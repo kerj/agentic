@@ -1,0 +1,159 @@
+#!/bin/bash
+# Agentic Workflow CLI
+
+set -euo pipefail
+
+AGENTIC_HOME="${AGENTIC_HOME:-$HOME/.agentic}"
+
+# Source all modules
+source "$AGENTIC_HOME/lib/config.sh"
+source "$AGENTIC_HOME/lib/utils.sh"
+source "$AGENTIC_HOME/lib/init.sh"
+source "$AGENTIC_HOME/lib/doc.sh"
+source "$AGENTIC_HOME/lib/claude-api.sh"
+source "$AGENTIC_HOME/lib/architect.sh"
+source "$AGENTIC_HOME/lib/implement.sh"
+source "$AGENTIC_HOME/lib/validate.sh"
+source "$AGENTIC_HOME/lib/apply.sh"
+source "$AGENTIC_HOME/lib/refine.sh"
+source "$AGENTIC_HOME/lib/plan.sh"
+source "$AGENTIC_HOME/lib/metrics.sh"
+source "$AGENTIC_HOME/lib/retry.sh"
+source "$AGENTIC_HOME/lib/core.sh"
+
+# CLI interface
+case "${1:-}" in
+  # Main workflow
+  ""|run)
+    agentic
+    ;;
+  
+  # Setup & configuration
+  init)
+    agentic-init
+    ;;
+  config)
+    agentic-config
+    ;;
+  
+  # Session management
+  list)
+    agentic-list
+    ;;
+  use)
+    agentic-use
+    ;;
+  retry|regenerate)
+    agentic-retry
+    ;;
+  
+  # Planning & documentation
+  plan)
+    plan
+    ;;
+  doc)
+    agentic-doc
+    ;;
+  doc-gen)
+    agentic-doc-gen
+    ;;
+  
+  # Metrics
+  metrics)
+    agentic-metrics "${2:-}"
+    ;;
+  
+  # Low-level workflow commands
+  archie|architect)
+    archie
+    ;;
+  implement)
+    implement
+    ;;
+  validate)
+    validate
+    ;;
+  apply)
+    shift
+    apply "$@"
+    ;;
+  verify|verify-apply)
+    verify-apply
+    ;;
+  refine)
+    refine
+    ;;
+  
+  # Version & help
+  --version|-v)
+    echo "agentic v1.0.0"
+    echo "Model: ${AGENTIC_MODEL:-not configured}"
+    echo "Home: $AGENTIC_HOME"
+    ;;
+  --help|-h)
+    cat <<HELP
+Agentic - AI-powered development workflow
+
+MAIN COMMANDS:
+  agentic [run]           Run complete workflow with orchestration
+  agentic init            Initialize project (.claude/, CLAUDE.md)
+  agentic config          Configure settings (model, endpoints)
+  
+SESSION MANAGEMENT:
+  agentic list            List past sessions
+  agentic use             Switch to previous session (interactive)
+  agentic retry           Retry/regenerate corrupted session
+  
+PLANNING & DOCS:
+  agentic plan            Create agile plan (stories, acceptance criteria)
+  agentic doc             Edit CLAUDE.md in your editor
+  agentic doc-gen         Generate CLAUDE.md from project analysis
+  
+METRICS:
+  agentic metrics [file]  View session performance metrics
+  
+LOW-LEVEL WORKFLOW (Expert Mode):
+  agentic archie          Create task breakdown only
+  agentic implement       Generate code for tasks
+  agentic validate        Run quality validation
+  agentic apply [--dry-run]  Apply changes to files
+  agentic verify          Verify applied changes match plan
+  agentic refine          Refine plan based on validation issues
+
+EXAMPLES:
+  # Complete workflow
+  agentic
+  
+  # Fix corrupted session
+  agentic use             # Pick corrupted session
+  agentic retry           # Regenerate tasks.json
+  agentic implement       # Continue from there
+  
+  # Step-by-step control
+  agentic archie          # Plan
+  agentic implement       # Generate
+  agentic apply           # Apply
+
+CONFIGURATION:
+  Model:    ${AGENTIC_MODEL:-not configured}
+  Endpoint: ${ANTHROPIC_BASE_URL:-not configured}
+  
+  Edit: agentic config
+
+MORE INFO:
+  Documentation: $AGENTIC_HOME/README.md
+  Modules: $AGENTIC_HOME/lib/
+HELP
+    ;;
+  *)
+    echo "❌ Unknown command: $1"
+    echo ""
+    echo "Run 'agentic --help' for usage"
+    echo ""
+    echo "Did you mean one of these?"
+    echo "  agentic run       - Run complete workflow"
+    echo "  agentic retry     - Retry corrupted session"
+    echo "  agentic use       - Switch sessions"
+    exit 1
+    ;;
+esac

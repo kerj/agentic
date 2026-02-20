@@ -1,0 +1,97 @@
+#!/bin/bash
+# ~/.agentic/bin/agentic-switch
+# Toggle between Anthropic and Ollama/Qwen configurations
+# Usage: agentic-switch [anthropic|ollama|status]
+
+CONF="$AGENTIC_HOME/.agentic.conf"
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+_current_provider() {
+  local url="${ANTHROPIC_BASE_URL:-}"
+  if [[ "$url" == *"anthropic.com"* ]]; then
+    echo "anthropic"
+  elif [[ -n "$url" ]]; then
+    echo "ollama"
+  else
+    echo "unknown"
+  fi
+}
+
+_show_current() {
+  local provider=$(_current_provider)
+  echo "Current provider: $provider"
+  echo ""
+  echo "  AGENTIC_MODEL:        ${AGENTIC_MODEL:-not set}"
+  echo "  ANTHROPIC_BASE_URL:   ${ANTHROPIC_BASE_URL:-not set}"
+  if [[ -n "${ANTHROPIC_API_KEY:-}" ]]; then
+    echo "  ANTHROPIC_API_KEY:    ${ANTHROPIC_API_KEY:0:12}..."
+  else
+    echo "  ANTHROPIC_API_KEY:    not set"
+  fi
+  echo "  ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-not set}"
+}
+
+_switch_to_anthropic() {
+  # Read existing key from conf so we don't overwrite it
+  local existing_key
+  existing_key=$(grep 'ANTHROPIC_API_KEY=' "$CONF" 2>/dev/null | grep -v '^#' | head -1 | cut -d'"' -f2)
+
+  if [[ -z "$existing_key" ]]; then
+    echo "⚠️  No ANTHROPIC_API_KEY found in $CONF"
+    read -p "Enter your Anthropic API key: " existing_key
+    [[ -z "$existing_key" ]] && echo "❌ No key provided" && return 1
+  fi
+
+  cat > "$CONF" << EOF
+# ── Anthropic ──────────────────────────────────────────────────────────────
+export AGENTIC_MODEL="claude-opus-4-20250514"
+export ANTHROPIC_BASE_URL="https://api.anthropic.com"
+export ANTHROPIC_API_KEY="$existing_key"
+unset ANTHROPIC_AUTH_TOKEN
+
+export OLLAMA_MAX_LOADED_MODELS=3
+export OLLAMA_KEEP_ALIVE="30m"
+EOF
+
+  echo "✅ Switched to Anthropic (claude-opus-4-20250514)"
+  echo "   Run: source \$AGENTIC_HOME/.agentic.conf"
+}
+
+_switch_to_ollama() {
+  cat > "$CONF" << 'EOF'
+# ── Ollama / Qwen ──────────────────────────────────────────────────────────
+export AGENTIC_MODEL="qwen2.5-coder:32b"
+export ANTHROPIC_BASE_URL="http://localhost:11434"
+export ANTHROPIC_AUTH_TOKEN="ollama"
+unset ANTHROPIC_API_KEY
+
+export OLLAMA_MAX_LOADED_MODELS=3
+export OLLAMA_KEEP_ALIVE="30m"
+EOF
+
+  echo "✅ Switched to Ollama (qwen2.5-coder:32b)"
+  echo "   Run: source \$AGENTIC_HOME/.agentic.conf"
+}
+
+case "${1:-}" in
+  anthropic|claude)
+    _switch_to_anthropic
+    ;;
+  ollama|qwen|local)
+    _switch_to_ollama
+    ;;
+  status|"")
+    _show_current
+    echo ""
+    echo "Usage:"
+    echo "  agentic-switch anthropic   # Switch to Anthropic/Claude"
+    echo "  agentic-switch ollama      # Switch to Ollama/Qwen"
+    echo "  agentic-switch status      # Show current config"
+    ;;
+  *)
+    echo "❌ Unknown option: $1"
+    echo "Usage: agentic-switch [anthropic|ollama|status]"
+    exit 1
+    ;;
+esac

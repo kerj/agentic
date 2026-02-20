@@ -1,0 +1,14 @@
+# ── Anthropic ──────────────────────────────────────────────────────────────
+export AGENTIC_MODEL="claude-opus-4-20250514"
+export ANTHROPIC_BASE_URL="https://api.anthropic.com"
+export ANTHROPIC_API_KEY=""
+unset ANTHROPIC_AUTH_TOKEN
+
+# Local model
+# export AGENTIC_MODEL="qwen2.5-coder:32b"
+# export ANTHROPIC_BASE_URL="http://localhost:11434"
+# export ANTHROPIC_AUTH_TOKEN="ollama"
+# unset ANTHROPIC_API_KEY
+
+export OLLAMA_MAX_LOADED_MODELS=3
+export OLLAMA_KEEP_ALIVE="30m"
