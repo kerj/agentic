@@ -54,7 +54,24 @@ The installer will:
 
 `~/.agentic/.agentic.conf` holds your settings and secrets. It is **gitignored** — never committed to the repo. The repo ships `.agentic.conf.example` as a safe template.
 
-### First-Time Setup
+### Switching Providers
+
+The fastest way to switch between Anthropic and Ollama:
+
+```bash
+agentic switch anthropic   # Switch to Anthropic API (claude-opus-4-20250514)
+agentic switch ollama      # Switch to Ollama (qwen2.5-coder:32b)
+agentic switch status      # Show current provider and settings
+```
+
+Then reload:
+```bash
+source ~/.zshrc
+```
+
+### Full Configuration
+
+For fine-grained control over model, endpoint, and auth:
 ```bash
 agentic config
 ```
@@ -76,7 +93,7 @@ This detects whether you're using the Anthropic API or a local Ollama endpoint a
 
 **For Ollama:** set `ANTHROPIC_BASE_URL=http://localhost:11434` and `ANTHROPIC_AUTH_TOKEN=ollama`
 
-`agentic config` handles this automatically — it detects the backend from the URL and saves the correct variables.
+`agentic switch` and `agentic config` both handle this automatically — they detect the backend from the URL and save the correct variables.
 
 ### Agent Prompts
 
@@ -136,7 +153,8 @@ agentic apply
 |---------|-------------|
 | `agentic` | Run complete workflow with orchestration |
 | `agentic init` | Initialize project (creates `.claude/`, `CLAUDE.md`) |
-| `agentic config` | Configure settings (model, endpoint, API key) |
+| `agentic config` | Configure settings interactively (model, endpoint, API key) |
+| `agentic switch [anthropic\|ollama\|status]` | Quickly toggle between Anthropic and Ollama |
 | `agentic plan` | Create agile plan with user stories and acceptance criteria |
 | `agentic list` | List past sessions |
 | `agentic use` | Switch to a previous session interactively |
@@ -429,6 +447,9 @@ Real token counts (including cache reads and cache writes) are tracked per-task 
 # Setup
 agentic init              # Initialize project
 agentic config            # Configure model / endpoint / keys
+agentic switch anthropic  # Quick switch to Anthropic
+agentic switch ollama     # Quick switch to Ollama
+agentic switch status     # Show current provider
 
 # Main workflow
 agentic                   # Complete orchestrated workflow

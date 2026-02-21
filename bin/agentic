@@ -35,6 +35,10 @@ case "${1:-}" in
   config)
     agentic-config
     ;;
+  switch)
+    shift
+    source "$AGENTIC_HOME/bin/agentic-switch" "${@:-}"
+    ;;
   
   # Session management
   list)
@@ -97,7 +101,8 @@ Agentic - AI-powered development workflow
 MAIN COMMANDS:
   agentic [run]           Run complete workflow with orchestration
   agentic init            Initialize project (.claude/, CLAUDE.md)
-  agentic config          Configure settings (model, endpoints)
+  agentic config          Configure settings interactively
+  agentic switch          Toggle provider (anthropic|ollama|status)
   
 SESSION MANAGEMENT:
   agentic list            List past sessions
@@ -124,6 +129,11 @@ EXAMPLES:
   # Complete workflow
   agentic
   
+  # Switch providers
+  agentic switch anthropic
+  agentic switch ollama
+  agentic switch status
+  
   # Fix corrupted session
   agentic use             # Pick corrupted session
   agentic retry           # Regenerate tasks.json
@@ -138,7 +148,8 @@ CONFIGURATION:
   Model:    ${AGENTIC_MODEL:-not configured}
   Endpoint: ${ANTHROPIC_BASE_URL:-not configured}
   
-  Edit: agentic config
+  Quick switch: agentic switch [anthropic|ollama]
+  Full config:  agentic config
 
 MORE INFO:
   Documentation: $AGENTIC_HOME/README.md
@@ -152,6 +163,7 @@ HELP
     echo ""
     echo "Did you mean one of these?"
     echo "  agentic run       - Run complete workflow"
+    echo "  agentic switch    - Toggle provider (anthropic|ollama)"
     echo "  agentic retry     - Retry corrupted session"
     echo "  agentic use       - Switch sessions"
     exit 1

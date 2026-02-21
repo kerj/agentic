@@ -7,7 +7,7 @@ function agentic-retry() {
   
   local session_name=""
   
-  # PRIORITY 1: Use .claude/latest symlink (most reliable)
+  # PRIORITY 1: Use .claude/latest symlink
   if [[ -L ".claude/latest" ]]; then
     local latest_target=$(readlink .claude/latest)
     session_name=$(basename "$latest_target")
@@ -30,13 +30,11 @@ function agentic-retry() {
   
   echo ""
   
-  # Build session directory path
   local session_dir=".claude/sessions/$session_name"
   
   echo "📂 Session directory: $session_dir"
   echo ""
   
-  # Validate session exists
   if [[ ! -d "$session_dir" ]]; then
     echo "❌ Session directory doesn't exist!"
     echo ""
@@ -57,7 +55,6 @@ function agentic-retry() {
   echo "✅ Session directory exists"
   echo ""
   
-  # Validate session has request
   if [[ ! -f "$session_dir/request.txt" ]]; then
     echo "❌ Session has no request.txt"
     echo ""
@@ -74,7 +71,6 @@ function agentic-retry() {
   echo "─────────────────────────────────────"
   echo ""
   
-  # Show what's corrupted (if anything)
   if [[ -f "$session_dir/tasks.json" ]]; then
     if jq empty "$session_dir/tasks.json" 2>/dev/null; then
       if ! jq -e '.tasks' "$session_dir/tasks.json" >/dev/null 2>&1; then
@@ -96,7 +92,6 @@ function agentic-retry() {
   fi
   echo ""
   
-  # Backup corrupted files
   local timestamp=$(date +%Y%m%d-%H%M%S)
   local backed_up=false
   
@@ -112,16 +107,13 @@ function agentic-retry() {
     backed_up=true
   fi
   
-  # Clear outputs
   if [[ -d "$session_dir/outputs" ]]; then
     mv "$session_dir/outputs" "$session_dir/outputs.bad-${timestamp}"
     echo "✅ Backed up outputs/ → outputs.bad-${timestamp}"
     backed_up=true
   fi
   
-  if [[ "$backed_up" == true ]]; then
-    echo ""
-  fi
+  [[ "$backed_up" == true ]] && echo ""
   
   read -p "Regenerate tasks.json? (y/n) " confirm
   if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
@@ -139,40 +131,7 @@ function agentic-retry() {
   local context_file="$session_dir/context.txt"
   if [[ ! -f "$context_file" ]]; then
     echo "📋 Rebuilding context..."
-    
-    if [[ -f "CLAUDE.md" ]]; then
-      echo "=== PROJECT DOCUMENTATION ===" > "$context_file"
-      cat CLAUDE.md >> "$context_file"
-      echo "" >> "$context_file"
-    fi
-    
-    echo "=== INSTALLED PACKAGES ===" >> "$context_file"
-    if [[ -f "package.json" ]]; then
-      jq -r '.dependencies // {} | keys[]' package.json 2>/dev/null >> "$context_file"
-      jq -r '.devDependencies // {} | keys[]' package.json 2>/dev/null >> "$context_file"
-    fi
-    echo "" >> "$context_file"
-    
-    echo "=== EXISTING SOURCE FILES ===" >> "$context_file"
-    find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) \
-      -not -path "*/node_modules/*" \
-      -not -path "*/.git/*" \
-      -not -path "*/dist/*" \
-      -not -path "*/build/*" \
-      -not -path "*/.next/*" \
-      -not -path "*/coverage/*" \
-      -not -name "*.test.*" \
-      -not -name "*.spec.*" \
-      2>/dev/null | sort >> "$context_file"
-    echo "" >> "$context_file"
-    
-    echo "=== EXISTING TEST FILES ===" >> "$context_file"
-    find . -type f \( -name "*.test.ts" -o -name "*.test.tsx" -o -name "*.spec.ts" -o -name "*.spec.tsx" \) \
-      -not -path "*/node_modules/*" \
-      -not -path "*/.git/*" \
-      2>/dev/null | head -10 >> "$context_file"
-    echo "" >> "$context_file"
-    
+    _archie_build_context "$context_file"
     echo "✅ Context rebuilt"
     echo ""
   else
@@ -180,23 +139,51 @@ function agentic-retry() {
     echo ""
   fi
   
-  # Generate tasks
-  local system_prompt="$(cat $AGENTIC_HOME/agents/architect.txt)"
-  
-  echo "🏗️  Calling architect..."
-  
-  claude --model $AGENTIC_MODEL --print > "$session_dir/tasks.json" <<ARCHITECT_PROMPT
-$system_prompt
+  local architect_prompt
+  architect_prompt="$(cat $AGENTIC_HOME/agents/architect.txt)"
 
-$(cat "$context_file")
+  local user_prompt="$(cat "$context_file")
 
 USER REQUEST:
 $(cat "$session_dir/request.txt")
 
-Output tasks as valid JSON. Use arrays for multi-line content, not \\n.
-ARCHITECT_PROMPT
+Output tasks as valid JSON. Use arrays for multi-line content, not \n.
+The 'target' field must be the exact identifier as it appears in source code.
+DO NOT wrap output in markdown code fences. Output raw JSON only."
+
+  echo "🏗️  Calling architect..."
+
+  claude_api \
+    --model "$AGENTIC_MODEL" \
+    --system "$architect_prompt" \
+    --cache-system \
+    --user "$user_prompt" \
+    --output "$session_dir/tasks.json" \
+    --usage "$session_dir/retry_${timestamp}_usage.json"
+
+  if [[ $? -ne 0 ]]; then
+    echo "❌ API call failed"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "❌ Retry Failed"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo ""
+    echo "Options:"
+    echo "  1. Try again: agentic retry"
+    echo "  2. Use a different model: agentic config"
+    echo "  3. Start fresh: agentic"
+    return 1
+  fi
+
+  # Strip markdown fences if present
+  if grep -q '```' "$session_dir/tasks.json"; then
+    echo "  ⚠️  Cleaning markdown fences from output..."
+    local tmp
+    tmp=$(mktemp)
+    grep -v '^```' "$session_dir/tasks.json" > "$tmp"
+    mv "$tmp" "$session_dir/tasks.json"
+  fi
   
-  # Validate JSON
   if ! jq empty "$session_dir/tasks.json" 2>/dev/null; then
     echo "❌ Invalid JSON generated"
     echo ""
@@ -207,28 +194,23 @@ ARCHITECT_PROMPT
     echo "❌ Retry Failed"
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
-    echo "The model produced invalid JSON. You can:"
+    echo "Options:"
     echo "  1. Try again: agentic retry"
     echo "  2. Use a different model: agentic config"
-    echo "  3. Check model is running: ollama list"
-    echo "  4. Start fresh: agentic"
+    echo "  3. Start fresh: agentic"
     return 1
   fi
   
-  # Validate structure
   if ! jq -e '.tasks' "$session_dir/tasks.json" >/dev/null 2>&1; then
     echo "❌ JSON is valid but missing 'tasks' array"
     echo ""
     echo "Content:"
     jq . "$session_dir/tasks.json"
     echo ""
-    echo "This might be a model issue. Try:"
-    echo "  1. Different model: agentic config"
-    echo "  2. Retry: agentic retry"
+    echo "Try a different model: agentic config"
     return 1
   fi
   
-  # Display tasks
   echo ""
   echo "✅ Tasks regenerated successfully!"
   echo ""
@@ -236,7 +218,17 @@ ARCHITECT_PROMPT
   local task_count=$(jq -r '.tasks | length' "$session_dir/tasks.json")
   echo "  Total: $task_count tasks"
   echo ""
-  jq -r '.tasks[]? | "  [\(.id)] \(.action) \(.file) - \(.description // "no description")"' "$session_dir/tasks.json" 2>/dev/null
+  jq -r '.tasks[]? | "  [\(.id)] \(.action) \(.file) - \(.description // "no description")"' \
+    "$session_dir/tasks.json" 2>/dev/null
+
+  if [[ -f "$session_dir/retry_${timestamp}_usage.json" ]]; then
+    echo ""
+    local input output cache_read
+    input=$(jq -r '.input_tokens' "$session_dir/retry_${timestamp}_usage.json")
+    output=$(jq -r '.output_tokens' "$session_dir/retry_${timestamp}_usage.json")
+    cache_read=$(jq -r '.cache_read_input_tokens' "$session_dir/retry_${timestamp}_usage.json")
+    echo "📊 Tokens — input: $input, output: $output, cache read: $cache_read"
+  fi
   
   echo ""
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
