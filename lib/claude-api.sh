@@ -21,32 +21,24 @@
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Detect whether we are talking to the real Anthropic API or a local proxy
-# (Ollama, LiteLLM, etc.). Caching headers are Anthropic-only.
 _claude_api_is_anthropic() {
   local base_url="${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
   [[ "$base_url" == *"anthropic.com"* ]]
 }
 
-# Resolve the endpoint URL
 _claude_api_endpoint() {
   local base="${ANTHROPIC_BASE_URL:-https://api.anthropic.com}"
-  # Normalise: strip trailing slash
   base="${base%/}"
   echo "${base}/v1/messages"
 }
 
-# Resolve the API key
 _claude_api_key() {
-  # Prefer ANTHROPIC_API_KEY; fall back to ANTHROPIC_AUTH_TOKEN (Ollama default)
   echo "${ANTHROPIC_API_KEY:-${ANTHROPIC_AUTH_TOKEN:-ollama}}"
 }
 
-# Build the system array as a JSON array string.
-# If cache=true, the last block gets cache_control injected.
 _claude_api_build_system_json() {
   local system_text="$1"
-  local cache="$2"     # "true" or "false"
+  local cache="$2"
 
   if [[ -z "$system_text" ]]; then
     echo "null"
@@ -54,7 +46,6 @@ _claude_api_build_system_json() {
   fi
 
   if [[ "$cache" == "true" ]] && _claude_api_is_anthropic; then
-    # Single block with cache_control
     jq -n \
       --arg text "$system_text" \
       '[{type: "text", text: $text, cache_control: {type: "ephemeral"}}]'
@@ -65,11 +56,10 @@ _claude_api_build_system_json() {
   fi
 }
 
-# Build the full request payload as JSON
 _claude_api_build_payload() {
   local model="$1"
   local max_tokens="$2"
-  local system_json="$3"   # already-valid JSON (array or null)
+  local system_json="$3"
   local user_text="$4"
 
   if [[ "$system_json" == "null" ]]; then
@@ -97,15 +87,12 @@ _claude_api_build_payload() {
   fi
 }
 
-# Extract the assistant text from a successful response JSON.
-# The content array may contain multiple blocks; we join all text blocks.
 _claude_api_extract_text() {
   local response_json="$1"
   jq -r '[.content[] | select(.type == "text") | .text] | join("")' \
     <<< "$response_json"
 }
 
-# Extract usage statistics from a successful response JSON.
 _claude_api_extract_usage() {
   local response_json="$1"
   jq -r '{
@@ -120,8 +107,6 @@ _claude_api_extract_usage() {
 # Retry loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Calls curl once. Writes raw HTTP status to stdout; response body to $tmpfile.
-# Returns 0 on any completed HTTP exchange, 1 on curl error (network/timeout).
 _claude_api_curl_once() {
   local endpoint="$1"
   local api_key="$2"
@@ -136,24 +121,17 @@ _claude_api_curl_once() {
     -H "content-type: application/json"
   )
 
-  # Only send the caching beta header to Anthropic's own endpoint
   if [[ "$cache" == "true" ]] && _claude_api_is_anthropic; then
     headers+=(-H "anthropic-beta: prompt-caching-2024-07-31")
   fi
 
   local http_status
-  # http_status=$(curl -s -v -w "%{http_code}" \
-  #   --max-time "$timeout" \
-  #   "${headers[@]}" \
-  #   -d "@$payload_file" \
-  #   -o "$response_file" \
-  #   "$endpoint" 2>/dev/null)
-  http_status=$(curl -s -v -w "%{http_code}" \
-  --max-time "$timeout" \
-  "${headers[@]}" \
-  -d "@$payload_file" \
-  -o "$response_file" \
-  "$endpoint" 2>&1 | tee /tmp/curl_debug.txt | tail -1)
+  http_status=$(curl -s -w "%{http_code}" \
+    --max-time "$timeout" \
+    "${headers[@]}" \
+    -d "@$payload_file" \
+    -o "$response_file" \
+    "$endpoint" 2>/dev/null)
 
   local curl_exit=$?
 
@@ -230,15 +208,11 @@ claude_api() {
     return 1
   fi
 
-  # Write payload to temp file so curl reads it cleanly (avoids shell escaping issues)
-  local tmp_payload tmp_response tmp_dir
+  local tmp_dir tmp_payload tmp_response
   tmp_dir=$(mktemp -d)
   tmp_payload="$tmp_dir/payload.json"
   tmp_response="$tmp_dir/response.json"
   echo "$payload" > "$tmp_payload"
-
-  # echo "DEBUG payload:" >&2
-  # cat "$tmp_payload" >&2
 
   # ── Retry loop ────────────────────────────────────────────────────────────
   local max_retries=4
@@ -254,7 +228,6 @@ claude_api() {
 
     local curl_result=$?
 
-    # curl-level failure (network, timeout)
     if [[ $curl_result -ne 0 ]]; then
       local curl_code="${http_status#CURL_ERROR:}"
       echo "  ⚠️  curl error (code $curl_code), attempt $attempt/$max_retries" >&2
@@ -271,12 +244,9 @@ claude_api() {
       return 1
     fi
 
-    # ── HTTP-level response handling ──────────────────────────────────────
-
     case "$http_status" in
 
       200)
-        # Success — validate it looks like a proper response before accepting
         if ! jq -e '.content' "$tmp_response" &>/dev/null; then
           echo "claude_api: 200 response but no .content field — malformed response" >&2
           echo "  Raw response:" >&2
@@ -285,7 +255,6 @@ claude_api() {
           return 1
         fi
 
-        # Check for API-level error embedded in a 200 (shouldn't happen but does occasionally)
         local resp_type
         resp_type=$(jq -r '.type // "message"' "$tmp_response")
         if [[ "$resp_type" == "error" ]]; then
@@ -296,10 +265,8 @@ claude_api() {
           return 1
         fi
 
-        # Extract text to output file
         _claude_api_extract_text "$(cat "$tmp_response")" > "$output_file"
 
-        # Check output is non-empty
         if [[ ! -s "$output_file" ]]; then
           echo "claude_api: empty response text extracted" >&2
           echo "  stop_reason: $(jq -r '.stop_reason // "unknown"' "$tmp_response")" >&2
@@ -307,7 +274,6 @@ claude_api() {
           return 1
         fi
 
-        # Write usage sidecar if requested
         if [[ -n "$usage_file" ]]; then
           mkdir -p "$(dirname "$usage_file")"
           _claude_api_extract_usage "$(cat "$tmp_response")" > "$usage_file"
@@ -318,7 +284,6 @@ claude_api() {
         ;;
 
       429|529)
-        # Rate limited or overloaded — retry with backoff
         local retry_after
         retry_after=$(jq -r '.error.message // ""' "$tmp_response" | grep -oE '[0-9]+' | head -1)
         local wait=${retry_after:-$backoff}
@@ -337,7 +302,6 @@ claude_api() {
         ;;
 
       400|401|403|404)
-        # Non-retryable client errors
         local err_msg
         err_msg=$(jq -r '.error.message // "unknown error"' "$tmp_response" 2>/dev/null)
         echo "claude_api: HTTP $http_status — $err_msg" >&2
@@ -346,7 +310,6 @@ claude_api() {
         ;;
 
       500|502|503|504)
-        # Server errors — retry
         echo "  ⚠️  HTTP $http_status (server error), attempt $attempt/$max_retries" >&2
 
         if [[ $attempt -lt $max_retries ]]; then
@@ -362,7 +325,6 @@ claude_api() {
         ;;
 
       *)
-        # Unexpected status
         echo "claude_api: unexpected HTTP status $http_status" >&2
         echo "  Response body:" >&2
         cat "$tmp_response" >&2
@@ -373,7 +335,6 @@ claude_api() {
     esac
   done
 
-  # Should not reach here
   rm -rf "$tmp_dir"
   echo "claude_api: exhausted retries" >&2
   return 1
@@ -384,8 +345,6 @@ claude_api() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 claude_api_sum_usage() {
-  # Usage: claude_api_sum_usage file1.json file2.json ...
-  # Prints a JSON object with summed token counts
   local files=("$@")
 
   if [[ ${#files[@]} -eq 0 ]]; then
@@ -393,7 +352,6 @@ claude_api_sum_usage() {
     return
   fi
 
-  # Feed all files as a JSON array and sum each field
   jq -s '{
     input_tokens:                (map(.input_tokens)                | add // 0),
     output_tokens:               (map(.output_tokens)               | add // 0),
