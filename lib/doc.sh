@@ -18,6 +18,8 @@ function agentic-doc-gen() {
     fi
   fi
 
+  [[ -f ".llmignore" ]] && echo "🚫 .llmignore active ($(grep -c '^[^#]' .llmignore) patterns)"
+
   local analysis_file="/tmp/project_analysis_$(date +%s).txt"
 
   echo "📊 Analyzing project structure..."
@@ -37,7 +39,7 @@ function agentic-doc-gen() {
   # 2. DIRECTORY STRUCTURE
   # ============================================================
   echo "=== PROJECT STRUCTURE ===" >> "$analysis_file"
-  if command -v tree &> /dev/null; then
+  if command -v tree &> /dev/null && [[ ! -f ".llmignore" ]]; then
     if tree --version 2>&1 | grep -q "2\.[0-9]"; then
       tree -J -L 4 -I 'node_modules|.git|dist|build|coverage|.next' . 2>/dev/null >> "$analysis_file" \
         || tree -L 4 -I 'node_modules|.git|dist|build|coverage|.next' --dirsfirst . >> "$analysis_file" 2>/dev/null
@@ -48,7 +50,7 @@ function agentic-doc-gen() {
     find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) \
       -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" \
       -not -path "*/build/*" -not -path "*/.next/*" \
-      2>/dev/null | sort >> "$analysis_file"
+      2>/dev/null | sort | _llmignore_filter >> "$analysis_file"
   fi
   echo "" >> "$analysis_file"
 
@@ -66,7 +68,24 @@ function agentic-doc-gen() {
   echo "" >> "$analysis_file"
 
   # ============================================================
-  # 4. TSCONFIG
+  # 4. LINTER / FORMATTER CONFIG
+  # ============================================================
+  echo "=== LINTER / FORMATTER CONFIG ===" >> "$analysis_file"
+  for cfg in \
+    eslint.config.ts eslint.config.js eslint.config.mjs \
+    .eslintrc .eslintrc.js .eslintrc.json .eslintrc.yml \
+    prettier.config.ts prettier.config.js .prettierrc .prettierrc.json \
+    .editorconfig; do
+    if [[ -f "$cfg" ]]; then
+      echo "--- $cfg ---" >> "$analysis_file"
+      cat "$cfg" >> "$analysis_file"
+      echo "" >> "$analysis_file"
+    fi
+  done
+  echo "" >> "$analysis_file"
+
+  # ============================================================
+  # 5. TSCONFIG
   # ============================================================
   echo "=== TSCONFIG ===" >> "$analysis_file"
   if [[ -f "tsconfig.json" ]]; then
@@ -75,7 +94,7 @@ function agentic-doc-gen() {
   echo "" >> "$analysis_file"
 
   # ============================================================
-  # 5. TEST FILES — REAL EXAMPLES
+  # 6. TEST FILES — REAL EXAMPLES
   # ============================================================
   echo "📋 Extracting test patterns..."
   echo "=== TEST FILE ANALYSIS ===" >> "$analysis_file"
@@ -84,7 +103,8 @@ function agentic-doc-gen() {
     -name "*.test.ts" -o -name "*.test.tsx" \
     -o -name "*.test.js" -o -name "*.test.jsx" \
     -o -name "*.spec.ts" -o -name "*.spec.tsx" \
-    \) -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null | head -10))
+    \) -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null \
+    | _llmignore_filter | head -10))
 
   if [[ ${#test_files[@]} -gt 0 ]]; then
     echo "Test files found: ${#test_files[@]}" >> "$analysis_file"
@@ -129,54 +149,58 @@ function agentic-doc-gen() {
   echo "" >> "$analysis_file"
 
   # ============================================================
-  # 6. REAL EXPORT EXAMPLES
+  # 7. REAL EXPORT EXAMPLES
   # ============================================================
   echo "🔍 Extracting real export patterns..."
   echo "=== EXPORT PATTERNS (real lines from source) ===" >> "$analysis_file"
 
- while IFS= read -r f; do
-  grep -m 3 -E "^export (default |const |function |class |type |interface |enum )" "$f" 2>/dev/null \
-    | sed "s|^|$f: |" || true
-done < <(find . -type f \( -name "*.ts" -o -name "*.tsx" \) \
-  -not -path "*/node_modules/*" -not -path "*/.git/*" \
-  -not -name "*.test.*" -not -name "*.spec.*" \
-  2>/dev/null | head -30) >> "$analysis_file"
+  while IFS= read -r f; do
+    grep -m 3 -E "^export (default |const |function |class |type |interface |enum )" "$f" 2>/dev/null \
+      | sed "s|^|$f: |" || true
+  done < <(find . -type f \( -name "*.ts" -o -name "*.tsx" \) \
+    -not -path "*/node_modules/*" -not -path "*/.git/*" \
+    -not -name "*.test.*" -not -name "*.spec.*" \
+    2>/dev/null | _llmignore_filter | head -30) >> "$analysis_file"
+  echo "" >> "$analysis_file"
 
   # ============================================================
-  # 7. REAL IMPORT EXAMPLES
+  # 8. REAL IMPORT EXAMPLES
   # ============================================================
   echo "=== IMPORT PATTERNS (real lines from source) ===" >> "$analysis_file"
 
   while IFS= read -r f; do
-  grep -m 3 -E "^import " "$f" 2>/dev/null \
-    | sed "s|^|$f: |" || true
-done < <(find . -type f \( -name "*.ts" -o -name "*.tsx" \) \
-  -not -path "*/node_modules/*" -not -path "*/.git/*" \
-  -not -name "*.test.*" -not -name "*.spec.*" \
-  2>/dev/null | head -20) >> "$analysis_file"
+    grep -m 3 -E "^import " "$f" 2>/dev/null \
+      | sed "s|^|$f: |" || true
+  done < <(find . -type f \( -name "*.ts" -o -name "*.tsx" \) \
+    -not -path "*/node_modules/*" -not -path "*/.git/*" \
+    -not -name "*.test.*" -not -name "*.spec.*" \
+    2>/dev/null | _llmignore_filter | head -20) >> "$analysis_file"
+  echo "" >> "$analysis_file"
 
   # ============================================================
-  # 8. REAL ASYNC/FUNCTION PATTERN EXAMPLES
+  # 9. REAL ASYNC/FUNCTION PATTERN EXAMPLES
   # ============================================================
   echo "=== FUNCTION PATTERNS (real signatures from source) ===" >> "$analysis_file"
 
- while IFS= read -r f; do
-  grep -m 2 -E "^(export )?(async )?function |^export const [a-zA-Z]+ = (async )?\(" "$f" 2>/dev/null \
-    | sed "s|^|$f: |" || true
-done < <(find . -type f \( -name "*.ts" -o -name "*.tsx" \) \
-  -not -path "*/node_modules/*" -not -path "*/.git/*" \
-  -not -name "*.test.*" -not -name "*.spec.*" \
-  2>/dev/null | head -20) >> "$analysis_file"
+  while IFS= read -r f; do
+    grep -m 2 -E "^(export )?(async )?function |^export const [a-zA-Z]+ = (async )?\(" "$f" 2>/dev/null \
+      | sed "s|^|$f: |" || true
+  done < <(find . -type f \( -name "*.ts" -o -name "*.tsx" \) \
+    -not -path "*/node_modules/*" -not -path "*/.git/*" \
+    -not -name "*.test.*" -not -name "*.spec.*" \
+    2>/dev/null | _llmignore_filter | head -20) >> "$analysis_file"
+  echo "" >> "$analysis_file"
 
   # ============================================================
-  # 9. FULL SOURCE FILE SAMPLES (middle content, not just head)
+  # 10. FULL SOURCE FILE SAMPLES
   # ============================================================
   echo "📝 Collecting source samples..."
   echo "=== SOURCE FILE SAMPLES ===" >> "$analysis_file"
 
   local source_files=($(find . -type f \( -name "*.ts" -o -name "*.tsx" \) \
     -not -path "*/node_modules/*" -not -path "*/.git/*" -not -path "*/dist/*" \
-    -not -name "*.test.*" -not -name "*.spec.*" 2>/dev/null | head -20))
+    -not -name "*.test.*" -not -name "*.spec.*" 2>/dev/null \
+    | _llmignore_filter | head -20))
 
   for f in "${source_files[@]:0:3}"; do
     local lines=$(wc -l < "$f" | tr -d ' ')
@@ -197,7 +221,7 @@ done < <(find . -type f \( -name "*.ts" -o -name "*.tsx" \) \
   echo "" >> "$analysis_file"
 
   # ============================================================
-  # 10. GENERATE CLAUDE.MD
+  # 11. GENERATE CLAUDE.MD
   # ============================================================
   local documenter_prompt
   if [[ -f "$AGENTIC_HOME/agents/documenter.txt" ]]; then

@@ -36,14 +36,14 @@ function _archie_build_context() {
     -not -path "*/coverage/*" \
     -not -name "*.test.*" \
     -not -name "*.spec.*" \
-    2>/dev/null | sort >> "$context_file"
+    2>/dev/null | sort | _llmignore_filter >> "$context_file"
   echo "" >> "$context_file"
 
   echo "=== EXISTING TEST FILES (for reference - shows test location pattern) ===" >> "$context_file"
   find . -type f \( -name "*.test.ts" -o -name "*.test.tsx" -o -name "*.spec.ts" -o -name "*.spec.tsx" \) \
     -not -path "*/node_modules/*" \
     -not -path "*/.git/*" \
-    2>/dev/null | head -10 >> "$context_file"
+    2>/dev/null | head -10 | _llmignore_filter >> "$context_file"
   echo "" >> "$context_file"
 }
 
@@ -72,6 +72,8 @@ function archie() {
   else
     echo "📖 Reading CLAUDE.md..."
   fi
+
+  [[ -f ".llmignore" ]] && echo "🚫 .llmignore active ($(grep -c '^[^#]' .llmignore) patterns)"
 
   echo "🔍 Analyzing project..."
 
@@ -150,7 +152,6 @@ DO NOT wrap output in markdown code fences. Output raw JSON only."
   echo "Next: Review tasks.json then run 'implement'"
 }
 
-# archie-with-metrics is now just archie — real token counts always tracked
 function archie-with-metrics() {
   archie
 }

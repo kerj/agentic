@@ -187,12 +187,13 @@ _find_source_for_test() {
     fi
   done
 
-  # Strategy 3: Project-wide search
+  # Strategy 3: Project-wide search (respects .llmignore)
   find . -type f \( -name "${base_name}.ts" -o -name "${base_name}.tsx" \
     -o -name "${base_name}.js" -o -name "${base_name}.jsx" \) \
     -not -path "*/node_modules/*" -not -path "*/.git/*" \
     -not -path "*/test/*" -not -path "*/tests/*" -not -path "*/__tests__/*" \
-    -not -name "*.test.*" -not -name "*.spec.*" | head -1
+    -not -name "*.test.*" -not -name "*.spec.*" \
+    2>/dev/null | _llmignore_filter | head -1
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -240,7 +241,6 @@ function implement() {
 
   local session_dir
   session_dir=$(_apply_resolve_session)
-  
 
   local tasks_file="$session_dir/tasks.json"
   [[ ! -f "$tasks_file" ]] && echo "❌ No tasks found. Run 'archie' first." && return 1

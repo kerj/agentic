@@ -476,3 +476,98 @@ MIT — use freely, modify as needed.
 This tool handles tedious boilerplate, file structure, imports, test scaffolding, and repetitive patterns. You focus on architecture decisions, creative solutions, code review, and business logic.
 
 **Result:** 10x productivity without sacrificing quality.
+
+
+---
+
+## 🚫 .llmignore
+
+Similar to `.gitignore`, a `.llmignore` file in your project root controls which files are excluded from the LLM's context. This is useful for keeping secrets, generated files, large data files, and low-signal noise out of the AI's view — reducing token usage and improving output quality.
+
+**`.llmignore` should be committed to your repo.** It is not a secrets file itself — it just tells agentic which files to hide from the AI.
+
+### Where It Applies
+
+| Command | What it filters |
+|---------|----------------|
+| `agentic archie` | Source file and test file lists sent in the planning context |
+| `agentic doc-gen` | All file discovery during project analysis |
+| `agentic implement` | Strategy 3 source file discovery (project-wide `find` fallback) |
+
+### Setup
+
+```bash
+# Copy the example as a starting point
+cp ~/.agentic/.llmignore.example .llmignore
+
+# Edit for your project
+nano .llmignore
+```
+
+When a `.llmignore` is active, agentic will confirm at the start of `archie` and `doc-gen`:
+```
+🚫 .llmignore active (12 patterns)
+```
+
+### Syntax
+
+Standard gitignore-style patterns:
+
+```gitignore
+# Comments and blank lines are ignored
+
+# Directory (trailing slash) — matches the dir and everything inside
+secrets/
+dist/
+migrations/
+
+# Bare filename glob — matches that filename anywhere in the tree
+*.env
+*.log
+*.lock
+
+# Path glob — matches relative to project root
+src/generated/*.ts
+
+# ** recursive glob
+**/fixtures/**
+**/*.min.js
+```
+
+### Recommended Patterns
+
+```gitignore
+# Secrets
+*.env
+*.env.*
+*.pem
+*.key
+secrets/
+credentials/
+
+# Build output
+dist/
+build/
+.next/
+coverage/
+*.d.ts
+*.min.js
+
+# Large data / low signal
+*.sql
+*.sqlite
+migrations/
+fixtures/
+seed-data/
+
+# Lock files
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Vendor
+vendor/
+third-party/
+```
+
+A full example is available at `~/.agentic/.llmignore.example`.

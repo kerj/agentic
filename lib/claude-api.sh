@@ -232,10 +232,10 @@ claude_api() {
 
   # Write payload to temp file so curl reads it cleanly (avoids shell escaping issues)
   local tmp_payload tmp_response tmp_dir
-  # tmp_dir=$(mktemp -d)
-  # tmp_payload="$tmp_dir/payload.json"
-  # tmp_response="$tmp_dir/response.json"
-  # echo "$payload" > "$tmp_payload"
+  tmp_dir=$(mktemp -d)
+  tmp_payload="$tmp_dir/payload.json"
+  tmp_response="$tmp_dir/response.json"
+  echo "$payload" > "$tmp_payload"
 
   # echo "DEBUG payload:" >&2
   # cat "$tmp_payload" >&2

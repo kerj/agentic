@@ -23,9 +23,11 @@ function agentic-init() {
   echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
   echo ""
   
+  # ── .claude/ directories ───────────────────────────────────────────────────
   mkdir -p .claude/{sessions,plans,metrics}
   echo "✅ Created .claude/ directory"
   
+  # ── .gitignore ─────────────────────────────────────────────────────────────
   if [[ -f ".gitignore" ]]; then
     if ! grep -q ".claude/" .gitignore; then
       echo "" >> .gitignore
@@ -44,7 +46,56 @@ function agentic-init() {
 GITIGNORE
     echo "✅ Created .gitignore"
   fi
-  
+
+  # ── .vscode/settings.json ──────────────────────────────────────────────────
+  mkdir -p .vscode
+  if [[ -f ".vscode/settings.json" ]]; then
+    local tmp
+    tmp=$(mktemp)
+    # Strip // line comments so jq can parse JSONC format
+    if sed 's|[[:space:]]*//.*||g' .vscode/settings.json \
+        | jq '. * {
+          "files.associations": {".llmignore": "ignore"},
+          "material-icon-theme.files.associations": {".llmignore": ".gitignore"}
+        }' > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+      mv "$tmp" .vscode/settings.json
+      echo "✅ Updated .vscode/settings.json"
+    else
+      rm -f "$tmp"
+      # Fallback: insert before closing brace
+      cp .vscode/settings.json .vscode/settings.json.bak
+      sed -i '' '$ s/}/,\
+  "files.associations": {".llmignore": "ignore"},\
+  "material-icon-theme.files.associations": {".llmignore": ".gitignore"}\
+}/' .vscode/settings.json
+      echo "✅ Updated .vscode/settings.json (backup at .vscode/settings.json.bak)"
+    fi
+  else
+    cat > .vscode/settings.json <<'VSCODE'
+{
+  "files.associations": {
+    ".llmignore": "ignore"
+  },
+  "material-icon-theme.files.associations": {
+    ".llmignore": ".gitignore"
+  }
+}
+VSCODE
+    echo "✅ Created .vscode/settings.json"
+  fi
+
+  # ── .llmignore ─────────────────────────────────────────────────────────────
+  if [[ ! -f ".llmignore" ]]; then
+    if [[ -f "$AGENTIC_HOME/.llmignore.example" ]]; then
+      cp "$AGENTIC_HOME/.llmignore.example" .llmignore
+      echo "✅ Created .llmignore from example"
+      echo "   Edit to exclude files from AI context: nano .llmignore"
+    fi
+  else
+    echo "✅ .llmignore already exists"
+  fi
+
+  # ── CLAUDE.md ──────────────────────────────────────────────────────────────
   echo ""
   if [[ -f "CLAUDE.md" ]]; then
     read -p "CLAUDE.md exists. Regenerate? (y/n) " regen
@@ -135,13 +186,16 @@ TEMPLATE
   echo "Project initialized with:"
   echo "  ✓ .claude/ directory for sessions"
   echo "  ✓ .gitignore configured"
+  echo "  ✓ .vscode/settings.json configured"
+  [[ -f ".llmignore" ]] && echo "  ✓ .llmignore (edit to exclude files from AI context)"
   [[ -f "CLAUDE.md" ]] && echo "  ✓ CLAUDE.md project documentation"
   echo ""
   echo "Next steps:"
-  echo "  1. Edit CLAUDE.md to document your project conventions"
-  echo "  2. Review with: agentic doc"
-  echo "  3. Start workflow: agentic"
-  echo "  4. Or plan feature: agentic plan"
+  echo "  1. Edit .llmignore to exclude sensitive/noisy files"
+  echo "  2. Edit CLAUDE.md to document your project conventions"
+  echo "  3. Review with: agentic doc"
+  echo "  4. Start workflow: agentic"
+  echo "  5. Or plan feature: agentic plan"
   echo ""
   
   read -p "Start workflow now? (y/n) " start_now

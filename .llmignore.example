@@ -1,0 +1,52 @@
+# .llmignore — exclude files and directories from LLM context
+# Syntax is gitignore-style: globs, # comments, blank lines ignored
+# This file SHOULD be committed to your repo.
+#
+# Files matching these patterns will not be sent to the AI in:
+#   - agentic archie   (project context / source file lists)
+#   - agentic doc-gen  (project analysis for CLAUDE.md generation)
+#   - agentic implement (source file discovery for tests)
+
+# ── Secrets & credentials ────────────────────────────────────────────────────
+*.env
+*.env.*
+.env.local
+.env.production
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+credentials/
+
+# ── Generated / build output ─────────────────────────────────────────────────
+dist/
+build/
+.next/
+out/
+coverage/
+*.min.js
+*.min.ts
+*.d.ts
+
+# ── Large data files ─────────────────────────────────────────────────────────
+*.sql
+*.sqlite
+*.db
+fixtures/
+seed-data/
+migrations/
+
+# ── Noisy / low-signal files ─────────────────────────────────────────────────
+*.lock
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+*.log
+*.map
+
+# ── Vendor / third-party code ────────────────────────────────────────────────
+vendor/
+third-party/
+
+# ── Project-specific (add your own below) ────────────────────────────────────
