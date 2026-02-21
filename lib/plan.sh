@@ -1,3 +1,26 @@
+#!/bin/bash
+# Planning functions
+
+# Cross-platform clipboard helper
+_copy_to_clipboard() {
+  local file="$1"
+  if command -v pbcopy &>/dev/null; then
+    pbcopy < "$file"                          # macOS
+  elif command -v xclip &>/dev/null; then
+    xclip -selection clipboard < "$file"      # Linux (X11)
+  elif command -v xsel &>/dev/null; then
+    xsel --clipboard --input < "$file"        # Linux (X11 alt)
+  elif command -v wl-copy &>/dev/null; then
+    wl-copy < "$file"                         # Linux (Wayland)
+  elif command -v clip.exe &>/dev/null; then
+    clip.exe < "$file"                        # WSL → Windows clipboard
+  else
+    echo "⚠️  No clipboard tool found"
+    echo "   Install one of: xclip, xsel, wl-copy"
+    return 1
+  fi
+}
+
 function plan() {
   echo "📋 Agile Planning Tool"
   echo ""
@@ -5,17 +28,14 @@ function plan() {
   echo "(Press Ctrl+D when done, or type on one line)"
   echo ""
   
-  # Read multi-line input
   local description=""
   if [[ -t 0 ]]; then
-    # Interactive mode
     local line
     while IFS= read -r line; do
       description+="$line"$'\n'
     done
   fi
   
-  # Trim trailing newline
   description="${description%$'\n'}"
   
   if [[ -z "$description" ]]; then
@@ -27,13 +47,11 @@ function plan() {
   echo "📝 Planning: $description"
   echo ""
   
-  # Create output directory
   mkdir -p .claude/plans
   local timestamp=$(date +%Y%m%d-%H%M%S)
   local slug=$(echo "$description" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | sed 's/--*/-/g' | cut -c1-30)
   local output_file=".claude/plans/${timestamp}_${slug}.md"
   
-  # Phase 1: Ask clarification questions
   echo "🤔 Analyzing and preparing clarification questions..."
   echo ""
   
@@ -56,25 +74,28 @@ Example:
 2. Are there any performance requirements?
 3. What devices/platforms need to be supported?"
 
-  local questions=$(claude --model $AGENTIC_MODEL --print <<< "$clarification_prompt")
+  local questions
+  questions=$(claude_api \
+    --model "$AGENTIC_MODEL" \
+    --user "$clarification_prompt" \
+    --output /tmp/plan_questions_$$.txt \
+    --max-tokens 512 && cat /tmp/plan_questions_$$.txt)
+  rm -f /tmp/plan_questions_$$.txt
   
   echo "Questions:"
   echo "$questions"
   echo ""
   
-  # Get answers
   echo "Please answer these questions:"
   echo "(Type your answer after each question, press Enter. Type 'skip' to skip)"
   echo ""
   
   local answers=""
-  local question_num=1
   
   while IFS= read -r question; do
     if [[ -n "$question" && ! "$question" =~ ^[[:space:]]*$ ]]; then
       echo "$question"
-      read -r "answer"
-      
+      read -r answer
       if [[ "$answer" != "skip" && -n "$answer" ]]; then
         answers+="Q: $question"$'\n'
         answers+="A: $answer"$'\n\n'
@@ -86,7 +107,6 @@ Example:
   echo "📋 Generating agile plan..."
   echo ""
   
-  # Phase 2: Generate plan
   local planning_prompt="You are an agile product manager creating a detailed work breakdown.
 
 FEATURE REQUEST:
@@ -167,29 +187,33 @@ Use this structure:
 
 Output ONLY the markdown. No preamble or explanation."
 
-  # Generate plan
-  claude --model $AGENTIC_MODEL --print > "$output_file" <<< "$planning_prompt"
-  
-  # Check if generated
-  if [[ ! -s "$output_file" ]]; then
+  claude_api \
+    --model "$AGENTIC_MODEL" \
+    --user "$planning_prompt" \
+    --output "$output_file" \
+    --max-tokens 4096
+
+  if [[ $? -ne 0 ]] || [[ ! -s "$output_file" ]]; then
     echo "❌ Failed to generate plan"
     return 1
   fi
   
   # Clean markdown fences if present
   if grep -q '```' "$output_file"; then
-    sed -i.bak '/```markdown/d; /```$/d' "$output_file"
-    rm -f "$output_file.bak"
+    local tmp
+    tmp=$(mktemp)
+    grep -v '^```markdown$' "$output_file" | grep -v '^```$' > "$tmp"
+    mv "$tmp" "$output_file"
   fi
   
   echo "✅ Plan created: $output_file"
   echo ""
   
-  # Preview
   echo "Preview:"
   echo "─────────────────────────────────────"
   head -30 "$output_file"
-  local total_lines=$(wc -l < "$output_file" | tr -d ' ')
+  local total_lines
+  total_lines=$(wc -l < "$output_file" | tr -d ' ')
   if [[ $total_lines -gt 30 ]]; then
     echo "..."
     echo "($((total_lines - 30)) more lines)"
@@ -197,19 +221,22 @@ Output ONLY the markdown. No preamble or explanation."
   echo "─────────────────────────────────────"
   echo ""
   
-  # Symlink to latest
   rm -f .claude/plans/latest.md
   ln -s "$(basename "$output_file")" .claude/plans/latest.md
   
-  # Options
   echo "Options:"
   echo "  1. Open in editor: ${EDITOR:-nano} $output_file"
   echo "  2. View full plan: cat $output_file"
-  echo "  3. Copy to clipboard: pbcopy < $output_file"
+  echo "  3. Copy to clipboard"
   echo ""
   
   read -p "Open in editor now? (y/n) " open_editor
   if [[ "$open_editor" =~ ^[Yy]$ ]]; then
     ${EDITOR:-nano} "$output_file"
+  else
+    read -p "Copy to clipboard? (y/n) " do_copy
+    if [[ "$do_copy" =~ ^[Yy]$ ]]; then
+      _copy_to_clipboard "$output_file" && echo "✅ Copied to clipboard"
+    fi
   fi
 }

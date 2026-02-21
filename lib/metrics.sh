@@ -1,6 +1,11 @@
 #!/bin/bash
 # Metrics functions
 
+# Cross-platform ISO 8601 timestamp (works on macOS and Linux/WSL)
+_iso_timestamp() {
+  date -u +"%Y-%m-%dT%H:%M:%SZ"
+}
+
 log_step_metrics() {
   local metrics_file="$1"
   local step="$2"
@@ -16,10 +21,9 @@ log_step_metrics() {
     --argjson duration "$duration" \
     --argjson tokens "$tokens" \
     --arg status "$status" \
-    --arg timestamp "$(date -Iseconds)" \
+    --arg timestamp "$(_iso_timestamp)" \
     '{step: $step, duration_seconds: $duration, tokens: $tokens, status: $status, timestamp: $timestamp}')
 
-  # Append to steps array using a temp file
   local tmp="${metrics_file}.tmp"
   jq --argjson entry "$step_entry" '.steps += [$entry]' "$metrics_file" > "$tmp" \
     && mv "$tmp" "$metrics_file"
@@ -43,7 +47,7 @@ finalize_metrics() {
     --argjson duration "$total_duration" \
     --argjson tokens "$total_tokens" \
     --arg session "${AGENTIC_SESSION:-unknown}" \
-    --arg end_time "$(date -Iseconds)" \
+    --arg end_time "$(_iso_timestamp)" \
     '.status = $status |
      .total_duration_seconds = $duration |
      .total_tokens = $tokens |
@@ -97,7 +101,7 @@ function agentic-metrics() {
 init_metrics() {
   local metrics_file="$1"
   jq -n \
-    --arg start_time "$(date -Iseconds)" \
+    --arg start_time "$(_iso_timestamp)" \
     --arg session "${AGENTIC_SESSION:-unknown}" \
     '{start_time: $start_time, session: $session, status: "running", steps: []}' \
     > "$metrics_file"

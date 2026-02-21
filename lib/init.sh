@@ -52,7 +52,7 @@ GITIGNORE
   if [[ -f ".vscode/settings.json" ]]; then
     local tmp
     tmp=$(mktemp)
-    # Strip // line comments so jq can parse JSONC format
+    # Strip // line comments so jq can parse JSONC, then merge
     if sed 's|[[:space:]]*//.*||g' .vscode/settings.json \
         | jq '. * {
           "files.associations": {".llmignore": "ignore"},
@@ -62,12 +62,19 @@ GITIGNORE
       echo "✅ Updated .vscode/settings.json"
     else
       rm -f "$tmp"
-      # Fallback: insert before closing brace
+      # Fallback: write keys before closing brace using temp file (cross-platform)
       cp .vscode/settings.json .vscode/settings.json.bak
-      sed -i '' '$ s/}/,\
-  "files.associations": {".llmignore": "ignore"},\
-  "material-icon-theme.files.associations": {".llmignore": ".gitignore"}\
-}/' .vscode/settings.json
+      local tmp2
+      tmp2=$(mktemp)
+      # Remove last closing brace, append new keys, re-close
+      head -n -1 .vscode/settings.json > "$tmp2"
+      cat >> "$tmp2" <<'JSONKEYS'
+  ,
+  "files.associations": {".llmignore": "ignore"},
+  "material-icon-theme.files.associations": {".llmignore": ".gitignore"}
+}
+JSONKEYS
+      mv "$tmp2" .vscode/settings.json
       echo "✅ Updated .vscode/settings.json (backup at .vscode/settings.json.bak)"
     fi
   else
