@@ -37,7 +37,7 @@ case "${1:-}" in
     ;;
   switch)
     shift
-    source "$AGENTIC_HOME/bin/agentic-switch" "${@:-}"
+    agentic-switch "${@:-}"
     ;;
   
   # Session management

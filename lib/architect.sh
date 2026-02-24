@@ -96,6 +96,7 @@ DO NOT wrap output in markdown code fences. Output raw JSON only."
     --model "$AGENTIC_MODEL" \
     --system "$architect_prompt" \
     --cache-system \
+    --temperature  0.8 \
     --user "$user_prompt" \
     --output "$session_dir/tasks.json" \
     --usage "$session_dir/architect_usage.json"

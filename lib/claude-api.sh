@@ -8,14 +8,18 @@
 #   source "$AGENTIC_HOME/lib/claude-api.sh"
 #
 #   claude_api \
-#     --model        "claude-sonnet-4-6"   \
-#     --system       "$system_prompt"       \   # optional; cached if --cache-system set
-#     --cache-system                         \   # flag: add cache_control to system prompt
-#     --user         "$user_prompt"          \
-#     --output       "/path/to/output.txt"   \   # writes extracted text here
-#     --usage        "/path/to/usage.json"   \   # optional: writes token counts here
-#     --max-tokens   4096                    \   # default: 8192
-#     --timeout      120                         # curl timeout in seconds, default: 180
+#     --model           "claude-sonnet-4-6"   \
+#     --system          "$system_prompt"       \   # optional; cached if --cache-system set
+#     --cache-system                            \   # flag: add cache_control to system prompt
+#     --user            "$user_prompt"          \
+#     --output          "/path/to/output.txt"   \   # writes extracted text here
+#     --usage           "/path/to/usage.json"   \   # optional: writes token counts here
+#     --max-tokens      4096                    \   # default: 8192
+#     --timeout         120                     \   # curl timeout in seconds, default: 180
+#     --temperature     0.2                     \   # optional: 0.0–1.0 (omit = API default 1.0)
+#     --top-p           0.9                     \   # optional: nucleus sampling 0.0–1.0
+#     --top-k           50                      \   # optional: top-k sampling (integer)
+#     --stop-sequences  '["```","<end>"]'           # optional: JSON array of stop strings
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
@@ -61,30 +65,50 @@ _claude_api_build_payload() {
   local max_tokens="$2"
   local system_json="$3"
   local user_text="$4"
+  local temperature="$5"
+  local top_p="$6"
+  local top_k="$7"
+  local stop_sequences="$8"
 
+  # Build base args
+  local base_args=(
+    --arg     model       "$model"
+    --argjson max_tokens  "$max_tokens"
+    --arg     user        "$user_text"
+  )
+
+  local base_expr
   if [[ "$system_json" == "null" ]]; then
-    jq -n \
-      --arg   model      "$model"      \
-      --argjson max_tokens "$max_tokens" \
-      --arg   user       "$user_text"  \
-      '{
-        model:      $model,
-        max_tokens: $max_tokens,
-        messages: [{role: "user", content: $user}]
-      }'
+    base_expr='{model: $model, max_tokens: $max_tokens, messages: [{role: "user", content: $user}]}'
   else
-    jq -n \
-      --arg    model       "$model"      \
-      --argjson max_tokens  "$max_tokens" \
-      --argjson system      "$system_json" \
-      --arg    user        "$user_text"  \
-      '{
-        model:      $model,
-        max_tokens: $max_tokens,
-        system:     $system,
-        messages:   [{role: "user", content: $user}]
-      }'
+    base_args+=(--argjson system "$system_json")
+    base_expr='{model: $model, max_tokens: $max_tokens, system: $system, messages: [{role: "user", content: $user}]}'
   fi
+
+  # Build optional extras — only include fields that were explicitly set
+  local extras='{}'
+
+  if [[ -n "$temperature" ]]; then
+    extras=$(jq -n --argjson v "$temperature" --argjson e "$extras" '$e + {temperature: $v}')
+  fi
+
+  if [[ -n "$top_p" ]]; then
+    extras=$(jq -n --argjson v "$top_p" --argjson e "$extras" '$e + {top_p: $v}')
+  fi
+
+  if [[ -n "$top_k" ]]; then
+    extras=$(jq -n --argjson v "$top_k" --argjson e "$extras" '$e + {top_k: $v}')
+  fi
+
+  if [[ -n "$stop_sequences" ]]; then
+    extras=$(jq -n --argjson v "$stop_sequences" --argjson e "$extras" '$e + {stop_sequences: $v}')
+  fi
+
+  # Merge base payload with extras
+  jq -n \
+    "${base_args[@]}" \
+    --argjson extras "$extras" \
+    "(${base_expr}) + \$extras"
 }
 
 _claude_api_extract_text() {
@@ -158,18 +182,27 @@ claude_api() {
   local user_text=""
   local output_file=""
   local usage_file=""
+  # Optional tuning params — empty string means "omit from payload"
+  local temperature=""
+  local top_p=""
+  local top_k=""
+  local stop_sequences=""
 
   # ── Argument parsing ──────────────────────────────────────────────────────
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --model)        model="$2";        shift 2 ;;
-      --system)       system_text="$2";  shift 2 ;;
-      --cache-system) cache_system="true"; shift ;;
-      --user)         user_text="$2";    shift 2 ;;
-      --output)       output_file="$2";  shift 2 ;;
-      --usage)        usage_file="$2";   shift 2 ;;
-      --max-tokens)   max_tokens="$2";   shift 2 ;;
-      --timeout)      timeout="$2";      shift 2 ;;
+      --model)           model="$2";           shift 2 ;;
+      --system)          system_text="$2";     shift 2 ;;
+      --cache-system)    cache_system="true";  shift   ;;
+      --user)            user_text="$2";       shift 2 ;;
+      --output)          output_file="$2";     shift 2 ;;
+      --usage)           usage_file="$2";      shift 2 ;;
+      --max-tokens)      max_tokens="$2";      shift 2 ;;
+      --timeout)         timeout="$2";         shift 2 ;;
+      --temperature)     temperature="$2";     shift 2 ;;
+      --top-p)           top_p="$2";           shift 2 ;;
+      --top-k)           top_k="$2";           shift 2 ;;
+      --stop-sequences)  stop_sequences="$2";  shift 2 ;;
       *)
         echo "claude_api: unknown argument: $1" >&2
         return 1
@@ -187,6 +220,15 @@ claude_api() {
     return 1
   fi
 
+  # ── Validate temperature range if provided ────────────────────────────────
+  if [[ -n "$temperature" ]]; then
+    if ! echo "$temperature" | grep -qE '^[0-9]*\.?[0-9]+$' || \
+       (( $(echo "$temperature > 1.0" | bc -l 2>/dev/null) )); then
+      echo "claude_api: --temperature must be between 0.0 and 1.0" >&2
+      return 1
+    fi
+  fi
+
   # ── Ensure output directory exists ────────────────────────────────────────
   mkdir -p "$(dirname "$output_file")"
 
@@ -201,7 +243,9 @@ claude_api() {
   system_json=$(_claude_api_build_system_json "$system_text" "$cache_system")
 
   local payload
-  payload=$(_claude_api_build_payload "$model" "$max_tokens" "$system_json" "$user_text")
+  payload=$(_claude_api_build_payload \
+    "$model" "$max_tokens" "$system_json" "$user_text" \
+    "$temperature" "$top_p" "$top_k" "$stop_sequences")
 
   if [[ -z "$payload" ]]; then
     echo "claude_api: failed to build request payload (jq error?)" >&2

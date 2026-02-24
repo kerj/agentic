@@ -32,16 +32,44 @@ _show_current() {
   echo "  ANTHROPIC_AUTH_TOKEN: ${ANTHROPIC_AUTH_TOKEN:-not set}"
 }
 
-_switch_to_anthropic() {
-  # Read existing key from conf so we don't overwrite it
-  local existing_key
-  existing_key=$(grep 'ANTHROPIC_API_KEY=' "$CONF" 2>/dev/null | grep -v '^#' | head -1 | cut -d'"' -f2)
+_resolve_api_key() {
+  local key=""
 
-  if [[ -z "$existing_key" ]]; then
-    echo "⚠️  No ANTHROPIC_API_KEY found in $CONF"
-    read -p "Enter your Anthropic API key: " existing_key
-    [[ -z "$existing_key" ]] && echo "❌ No key provided" && return 1
+  # 1. Try reading live value from conf file (double-quoted format)
+  key=$(grep 'ANTHROPIC_API_KEY=' "$CONF" 2>/dev/null \
+    | grep -v '^#' \
+    | grep -v 'unset' \
+    | head -1 \
+    | cut -d'"' -f2)
+
+  # 2. Try reading stashed comment left by _switch_to_ollama
+  if [[ -z "$key" ]]; then
+    key=$(grep '^# ANTHROPIC_API_KEY=' "$CONF" 2>/dev/null \
+      | head -1 \
+      | cut -d'"' -f2)
   fi
+
+  # 3. Fall back to current shell environment
+  if [[ -z "$key" ]]; then
+    key="${ANTHROPIC_API_KEY:-}"
+  fi
+
+  # 4. Prompt if still not found
+  if [[ -z "$key" ]]; then
+    echo "⚠️  No ANTHROPIC_API_KEY found in conf or environment" >&2
+    read -p "Enter your Anthropic API key: " key
+    if [[ -z "$key" ]]; then
+      echo "❌ No key provided" >&2
+      return 1
+    fi
+  fi
+
+  echo "$key"
+}
+
+_switch_to_anthropic() {
+  local existing_key
+  existing_key=$(_resolve_api_key) || return 1
 
   cat > "$CONF" << EOF
 # ── Anthropic ──────────────────────────────────────────────────────────────
@@ -54,11 +82,16 @@ export OLLAMA_MAX_LOADED_MODELS=3
 export OLLAMA_KEEP_ALIVE="30m"
 EOF
 
+  chmod 600 "$CONF"
   echo "✅ Switched to Anthropic (claude-opus-4-20250514)"
   echo "   Run: source \$AGENTIC_HOME/.agentic.conf"
 }
 
 _switch_to_ollama() {
+  # Stash the API key before overwriting conf so switching back works without prompting
+  local stashed_key
+  stashed_key=$(_resolve_api_key 2>/dev/null || true)
+
   cat > "$CONF" << 'EOF'
 # ── Ollama / Qwen ──────────────────────────────────────────────────────────
 export AGENTIC_MODEL="qwen2.5-coder:32b"
@@ -70,9 +103,18 @@ export OLLAMA_MAX_LOADED_MODELS=3
 export OLLAMA_KEEP_ALIVE="30m"
 EOF
 
+  # Stash key as a comment so switching back to Anthropic works without prompting
+  if [[ -n "$stashed_key" ]]; then
+    echo "" >> "$CONF"
+    echo "# ANTHROPIC_API_KEY=\"$stashed_key\"" >> "$CONF"
+  fi
+
+  chmod 600 "$CONF"
   echo "✅ Switched to Ollama (qwen2.5-coder:32b)"
   echo "   Run: source \$AGENTIC_HOME/.agentic.conf"
 }
+
+# ── Main ───────────────────────────────────────────────────────────────────
 
 case "${1:-}" in
   anthropic|claude)

@@ -494,6 +494,7 @@ $execute_instruction"
       --model "$AGENTIC_MODEL" \
       --system "$system_prompt" \
       --cache-system \
+      --temperature  0.2 \
       --user "$user_prompt" \
       --output "$raw_output" \
       --usage "$session_dir/outputs/task_${task_id}_usage.json"
