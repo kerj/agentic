@@ -377,20 +377,113 @@ function validate() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AI reviewer — runs after static validation passes
+# AI reviewer — runs after static validation, or on-demand against git diff
+#
+# Modes (auto-detected, or forced with --diff):
+#   session  Uses session outputs + task plan (in-workflow or post-implement)
+#   diff     Uses `git diff HEAD` — for manual changes or post-apply review
 # ─────────────────────────────────────────────────────────────────────────────
 
 function review() {
   [[ -f "$AGENTIC_HOME/.agentic.conf" ]] && source "$AGENTIC_HOME/.agentic.conf"
 
-  local session_dir
-  session_dir=$(_apply_resolve_session)
-  if [[ -z "$session_dir" ]]; then
-    echo "❌ No active session."
-    return 1
+  # ── Flag parsing ───────────────────────────────────────────────────────────
+  local force_diff=false
+  local base_ref="HEAD"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --diff)        force_diff=true ; shift ;;
+      --diff=*)      force_diff=true ; base_ref="${1#--diff=}" ; shift ;;
+      *)             shift ;;
+    esac
+  done
+
+  # ── Build system prompt (shared by both modes) ─────────────────────────────
+  local reviewer_prompt
+  reviewer_prompt="$(cat "$AGENTIC_HOME/agents/reviewer.txt")"
+  if [[ -f "CLAUDE.md" ]]; then
+    reviewer_prompt="$reviewer_prompt
+
+PROJECT DOCUMENTATION (CLAUDE.md):
+$(cat CLAUDE.md)"
   fi
 
-  echo "🔎 Running AI review..."
+  # ── Decide mode ────────────────────────────────────────────────────────────
+  local session_dir
+  session_dir=$(_apply_resolve_session 2>/dev/null || echo "")
+
+  local use_diff=false
+  if [[ "$force_diff" == true ]]; then
+    use_diff=true
+  elif [[ -z "$session_dir" ]] || \
+       [[ ! -d "$session_dir/outputs" ]] || \
+       [[ -z "$(ls "$session_dir/outputs/"task_*.txt 2>/dev/null)" ]]; then
+    use_diff=true
+  fi
+
+  # ── DIFF MODE ──────────────────────────────────────────────────────────────
+  if [[ "$use_diff" == true ]]; then
+    echo "🔎 Running AI review (diff mode: $base_ref)..."
+    echo ""
+
+    if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+      echo "❌ Not a git repository — diff mode requires git"
+      return 1
+    fi
+
+    local git_diff
+    git_diff=$(git diff "$base_ref" 2>/dev/null)
+    # If nothing unstaged, try staged changes
+    if [[ -z "$git_diff" ]]; then
+      git_diff=$(git diff --staged 2>/dev/null)
+    fi
+
+    if [[ -z "$git_diff" ]]; then
+      echo "⚠️  No changes detected (git diff $base_ref is empty)"
+      return 0
+    fi
+
+    local changed_files
+    changed_files=$(git diff --name-only "$base_ref" 2>/dev/null)
+    local line_count
+    line_count=$(echo "$git_diff" | wc -l | tr -d ' ')
+    echo "📄 Changed files:"
+    echo "$changed_files" | sed 's/^/   /'
+    echo "   ($line_count lines of diff)"
+    echo ""
+
+    local review_input
+    review_input="CHANGES BEING REVIEWED (git diff $base_ref):
+
+$git_diff"
+
+    local review_output
+    review_output="$(pwd)/.claude/review-$(date +%Y%m%d-%H%M%S).txt"
+    mkdir -p "$(pwd)/.claude"
+
+    claude_api \
+      --model "$AGENTIC_MODEL" \
+      --system "$reviewer_prompt" \
+      --cache-system \
+      --temperature 0.3 \
+      --user "$review_input" \
+      --output "$review_output" \
+      --usage "${review_output%.txt}_usage.json"
+
+    if [[ $? -ne 0 ]]; then
+      echo "❌ Review API call failed"
+      return 1
+    fi
+
+    echo ""
+    cat "$review_output"
+    echo ""
+    echo "📄 Review saved: $review_output"
+    return 0
+  fi
+
+  # ── SESSION MODE ───────────────────────────────────────────────────────────
+  echo "🔎 Running AI review (session mode)..."
   echo ""
 
   local tasks_file="$session_dir/tasks.json"
@@ -404,7 +497,6 @@ function review() {
   local task_ids
   task_ids=($(_apply_get_task_ids "$tasks_file"))
 
-  # ── Build review payload ───────────────────────────────────────────────────
   local review_input
   review_input="ORIGINAL REQUEST:
 $(cat "$request_file")
@@ -426,16 +518,6 @@ GENERATED CODE:"
 $(cat "$output_file")"
   done
 
-  # ── System prompt: reviewer + optional CLAUDE.md ──────────────────────────
-  local reviewer_prompt
-  reviewer_prompt="$(cat "$AGENTIC_HOME/agents/reviewer.txt")"
-  if [[ -f "CLAUDE.md" ]]; then
-    reviewer_prompt="$reviewer_prompt
-
-PROJECT DOCUMENTATION (CLAUDE.md):
-$(cat CLAUDE.md)"
-  fi
-
   local review_output="$session_dir/review.txt"
 
   claude_api \
@@ -452,18 +534,16 @@ $(cat CLAUDE.md)"
     return 0
   fi
 
-  # ── Display review ─────────────────────────────────────────────────────────
   cat "$review_output"
   echo ""
 
-  # ── Parse verdict ──────────────────────────────────────────────────────────
+  # ── Parse verdict (session mode feeds back into refine loop) ───────────────
   local verdict
   verdict=$(grep "VERDICT:" "$review_output" | grep -oE 'APPROVED|REJECTED' | tail -1)
 
   case "$verdict" in
     REJECTED)
       echo "❌ Review: REJECTED"
-      # Extract critical issue lines and append to validation_issues.txt
       local critical
       critical=$(awk '/### Critical Issues/,/### (Warnings|Positive|Final|##)/' "$review_output" \
         | grep -E '^\s*[0-9]+\.' | sed 's/^[[:space:]]*//' | head -10)
@@ -477,7 +557,6 @@ $(cat CLAUDE.md)"
       ;;
     APPROVED)
       echo "✅ Review: APPROVED"
-      # Append any warnings
       local warnings
       warnings=$(awk '/### Warnings/,/### (Positive|Final|##)/' "$review_output" \
         | grep -E '^\s*[0-9]+\.' | sed 's/^[[:space:]]*//' | head -10)
