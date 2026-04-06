@@ -33,17 +33,17 @@ add_export:
   export const MAX_RETRIES = 3;
 
 add_to_function:
-  Output ONLY the new lines with 2 lines of context on each side.
-  // ... existing code ...
-  const { user } = useAuth();
-  setCurrentUser(user);
-  // ... existing code ...
+  Output the COMPLETE modified function from signature to closing brace.
+  Same format as modify_function — include the entire function with the new lines inserted.
+  export function handleSubmit(event: React.FormEvent) {
+    // ... all existing lines preserved ...
+    const validated = validate(data); // newly inserted line
+    // ... rest of function ...
+  }
 
 add_hook:
-  Output ONLY the new hook call with 2 lines of context.
-  // ... existing code ...
-  const [isValid, setIsValid] = useState(false);
-  // ... existing code ...
+  Output the COMPLETE modified component function from signature to closing brace.
+  Same format as modify_function — include the entire function with the new hook call inserted.
 
 add_route:
   Output ONLY the new route line.
@@ -68,7 +68,6 @@ CRITICAL OUTPUT RULES:
 - NO explanations or commentary before or after the code
 - Output ONLY what modification_type specifies — nothing more
 - Follow CLAUDE.md conventions exactly
-- Use sx prop (not inline styles) for MUI components
 
 CRITICAL - DO NOT REFACTOR:
 - Change ONLY what the task explicitly requires — nothing else

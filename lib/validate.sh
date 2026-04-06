@@ -375,3 +375,120 @@ function validate() {
     return 1
   fi
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI reviewer — runs after static validation passes
+# ─────────────────────────────────────────────────────────────────────────────
+
+function review() {
+  [[ -f "$AGENTIC_HOME/.agentic.conf" ]] && source "$AGENTIC_HOME/.agentic.conf"
+
+  local session_dir
+  session_dir=$(_apply_resolve_session)
+  if [[ -z "$session_dir" ]]; then
+    echo "❌ No active session."
+    return 1
+  fi
+
+  echo "🔎 Running AI review..."
+  echo ""
+
+  local tasks_file="$session_dir/tasks.json"
+  local request_file="$session_dir/request.txt"
+
+  if [[ ! -f "$tasks_file" || ! -f "$request_file" ]]; then
+    echo "⚠️  Missing tasks or request — skipping review"
+    return 0
+  fi
+
+  local task_ids
+  task_ids=($(_apply_get_task_ids "$tasks_file"))
+
+  # ── Build review payload ───────────────────────────────────────────────────
+  local review_input
+  review_input="ORIGINAL REQUEST:
+$(cat "$request_file")
+
+TASK PLAN:
+$(jq -r '.tasks[] | "[\(.id)] \(.action) \(.file) (\(.modification_type)) — \(.description)"' "$tasks_file" 2>/dev/null)
+
+GENERATED CODE:"
+
+  for task_id in "${task_ids[@]}"; do
+    local output_file="$session_dir/outputs/task_${task_id}.txt"
+    [[ ! -f "$output_file" ]] && continue
+    local task_file modification_type
+    task_file=$(jq -r ".tasks[]? | select(.id == \"$task_id\") | .file" "$tasks_file")
+    modification_type=$(jq -r ".tasks[]? | select(.id == \"$task_id\") | .modification_type" "$tasks_file")
+    review_input+="
+
+--- [$task_id] $task_file ($modification_type) ---
+$(cat "$output_file")"
+  done
+
+  # ── System prompt: reviewer + optional CLAUDE.md ──────────────────────────
+  local reviewer_prompt
+  reviewer_prompt="$(cat "$AGENTIC_HOME/agents/reviewer.txt")"
+  if [[ -f "CLAUDE.md" ]]; then
+    reviewer_prompt="$reviewer_prompt
+
+PROJECT DOCUMENTATION (CLAUDE.md):
+$(cat CLAUDE.md)"
+  fi
+
+  local review_output="$session_dir/review.txt"
+
+  claude_api \
+    --model "$AGENTIC_MODEL" \
+    --system "$reviewer_prompt" \
+    --cache-system \
+    --temperature 0.3 \
+    --user "$review_input" \
+    --output "$review_output" \
+    --usage "$session_dir/review_usage.json"
+
+  if [[ $? -ne 0 ]]; then
+    echo "⚠️  Review API call failed — skipping"
+    return 0
+  fi
+
+  # ── Display review ─────────────────────────────────────────────────────────
+  cat "$review_output"
+  echo ""
+
+  # ── Parse verdict ──────────────────────────────────────────────────────────
+  local verdict
+  verdict=$(grep "VERDICT:" "$review_output" | grep -oE 'APPROVED|REJECTED' | tail -1)
+
+  case "$verdict" in
+    REJECTED)
+      echo "❌ Review: REJECTED"
+      # Extract critical issue lines and append to validation_issues.txt
+      local critical
+      critical=$(awk '/### Critical Issues/,/### (Warnings|Positive|Final|##)/' "$review_output" \
+        | grep -E '^\s*[0-9]+\.' | sed 's/^[[:space:]]*//' | head -10)
+      local issues_file="$session_dir/validation_issues.txt"
+      if [[ -n "$critical" ]]; then
+        echo "$critical" >> "$issues_file"
+      else
+        echo "Review rejected implementation — see $session_dir/review.txt" >> "$issues_file"
+      fi
+      return 1
+      ;;
+    APPROVED)
+      echo "✅ Review: APPROVED"
+      # Append any warnings
+      local warnings
+      warnings=$(awk '/### Warnings/,/### (Positive|Final|##)/' "$review_output" \
+        | grep -E '^\s*[0-9]+\.' | sed 's/^[[:space:]]*//' | head -10)
+      if [[ -n "$warnings" ]]; then
+        echo "$warnings" >> "$session_dir/validation_warnings.txt"
+      fi
+      return 0
+      ;;
+    *)
+      echo "⚠️  Could not parse review verdict — treating as passed"
+      return 0
+      ;;
+  esac
+}

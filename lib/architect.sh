@@ -26,6 +26,22 @@ function _archie_build_context() {
   fi
   echo "" >> "$context_file"
 
+  if [[ -f "package.json" ]]; then
+    local scripts
+    scripts=$(jq -r '.scripts // {} | to_entries[] | "\(.key): \(.value)"' package.json 2>/dev/null)
+    if [[ -n "$scripts" ]]; then
+      echo "=== PACKAGE SCRIPTS ===" >> "$context_file"
+      echo "$scripts" >> "$context_file"
+      echo "" >> "$context_file"
+    fi
+  fi
+
+  if [[ -f "tsconfig.json" ]]; then
+    echo "=== TSCONFIG (path aliases and compiler options) ===" >> "$context_file"
+    cat tsconfig.json >> "$context_file"
+    echo "" >> "$context_file"
+  fi
+
   echo "=== EXISTING SOURCE FILES ===" >> "$context_file"
   find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) \
     -not -path "*/node_modules/*" \
@@ -80,12 +96,44 @@ function archie() {
   local context_file="$session_dir/context.txt"
   _archie_build_context "$context_file"
 
+  # ── Optional design pass ───────────────────────────────────────────────────
+  local design_spec=""
+  read -p "🎨 Run designer for a layout spec first? (y/n) " run_design
+  if [[ "$run_design" =~ ^[Yy]$ ]]; then
+    echo "🎨 Generating design spec..."
+    local designer_prompt
+    designer_prompt="$(cat "$AGENTIC_HOME/agents/designer.txt")"
+    local design_context=""
+    [[ -f "CLAUDE.md" ]] && design_context="PROJECT DOCUMENTATION:
+$(cat CLAUDE.md)
+
+"
+    local design_output="$session_dir/design.txt"
+    claude_api \
+      --model "$AGENTIC_MODEL" \
+      --system "$designer_prompt" \
+      --cache-system \
+      --temperature 0.7 \
+      --user "${design_context}USER REQUEST:
+$user_message" \
+      --output "$design_output" \
+      --usage "$session_dir/design_usage.json"
+    if [[ -s "$design_output" ]]; then
+      design_spec="
+DESIGN SPECIFICATION:
+$(cat "$design_output")"
+      echo ""
+      echo "📐 Design spec saved to $design_output"
+      echo ""
+    fi
+  fi
+
   local architect_prompt="$(cat $AGENTIC_HOME/agents/architect.txt)"
   local user_prompt="$(cat "$context_file")
 
 USER REQUEST:
 $(cat "$session_dir/request.txt")
-
+${design_spec}
 Output tasks as valid JSON. Use arrays for multi-line content, not \n.
 The 'target' field must be the exact identifier as it appears in source code (e.g. 'getProviderMonthData', not 'getProviderMonthData function').
 DO NOT wrap output in markdown code fences. Output raw JSON only."

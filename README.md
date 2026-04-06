@@ -8,10 +8,13 @@ Agentic discovers your project structure, learns your patterns, generates code w
 
 **Workflow:**
 ```
-Your Request → Plan (Architect) → Generate (Implementor) → Validate → Apply → Done
-                     ↓                        ↓                ↓ (if issues)
-              Discovers structure    Reads actual source    Refine → Iterate
+Your Request → [Design?] → Plan → Generate → Static Validate → AI Review → Apply → Done
+                  ↓          ↓         ↓               ↓              ↓ (if issues)
+             UI layout   Discovers  Reads actual   Shape/import    Correctness    Refine → Iterate
+              spec        structure   source        checks          & quality
 ```
+
+The `[Design?]` step is optional — you're always asked at the start of planning.
 
 ---
 
@@ -98,10 +101,16 @@ This detects whether you're using the Anthropic API or a local Ollama endpoint a
 ### Agent Prompts
 
 System prompts are in `~/.agentic/agents/`:
-- `architect.txt` — Task breakdown logic (required)
-- `implementor.txt` — Code generation rules (required)
-- `documenter.txt` — Documentation generation (optional)
-- `planner.txt` — Agile story breakdown (optional)
+
+| File | Role | When used |
+|------|------|-----------|
+| `architect.txt` | Breaks request into atomic tasks (JSON) | Every run |
+| `implementor.txt` | Generates code per task | Every run |
+| `reviewer.txt` | AI code review for correctness & quality | After static validation passes |
+| `designer.txt` | UI layout spec before planning | Optional — prompted for UI tasks |
+| `documenter.txt` | CLAUDE.md generation | `agentic doc-gen` |
+
+All agents are JS/TS focused. Framework-specific conventions (MUI, React, Tailwind, etc.) belong in your project's `CLAUDE.md`, not in the agent prompts.
 
 ---
 
@@ -117,27 +126,30 @@ agentic init
 # 2. Run the full workflow
 agentic
 # Enter: "Add user authentication to the login form"
-# → Discovers structure
+# → Discovers structure (reads tsconfig, package.json scripts, source files)
+# → Prompts for design spec if UI-related
 # → Plans tasks
 # → Generates code
-# → Validates quality
+# → Static validation (shape, imports, brace balance, test framework)
+# → AI review (correctness, completeness, CLAUDE.md conventions)
 # → Applies safely
 ```
 
-The orchestrator runs up to 5 iterations of implement → validate → refine before asking whether to proceed or stop.
+The orchestrator runs up to 5 iterations of implement → validate → AI review → refine before asking whether to proceed or stop.
 
 ### Step-by-Step (Manual Control)
 ```bash
 agentic archie          # Plan — creates .claude/latest/tasks.json
 agentic implement       # Generate code → .claude/latest/outputs/
-agentic validate        # Check quality
+agentic validate        # Static quality checks
+agentic review          # AI review (correctness & quality)
 agentic apply --dry-run # Preview changes
 agentic apply           # Apply for real
 ```
 
 ### Iterative Refinement
 ```bash
-# If validation fails:
+# If validation or review fails:
 agentic refine          # Reads issues, improves plan, re-runs architect
 agentic implement       # Regenerate with improved plan
 agentic apply
@@ -169,7 +181,8 @@ agentic apply
 |---------|-------------|
 | `agentic archie` | Create task breakdown only |
 | `agentic implement` | Generate code for all tasks |
-| `agentic validate` | Run quality checks |
+| `agentic validate` | Run static quality checks |
+| `agentic review` | Run AI review on generated outputs |
 | `agentic apply` | Apply changes to files |
 | `agentic apply --dry-run` | Preview changes without applying |
 | `agentic verify` | Verify applied changes match plan |
@@ -188,9 +201,15 @@ your-project/
 │   │       ├── request.txt         # Original request
 │   │       ├── context.txt         # Project context snapshot
 │   │       ├── tasks.json          # Task breakdown
+│   │       ├── design.txt          # UI design spec (if designer ran)
+│   │       ├── review.txt          # AI review output
 │   │       ├── architect_usage.json
+│   │       ├── review_usage.json
+│   │       ├── validation_issues.txt
+│   │       ├── validation_warnings.txt
 │   │       └── outputs/
-│   │           ├── task_001.txt
+│   │           ├── task_001.txt         # Stitched output (ready to apply)
+│   │           ├── task_001_raw.txt     # Pre-stitch model output (for validation)
 │   │           ├── task_001_usage.json
 │   │           └── task_002.txt
 │   ├── plans/                  # Agile planning outputs
@@ -208,9 +227,9 @@ your-project/
 │   ├── config.sh               # Configuration management
 │   ├── utils.sh                # Shared utilities (_session_slug, format_duration, etc.)
 │   ├── claude-api.sh           # Direct Anthropic API client (curl-based, with retry)
-│   ├── architect.sh            # Task planning & project discovery
+│   ├── architect.sh            # Task planning, project discovery, optional design step
 │   ├── implement.sh            # Code generation with stitching
-│   ├── validate.sh             # Multi-level validation
+│   ├── validate.sh             # Static validation + AI review
 │   ├── apply.sh                # Safe file operations & verify-apply
 │   ├── refine.sh               # Iterative improvement
 │   ├── plan.sh                 # Agile planning tool
@@ -220,10 +239,11 @@ your-project/
 │   ├── init.sh                 # Project initialization
 │   └── core.sh                 # Main orchestrator
 ├── agents/
-│   ├── architect.txt
-│   ├── implementor.txt
-│   ├── documenter.txt          # optional
-│   └── planner.txt             # optional
+│   ├── architect.txt           # Task breakdown logic
+│   ├── implementor.txt         # Code generation rules
+│   ├── reviewer.txt            # AI code review (JS/TS, correctness & quality)
+│   ├── designer.txt            # UI layout spec (framework-agnostic)
+│   └── documenter.txt          # CLAUDE.md generation
 ├── .agentic.conf               # Your config — gitignored
 └── .agentic.conf.example       # Safe template — committed to repo
 ```
@@ -237,9 +257,11 @@ your-project/
 The architect builds context by scanning the actual filesystem — no hardcoded assumptions about `src/` vs `app/` vs `lib/`:
 
 1. Reads `CLAUDE.md` for project conventions
-2. Lists all source files excluding `node_modules`, `dist`, `build`, etc.
-3. Lists existing test files to infer co-location patterns
-4. Sends to the architect agent which outputs a `tasks.json` with accurate file paths and `modification_type` per task
+2. Reads `tsconfig.json` for path aliases and compiler options (helps generate correct import paths)
+3. Reads `package.json` scripts so it knows the test command, build command, etc.
+4. Lists all TS/JS source files excluding `node_modules`, `dist`, `build`, etc.
+5. Lists existing test files to infer co-location patterns
+6. Sends everything to the architect agent which outputs a `tasks.json` with accurate file paths and `modification_type` per task
 
 Each task specifies not just a file and action but a `modification_type`:
 
@@ -250,16 +272,33 @@ Each task specifies not just a file and action but a `modification_type`:
 | `add_function` | Append a new function |
 | `add_type` | Insert a type/interface after imports |
 | `modify_function` | Replace a specific function by name |
-| `add_to_function` | Add code inside an existing function |
+| `add_to_function` | Add code inside an existing function (outputs full replacement function) |
 | `add_route` | Insert a route before the closing router tag |
 | `delete_code` | Remove a specific function/export |
+
+### 1b. Optional Design Step (Designer)
+
+At the start of every planning run, `archie` prompts:
+
+```
+🎨 Run designer for a layout spec first? (y/n)
+```
+
+If accepted, the designer agent produces a layout specification — component hierarchy, layout structure, responsive behavior, interaction states — and passes it to the architect as additional context. The designer reads your `CLAUDE.md` to know which UI framework you use; it doesn't assume any specific library.
+
+The design spec is saved to `design.txt` in the session directory.
 
 ### 2. Context-Aware Generation (Implementor)
 
 For each task the implementor:
 
 - Loads only the relevant section of the source file (not the whole file) based on `modification_type` — saves tokens and improves accuracy
-- For `modify_function` / `add_to_function`: uses brace-counting to locate the exact function range
+- For `modify_function` / `add_to_function` / `add_hook`: uses brace-counting to locate the exact function range. Detection covers:
+  - Named functions with optional modifiers: `export async function foo<T>(`
+  - Arrow functions: `const foo =`, `const foo: Type =`
+  - Class declarations including generics: `class Foo<T>`
+  - Class methods with all TypeScript modifiers: `private/public/protected/static/async/override/abstract methodName(`
+  - Class arrow methods: `methodName = async (`
 - For test files, runs a 4-strategy source file discovery process:
   - **Strategy 0**: Parse full path from task description (e.g. `"Create tests for app/utils/table.ts"`)
   - **Strategy 1**: Extract `src/` path from description
@@ -268,22 +307,18 @@ For each task the implementor:
 - Injects the actual source code into the prompt so generated tests use real function signatures
 
 After generation, partial outputs are **stitched** back into the original file:
-- `add_import` → inserted after the last existing import line
+- `add_import` → inserted after the last existing import (handles multi-line imports correctly)
 - `add_function` / `add_export` → appended to end of file
 - `add_type` → inserted after imports
-- `modify_function` → replaces the located line range
+- `modify_function` / `add_to_function` → replaces the located line range
 - `add_route` → inserted before `</Routes>` / `</Switch>`
 
-### 3. Multi-Level Validation
-
-**Pre-apply (inside `apply`):**
-- File paths have extensions
-- Output files exist for non-DELETE tasks
+### 3. Static Validation
 
 **Content validation (`validate`):**
 - Stray markdown fences
 - Placeholder/TODO markers (`...`, `// implement`, etc.)
-- Brace balance for TypeScript/JS
+- Brace balance for TypeScript/JS files (strips template literals and `${}` expressions before counting)
 - Vitest/Jest mixing detection in test files
 - JSON validity for `.json` files
 - Package import existence in `package.json`
@@ -294,12 +329,37 @@ After generation, partial outputs are **stitched** back into the original file:
 
 Issues are saved to `validation_issues.txt` for `refine` to consume. Warnings are saved separately and don't block `apply`.
 
+**Pre-apply (inside `apply`):**
+- File paths have extensions
+- Output files exist for non-DELETE tasks
+
 **Post-apply (`verify-apply`):**
 - Confirms CREATE/MODIFY/DELETE actually happened
 - For MODIFY, checks the file changed vs its backup
 - For `delete_code`, checks the file still exists but differs from backup
 
-### 4. Safe Application
+### 4. AI Review
+
+When static validation passes, the AI reviewer runs automatically before apply. It receives:
+- The original request
+- The full task plan
+- All generated outputs with their file paths and `modification_type`
+- Your `CLAUDE.md` (for conventions)
+
+The reviewer checks:
+- **Correctness** — does the implementation actually do what was asked?
+- **Edge cases** — null/undefined handling, error handling, empty inputs
+- **Type safety** — no untyped `any`, no unsafe casts
+- **Completeness** — all tasks implemented, no missing exports
+- **Conventions** — follows CLAUDE.md patterns, correct test framework, correct import paths
+- **Minimal change** — didn't touch things it wasn't asked to change
+
+`VERDICT: APPROVED` → proceeds to apply (warnings written to `validation_warnings.txt`)
+`VERDICT: REJECTED` → critical issues appended to `validation_issues.txt`, triggers refine loop
+
+The full review is saved to `review.txt` in the session directory.
+
+### 5. Safe Application
 
 `apply` runs these steps in order:
 1. Pre-apply validation (file paths, output existence)
@@ -312,9 +372,9 @@ Issues are saved to `validation_issues.txt` for `refine` to consume. Warnings ar
 
 `apply --dry-run` shows exactly what would happen without touching the filesystem.
 
-### 5. Iterative Refinement
+### 6. Iterative Refinement
 
-`refine` reads `validation_issues.txt`, appends the issues to the original request, and re-runs the architect agent. It backs up `tasks.json` as `tasks.json.iteration-N` and clears old outputs so `implement` starts clean.
+`refine` reads `validation_issues.txt` (which can contain issues from both static validation and the AI reviewer), appends them to the original request, and re-runs the architect agent. It backs up `tasks.json` as `tasks.json.iteration-N` and clears old outputs so `implement` starts clean.
 
 The `agentic` orchestrator loops this automatically up to 5 times before prompting the user.
 
@@ -362,6 +422,8 @@ agentic doc-gen   # Regenerate after major structural changes
 agentic doc       # Open in $EDITOR for manual edits
 ```
 
+Framework-specific conventions (styling rules, component patterns, test utilities) belong in `CLAUDE.md` — that's how the agents learn your project's style without being hardcoded to any particular library.
+
 ### Recover a Corrupted Session
 ```bash
 agentic use       # Pick the broken session
@@ -400,9 +462,21 @@ agentic archie
 ```
 Or update `CLAUDE.md` with the correct test location pattern.
 
+### "Function not found — falling back to full file"
+The implementor couldn't locate the target function. This usually means:
+- The `target` field in `tasks.json` doesn't exactly match the function name in source
+- The function uses an unusual TypeScript pattern
+
+```bash
+cat .claude/latest/tasks.json        # Check the target field
+grep -n "targetName" path/to/file.ts # Verify exact identifier
+nano .claude/latest/tasks.json       # Fix target, then re-run implement
+```
+
 ### Validation keeps failing
 ```bash
 cat .claude/latest/validation_issues.txt   # See exact issues
+cat .claude/latest/review.txt              # See AI review details
 nano .claude/latest/outputs/task_001.txt   # Fix manually
 agentic validate
 agentic apply
@@ -434,6 +508,7 @@ Steps:
   architect:     5s | 2100 tokens  | success
   implement_1: 125s | 11800 tokens | success
   validate_1:    2s | 0 tokens     | success
+  review_1:     18s | 1200 tokens  | success
   apply:         8s | 0 tokens     | success
 ```
 
@@ -453,9 +528,10 @@ agentic switch status     # Show current provider
 
 # Main workflow
 agentic                   # Complete orchestrated workflow
-agentic archie            # Plan only
+agentic archie            # Plan only (always prompts for optional design step)
 agentic implement         # Generate only
-agentic validate          # Validate only
+agentic validate          # Static checks only
+agentic review            # AI review only
 agentic apply --dry-run   # Preview
 agentic apply             # Apply
 
@@ -476,7 +552,9 @@ agentic plan              # Agile planning
 
 ## 🤝 Contributing
 
-- **Add validation rules**: `lib/validate.sh`
+- **Add validation rules**: `lib/validate.sh` — `validate()` function
+- **Improve AI review**: `agents/reviewer.txt` or `lib/validate.sh` — `review()` function
+- **Improve function detection**: `lib/implement.sh` — `_find_function_range()`
 - **Improve test discovery**: `lib/implement.sh` — `_find_source_for_test()`
 - **Improve stitching**: `lib/implement.sh` — `_stitch_*` helpers
 - **Better prompts**: `agents/*.txt`

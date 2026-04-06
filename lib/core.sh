@@ -113,6 +113,27 @@ function agentic() {
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo ""
 
+    # ── AI review (runs only when static validation passes) ───────────────────
+    if [[ ! -f "$session_dir/validation_issues.txt" || \
+          ! -s "$session_dir/validation_issues.txt" ]]; then
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo "Step 3b: AI Review"
+      echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+      echo ""
+
+      local review_start review_end
+      review_start=$(date +%s)
+      review || true   # review() appends to validation_issues.txt on REJECTED
+      review_end=$(date +%s)
+      local review_tokens
+      review_tokens=$(jq -r '(.input_tokens // 0) + (.output_tokens // 0)' \
+        "$session_dir/review_usage.json" 2>/dev/null || echo 0)
+      echo "⏱️  Review: $(( review_end - review_start ))s | tokens: $review_tokens"
+      echo ""
+      log_step_metrics "$metrics_file" "review_${iteration}" \
+        "$(( review_end - review_start ))" "$review_tokens" "success"
+    fi
+
     if [[ -f "$session_dir/validation_issues.txt" && \
           -s "$session_dir/validation_issues.txt" ]]; then
       local issue_count

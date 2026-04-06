@@ -5,7 +5,31 @@
 # ─────────────────────────────────────────────────────────────────────────────
 _find_last_import_line() {
   local file="$1"
-  grep -n "^import " "$file" | tail -1 | cut -d: -f1
+
+  # Find the start line of the last top-level import statement
+  local last_start
+  last_start=$(grep -n "^import " "$file" | tail -1 | cut -d: -f1)
+  [[ -z "$last_start" ]] && echo "" && return
+
+  # Single-line import (has semicolon on the same line)
+  if sed -n "${last_start}p" "$file" | grep -q ';'; then
+    echo "$last_start"
+    return
+  fi
+
+  # Multi-line import — scan forward to the line that closes with a semicolon
+  local total_lines
+  total_lines=$(wc -l < "$file" | tr -d ' ')
+  local n=$last_start
+  while [[ $n -le $total_lines ]]; do
+    if sed -n "${n}p" "$file" | grep -q ';'; then
+      echo "$n"
+      return
+    fi
+    ((n++))
+  done
+
+  echo "$last_start"
 }
 
 _find_function_range() {
@@ -14,7 +38,7 @@ _find_function_range() {
 
   local start_line
   start_line=$(grep -n \
-    -E "(export )?(default )?(async )?function[[:space:]]+${target}[[:space:](]|(export )?(const|let|var)[[:space:]]+${target}[[:space:]]*=|(export )?class[[:space:]]+${target}[[:space:{(]" \
+    -E "(export )?(default )?(async )?function[[:space:]]+${target}[[:space:](<]|(export )?(const|let|var)[[:space:]]+${target}[[:space:]]*[=:]|(export )?(abstract )?class[[:space:]]+${target}([[:space:]{<(]|$)|^[[:space:]]+(async[[:space:]]+|static[[:space:]]+|private[[:space:]]+|public[[:space:]]+|protected[[:space:]]+|override[[:space:]]+|abstract[[:space:]]+)*${target}[[:space:]]*[(<]|^[[:space:]]+(private[[:space:]]+|public[[:space:]]+|protected[[:space:]]+|static[[:space:]]+|readonly[[:space:]]+)*${target}[[:space:]]*=[[:space:]]*(async[[:space:]]+)?\(" \
     "$file" | head -1 | cut -d: -f1)
 
   if [[ -z "$start_line" ]]; then
@@ -32,7 +56,7 @@ _find_function_range() {
     [[ $line_num -lt $start_line ]] && continue
 
     local stripped
-    stripped=$(echo "$line" | sed "s/\"[^\"]*\"//g; s/'[^']*'//g")
+    stripped=$(echo "$line" | sed "s/\`[^\`]*\`//g; s/\\\${[^}]*}//g; s/\"[^\"]*\"//g; s/'[^']*'//g")
 
     local opens closes
     opens=$(echo "$stripped" | tr -cd '{' | wc -c | tr -d ' ')
