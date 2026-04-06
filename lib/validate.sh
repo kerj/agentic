@@ -35,6 +35,13 @@ function validate() {
     task_file=$(_apply_clean_path "$task_file")
 
     local output_file="$session_dir/outputs/task_${task_id}.txt"
+    # For partial modifications (modify_function etc.) implement() stitches
+    # the model's output into a full file and leaves the pre-stitch model
+    # output at task_${id}_raw.txt. Shape checks — "did the model return
+    # only a function?" — must read the raw file, not the stitched one.
+    local raw_model_output="$session_dir/outputs/task_${task_id}_raw.txt"
+    local check_file="$output_file"
+    [[ -f "$raw_model_output" ]] && check_file="$raw_model_output"
 
     echo "Task $task_id ($modification_type): $task_desc"
 
@@ -77,9 +84,11 @@ function validate() {
     fi
 
     # ── Placeholder / incomplete code ────────────────────────────────────────
+    # Run against the model's raw output so we don't false-positive on
+    # pre-existing TODO comments carried through by stitching.
     if grep -qiE \
-      '^\s*\.\.\.$|\.\.\..*rest.*code|\.\.\..*omitted|\.\.\..*more|// TODO|// your code here|// implement|/\* implement|// placeholder|// add implementation' \
-      "$output_file"; then
+      '^\s*\.\.\.$|\.\.\..*rest.*code|\.\.\..*omitted|\.\.\..*more|// your code here|// implement|/\* implement|// placeholder|// add implementation' \
+      "$check_file"; then
       echo "  ❌ Contains placeholder text — output is incomplete"
       issues+=("Task $task_id ($task_file): Output contains placeholder text or TODO markers")
     fi
@@ -93,17 +102,20 @@ function validate() {
     # ── modification_type shape checks ───────────────────────────────────────
     case "$modification_type" in
       add_import)
-        if [[ $output_lines -gt 3 ]]; then
-          echo "  ⚠️  add_import output is $output_lines lines — expected 1"
-          warnings+=("Task $task_id: add_import should be ~1 line, got $output_lines")
+        # Shape check against raw model output (stitched file is the full file).
+        local shape_lines=$output_lines
+        [[ -f "$raw_model_output" ]] && shape_lines=$(wc -l < "$raw_model_output" | tr -d ' ')
+        if [[ $shape_lines -gt 3 ]]; then
+          echo "  ⚠️  add_import output is $shape_lines lines — expected 1"
+          warnings+=("Task $task_id: add_import should be ~1 line, got $shape_lines")
         else
-          echo "  ✅ Import shape correct ($output_lines line(s))"
+          echo "  ✅ Import shape correct ($shape_lines line(s))"
         fi
 
         # Duplicate import — check if this import already exists in source file
         if [[ -f "$task_file" ]]; then
           local import_symbol
-          import_symbol=$(grep -oE '\{[^}]+\}' "$output_file" | head -1 | tr -d '{ }')
+          import_symbol=$(grep -oE '\{[^}]+\}' "$check_file" | head -1 | tr -d '{ }')
           if [[ -n "$import_symbol" ]] && grep -q "$import_symbol" "$task_file"; then
             echo "  ⚠️  '$import_symbol' may already be imported in $task_file"
             warnings+=("Task $task_id: '$import_symbol' may already be imported — could cause duplicate")
@@ -112,31 +124,37 @@ function validate() {
         ;;
 
       add_route)
-        if [[ $output_lines -gt 3 ]]; then
-          echo "  ⚠️  add_route output is $output_lines lines — expected 1"
-          warnings+=("Task $task_id: add_route should be ~1 line, got $output_lines")
+        local route_lines=$output_lines
+        [[ -f "$raw_model_output" ]] && route_lines=$(wc -l < "$raw_model_output" | tr -d ' ')
+        if [[ $route_lines -gt 3 ]]; then
+          echo "  ⚠️  add_route output is $route_lines lines — expected 1"
+          warnings+=("Task $task_id: add_route should be ~1 line, got $route_lines")
         else
-          echo "  ✅ Route shape correct ($output_lines line(s))"
+          echo "  ✅ Route shape correct ($route_lines line(s))"
         fi
         ;;
 
       add_export)
-        if [[ $output_lines -gt 5 ]]; then
-          echo "  ⚠️  add_export seems large ($output_lines lines)"
-          warnings+=("Task $task_id: add_export seems large at $output_lines lines")
+        local export_lines=$output_lines
+        [[ -f "$raw_model_output" ]] && export_lines=$(wc -l < "$raw_model_output" | tr -d ' ')
+        if [[ $export_lines -gt 5 ]]; then
+          echo "  ⚠️  add_export seems large ($export_lines lines)"
+          warnings+=("Task $task_id: add_export seems large at $export_lines lines")
         fi
         ;;
 
       modify_function|add_to_function|add_hook|wrap_component)
-        # These should NOT contain import statements — that means full file was output
-        if grep -qE "^import " "$output_file"; then
+        # These should NOT contain import statements — that means full file was output.
+        # CRITICAL: must read raw_model_output. After implement() stitches,
+        # $output_file is the full file and WILL contain imports legitimately.
+        if [[ -f "$raw_model_output" ]] && grep -qE "^import " "$raw_model_output"; then
           echo "  ❌ $modification_type output contains import statements — model output full file instead of just the function"
           issues+=("Task $task_id ($task_file): $modification_type output contains imports — stitching will corrupt the file")
         fi
 
         # Target function name should appear in output
         if [[ -n "$target" && "$target" != "null" ]]; then
-          if ! grep -q "$target" "$output_file"; then
+          if ! grep -q "$target" "$check_file"; then
             echo "  ⚠️  Target '$target' not found in output — model may have rewritten wrong function"
             warnings+=("Task $task_id: Target '$target' not found in output")
           fi

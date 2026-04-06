@@ -14,7 +14,7 @@ _find_function_range() {
 
   local start_line
   start_line=$(grep -n \
-    -E "(export )?(default )?(async )?function[[:space:]]+${target}[[:space:](]|(export )?(const|let|var)[[:space:]]+${target}[[:space:]]*=|(export )?class[[:space:]]+${target}[[:space:]{(]" \
+    -E "(export )?(default )?(async )?function[[:space:]]+${target}[[:space:](]|(export )?(const|let|var)[[:space:]]+${target}[[:space:]]*=|(export )?class[[:space:]]+${target}[[:space:{(]" \
     "$file" | head -1 | cut -d: -f1)
 
   if [[ -z "$start_line" ]]; then
@@ -597,6 +597,9 @@ $execute_instruction"
         if [[ $shrink -lt -30 ]]; then
           echo "  ⚠️  Output is $((shrink * -1)) lines shorter than original — review before applying"
         fi
+        # Preserve the pre-stitch model output so validate() can inspect
+        # what the model actually produced, not the stitched full file.
+        cp "$raw_output" "$session_dir/outputs/task_${task_id}_raw.txt"
         mv "$stitched" "$raw_output"
       fi
     fi
