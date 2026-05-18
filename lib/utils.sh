@@ -22,7 +22,6 @@ format_duration() {
 _apply_clean_path() {
   local path="$1"
   path="${path#$(pwd)/}"
-  path=$(echo "$path" | sed 's|^/[^/]*/[^/]*/[^/]*/[^/]*/||')
   echo "$path"
 }
 

@@ -77,6 +77,10 @@ case "${1:-}" in
   validate)
     validate
     ;;
+  review)
+    shift
+    review "$@"
+    ;;
   apply)
     shift
     apply "$@"
@@ -86,6 +90,9 @@ case "${1:-}" in
     ;;
   refine)
     refine
+    ;;
+  repair)
+    repair
     ;;
   
   # Version & help
@@ -121,9 +128,13 @@ LOW-LEVEL WORKFLOW (Expert Mode):
   agentic archie          Create task breakdown only
   agentic implement       Generate code for tasks
   agentic validate        Run quality validation
+  agentic review          AI review (auto: session or git diff)
+  agentic review --diff   Force git diff review against HEAD
+  agentic review --diff=<ref>  Review diff against a specific ref
   agentic apply [--dry-run]  Apply changes to files
   agentic verify          Verify applied changes match plan
-  agentic refine          Refine plan based on validation issues
+  agentic repair          Fix failing tasks in place (keeps the plan)
+  agentic refine          Replan from scratch (use when the plan itself is wrong)
 
 EXAMPLES:
   # Complete workflow

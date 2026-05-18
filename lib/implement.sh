@@ -5,7 +5,31 @@
 # ─────────────────────────────────────────────────────────────────────────────
 _find_last_import_line() {
   local file="$1"
-  grep -n "^import " "$file" | tail -1 | cut -d: -f1
+
+  local last_start
+  last_start=$(grep -n "^import " "$file" | tail -1 | cut -d: -f1)
+  [[ -z "$last_start" ]] && echo "" && return
+
+  # Single-line import: ends on the same line as `from '...'`
+  # Handles both semicolon and no-semicolon codebases.
+  if sed -n "${last_start}p" "$file" | grep -qE "from ['\"][^'\"]*['\"]"; then
+    echo "$last_start"
+    return
+  fi
+
+  # Multi-line import — scan forward to the closing `from '...'` line
+  local total_lines
+  total_lines=$(wc -l < "$file" | tr -d ' ')
+  local n=$((last_start + 1))
+  while [[ $n -le $total_lines ]]; do
+    if sed -n "${n}p" "$file" | grep -qE "from ['\"][^'\"]*['\"]"; then
+      echo "$n"
+      return
+    fi
+    ((n++))
+  done
+
+  echo "$last_start"
 }
 
 _find_function_range() {
@@ -14,8 +38,15 @@ _find_function_range() {
 
   local start_line
   start_line=$(grep -n \
-    -E "(export )?(default )?(async )?function[[:space:]]+${target}[[:space:](]|(export )?(const|let|var)[[:space:]]+${target}[[:space:]]*=|(export )?class[[:space:]]+${target}[[:space:{(]" \
+    -E "(export )?(default )?(async )?function[[:space:]]+${target}[[:space:](<]|(export )?(const|let|var)[[:space:]]+${target}[[:space:]]*[=:]|(export )?(abstract )?class[[:space:]]+${target}([[:space:]{<(]|$)|^[[:space:]]+(async[[:space:]]+|static[[:space:]]+|private[[:space:]]+|public[[:space:]]+|protected[[:space:]]+|override[[:space:]]+|abstract[[:space:]]+)*${target}[[:space:]]*[(<]|^[[:space:]]+(private[[:space:]]+|public[[:space:]]+|protected[[:space:]]+|static[[:space:]]+|readonly[[:space:]]+)*${target}[[:space:]]*=[[:space:]]*(async[[:space:]]+)?\(" \
     "$file" | head -1 | cut -d: -f1)
+
+  # Test framework blocks: describe/it/test/beforeEach/afterEach where target is the description string
+  if [[ -z "$start_line" ]]; then
+    start_line=$(grep -n \
+      -E "(describe|it|test|beforeEach|afterEach|beforeAll|afterAll)[[:space:]]*\([[:space:]]*['\"]${target}['\"]" \
+      "$file" | head -1 | cut -d: -f1)
+  fi
 
   if [[ -z "$start_line" ]]; then
     echo ""
@@ -32,7 +63,7 @@ _find_function_range() {
     [[ $line_num -lt $start_line ]] && continue
 
     local stripped
-    stripped=$(echo "$line" | sed "s/\"[^\"]*\"//g; s/'[^']*'//g")
+    stripped=$(echo "$line" | sed "s/\`[^\`]*\`//g; s/\\\${[^}]*}//g; s/\"[^\"]*\"//g; s/'[^']*'//g")
 
     local opens closes
     opens=$(echo "$stripped" | tr -cd '{' | wc -c | tr -d ' ')
@@ -299,23 +330,42 @@ $project_doc"
     echo "  File: $task_file ($task_action / $modification_type)"
     [[ -n "$target" && "$target" != "null" ]] && echo "  Target: $target"
 
-    local clean_task_file="${task_file#/Users/*/Projects/*/projects/*/}"
-    clean_task_file="${clean_task_file#$(pwd)/}"
+    local clean_task_file="${task_file#$(pwd)/}"
+
+    # Resolve the effective base file for this task.
+    # If a prior task in this session already produced output for the same path,
+    # use that output as the base for context and stitching — otherwise we'd
+    # overwrite the prior task's changes when apply writes sequentially.
+    local _file_key="${clean_task_file//\//__}"
+    local _ptr="$session_dir/latest_output_${_file_key}"
+    local effective_base="$clean_task_file"
+    if [[ -f "$_ptr" ]]; then
+      local _prior_output
+      _prior_output=$(cat "$_ptr")
+      if [[ -f "$_prior_output" ]]; then
+        effective_base="$_prior_output"
+        echo "  🔗 Building on prior task output for $(basename "$clean_task_file")"
+      fi
+    fi
+    # True if we have any readable version of this file (original or prior output)
+    local base_exists=false
+    [[ -f "$effective_base" ]] && base_exists=true
 
     local raw_output="$session_dir/outputs/task_${task_id}.txt"
 
     # ── DELETE — no model call ───────────────────────────────────────────────
     if [[ "$task_action" == "DELETE" || "$modification_type" == "delete_code" ]]; then
-      if [[ -f "$clean_task_file" && -n "$target" && "$target" != "null" ]]; then
+      if [[ "$base_exists" == true && -n "$target" && "$target" != "null" ]]; then
         local range
-        range=$(_find_function_range "$clean_task_file" "$target")
+        range=$(_find_function_range "$effective_base" "$target")
         if [[ -n "$range" ]]; then
           local del_start del_end
           del_start=$(echo "$range" | cut -d: -f1)
           del_end=$(echo "$range" | cut -d: -f2)
           local stitched="$session_dir/outputs/task_${task_id}_stitched.txt"
-          _stitch_delete_range "$clean_task_file" "$del_start" "$del_end" "$stitched"
+          _stitch_delete_range "$effective_base" "$del_start" "$del_end" "$stitched"
           mv "$stitched" "$raw_output"
+          echo "$raw_output" > "$_ptr"
           echo "  ✅ Deleted '$target' (lines $del_start-$del_end)"
         else
           echo "  ⚠️  Could not locate '$target' for deletion"
@@ -326,7 +376,7 @@ $project_doc"
         echo "  ✅ File deletion marked"
       fi
       echo ""
-      sleep 0.3
+      sleep "${AGENTIC_TASK_DELAY:-0.3}"
       continue
     fi
 
@@ -334,41 +384,41 @@ $project_doc"
     local existing_content=""
     local stored_range=""
 
-    if [[ "$modification_type" != "full_file" && -f "$clean_task_file" ]]; then
+    if [[ "$modification_type" != "full_file" && "$base_exists" == true ]]; then
       local file_size
-      file_size=$(wc -l < "$clean_task_file" | tr -d ' ')
+      file_size=$(wc -l < "$effective_base" | tr -d ' ')
 
       case "$modification_type" in
         add_import)
           existing_content="EXISTING FILE — imports section (first 30 lines):
 \`\`\`
-$(head -30 "$clean_task_file")
+$(head -30 "$effective_base")
 \`\`\`"
           ;;
 
         add_function|add_export)
           existing_content="EXISTING FILE — end of file (last 20 lines, $file_size total):
 \`\`\`
-$(tail -20 "$clean_task_file")
+$(tail -20 "$effective_base")
 \`\`\`"
           ;;
 
         add_type)
           local last_import
-          last_import=$(_find_last_import_line "$clean_task_file")
+          last_import=$(_find_last_import_line "$effective_base")
           local show_from=1
           local show_to=$(( ${last_import:-0} + 10 ))
           [[ $show_to -gt $file_size ]] && show_to=$file_size
           existing_content="EXISTING FILE — after imports (lines $show_from-$show_to of $file_size):
 \`\`\`
-$(sed -n "${show_from},${show_to}p" "$clean_task_file")
+$(sed -n "${show_from},${show_to}p" "$effective_base")
 \`\`\`"
           ;;
 
         modify_function|add_to_function|add_hook|wrap_component)
           if [[ -n "$target" && "$target" != "null" ]]; then
             local range
-            range=$(_find_function_range "$clean_task_file" "$target")
+            range=$(_find_function_range "$effective_base" "$target")
             if [[ -n "$range" ]]; then
               local fn_start fn_end
               fn_start=$(echo "$range" | cut -d: -f1)
@@ -378,12 +428,12 @@ $(sed -n "${show_from},${show_to}p" "$clean_task_file")
               existing_content="TARGET FUNCTION — '$target' (lines $fn_start-$fn_end of $file_size):
 LINE_RANGE=${fn_start}:${fn_end}
 \`\`\`
-$(sed -n "${fn_start},${fn_end}p" "$clean_task_file")
+$(sed -n "${fn_start},${fn_end}p" "$effective_base")
 \`\`\`
 
 IMPORTS (for context):
 \`\`\`
-$(head -20 "$clean_task_file")
+$(head -20 "$effective_base")
 \`\`\`"
             else
               echo "  ⚠️  Could not locate '$target' — falling back to full file"
@@ -391,11 +441,11 @@ $(head -20 "$clean_task_file")
               if [[ $file_size -le 200 ]]; then
                 existing_content="EXISTING FILE ($file_size lines):
 \`\`\`
-$(cat "$clean_task_file")
+$(cat "$effective_base")
 \`\`\`"
               else
                 local section_output
-                section_output=$(extract_relevant_section "$clean_task_file" "$target" "$file_size")
+                section_output=$(extract_relevant_section "$effective_base" "$target" "$file_size")
                 existing_content="$section_output"
                 stored_range=$(echo "$section_output" | grep '^LINE_RANGE=' | cut -d= -f2)
               fi
@@ -407,11 +457,11 @@ $(cat "$clean_task_file")
           if [[ $file_size -le 150 ]]; then
             existing_content="EXISTING FILE ($file_size lines):
 \`\`\`
-$(cat "$clean_task_file")
+$(cat "$effective_base")
 \`\`\`"
           else
             local section_output
-            section_output=$(extract_relevant_section "$clean_task_file" "$target" "$file_size")
+            section_output=$(extract_relevant_section "$effective_base" "$target" "$file_size")
             existing_content="$section_output"
           fi
           ;;
@@ -517,7 +567,7 @@ $execute_instruction"
     echo "  ✅ Generated ($output_lines lines)"
 
     # ── Stitching ────────────────────────────────────────────────────────────
-    if [[ "$task_action" != "CREATE" && -f "$clean_task_file" && \
+    if [[ "$task_action" != "CREATE" && "$base_exists" == true && \
           "$modification_type" != "full_file" ]]; then
 
       local stitched="$session_dir/outputs/task_${task_id}_stitched.txt"
@@ -527,31 +577,31 @@ $execute_instruction"
 
         add_import)
           local last_import
-          last_import=$(_find_last_import_line "$clean_task_file")
+          last_import=$(_find_last_import_line "$effective_base")
           if [[ -n "$last_import" && "$last_import" -gt 0 ]]; then
-            _stitch_insert_after "$clean_task_file" "$raw_output" "$last_import" "$stitched"
+            _stitch_insert_after "$effective_base" "$raw_output" "$last_import" "$stitched"
             echo "  🔧 Import inserted after line $last_import"
           else
-            { cat "$raw_output"; echo ""; cat "$clean_task_file"; } > "$stitched"
+            { cat "$raw_output"; echo ""; cat "$effective_base"; } > "$stitched"
             echo "  🔧 Import prepended (no existing imports)"
           fi
           stitch_ok=true
           ;;
 
         add_function|add_export)
-          _stitch_append "$clean_task_file" "$raw_output" "$stitched"
+          _stitch_append "$effective_base" "$raw_output" "$stitched"
           echo "  🔧 Appended to end of file"
           stitch_ok=true
           ;;
 
         add_type)
           local after_line
-          after_line=$(_find_end_of_imports "$clean_task_file")
+          after_line=$(_find_end_of_imports "$effective_base")
           if [[ "$after_line" -gt 0 ]]; then
-            _stitch_insert_after "$clean_task_file" "$raw_output" "$after_line" "$stitched"
+            _stitch_insert_after "$effective_base" "$raw_output" "$after_line" "$stitched"
             echo "  🔧 Type inserted after imports (line $after_line)"
           else
-            _stitch_append "$clean_task_file" "$raw_output" "$stitched"
+            _stitch_append "$effective_base" "$raw_output" "$stitched"
             echo "  🔧 Type appended to end of file"
           fi
           stitch_ok=true
@@ -562,7 +612,7 @@ $execute_instruction"
             local fn_start fn_end
             fn_start=$(echo "$stored_range" | cut -d: -f1)
             fn_end=$(echo "$stored_range" | cut -d: -f2)
-            _stitch_replace_range "$clean_task_file" "$raw_output" "$fn_start" "$fn_end" "$stitched"
+            _stitch_replace_range "$effective_base" "$raw_output" "$fn_start" "$fn_end" "$stitched"
             echo "  🔧 Function replaced (lines $fn_start-$fn_end)"
             stitch_ok=true
           else
@@ -574,14 +624,14 @@ $execute_instruction"
 
         add_route)
           local router_close_line
-          router_close_line=$(grep -n '</Routes>\|</Switch>\|</Router>' "$clean_task_file" \
+          router_close_line=$(grep -n '</Routes>\|</Switch>\|</Router>' "$effective_base" \
             | tail -1 | cut -d: -f1)
           if [[ -n "$router_close_line" ]]; then
-            _stitch_insert_after "$clean_task_file" "$raw_output" \
+            _stitch_insert_after "$effective_base" "$raw_output" \
               "$((router_close_line - 1))" "$stitched"
             echo "  🔧 Route inserted before closing tag (line $router_close_line)"
           else
-            _stitch_append "$clean_task_file" "$raw_output" "$stitched"
+            _stitch_append "$effective_base" "$raw_output" "$stitched"
             echo "  🔧 Route appended (no closing router tag found)"
           fi
           stitch_ok=true
@@ -591,7 +641,7 @@ $execute_instruction"
 
       if [[ "$stitch_ok" == true && -f "$stitched" ]]; then
         local original_lines stitched_lines
-        original_lines=$(wc -l < "$clean_task_file" | tr -d ' ')
+        original_lines=$(wc -l < "$effective_base" | tr -d ' ')
         stitched_lines=$(wc -l < "$stitched" | tr -d ' ')
         local shrink=$(( stitched_lines - original_lines ))
         if [[ $shrink -lt -30 ]]; then
@@ -604,6 +654,10 @@ $execute_instruction"
       fi
     fi
 
+    # Track this task's output as the latest for its file path so subsequent
+    # tasks targeting the same file stitch against it, not the original on disk.
+    [[ -s "$raw_output" ]] && echo "$raw_output" > "$_ptr"
+
     # Token usage
     if [[ -f "$session_dir/outputs/task_${task_id}_usage.json" ]]; then
       local cache_read input_tok
@@ -613,7 +667,7 @@ $execute_instruction"
     fi
 
     echo ""
-    sleep 0.3
+    sleep "${AGENTIC_TASK_DELAY:-0.3}"
   done
 
   # ── Summary ───────────────────────────────────────────────────────────────
