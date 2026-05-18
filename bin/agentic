@@ -91,6 +91,9 @@ case "${1:-}" in
   refine)
     refine
     ;;
+  repair)
+    repair
+    ;;
   
   # Version & help
   --version|-v)
@@ -130,7 +133,8 @@ LOW-LEVEL WORKFLOW (Expert Mode):
   agentic review --diff=<ref>  Review diff against a specific ref
   agentic apply [--dry-run]  Apply changes to files
   agentic verify          Verify applied changes match plan
-  agentic refine          Refine plan based on validation issues
+  agentic repair          Fix failing tasks in place (keeps the plan)
+  agentic refine          Replan from scratch (use when the plan itself is wrong)
 
 EXAMPLES:
   # Complete workflow

@@ -128,12 +128,29 @@ $(cat "$design_output")"
     fi
   fi
 
+  # ── Test generation preference ─────────────────────────────────────────────
+  local test_directive=""
+  if [[ "${AGENTIC_SKIP_TESTS:-}" == "1" ]]; then
+    echo "⏭️  Tests skipped (AGENTIC_SKIP_TESTS=1)"
+    echo "n" > "$session_dir/include_tests.txt"
+    test_directive="
+SKIP TESTS: Do NOT create any test file tasks. Implementation tasks only."
+  else
+    read -p "🧪 Include tests? (y/n) " _include_tests
+    echo "$_include_tests" > "$session_dir/include_tests.txt"
+    if [[ ! "$_include_tests" =~ ^[Yy]$ ]]; then
+      echo "⏭️  Tests skipped"
+      test_directive="
+SKIP TESTS: Do NOT create any test file tasks. Implementation tasks only."
+    fi
+  fi
+
   local architect_prompt="$(cat $AGENTIC_HOME/agents/architect.txt)"
   local user_prompt="$(cat "$context_file")
 
 USER REQUEST:
 $(cat "$session_dir/request.txt")
-${design_spec}
+${design_spec}${test_directive}
 Output tasks as valid JSON. Use arrays for multi-line content, not \n.
 The 'target' field must be the exact identifier as it appears in source code (e.g. 'getProviderMonthData', not 'getProviderMonthData function').
 DO NOT wrap output in markdown code fences. Output raw JSON only."

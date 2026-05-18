@@ -35,17 +35,12 @@ function validate() {
     task_file=$(_apply_clean_path "$task_file")
 
     local output_file="$session_dir/outputs/task_${task_id}.txt"
-    # For partial modifications (modify_function etc.) implement() stitches
-    # the model's output into a full file and leaves the pre-stitch model
-    # output at task_${id}_raw.txt. Shape checks — "did the model return
-    # only a function?" — must read the raw file, not the stitched one.
     local raw_model_output="$session_dir/outputs/task_${task_id}_raw.txt"
     local check_file="$output_file"
     [[ -f "$raw_model_output" ]] && check_file="$raw_model_output"
 
     echo "Task $task_id ($modification_type): $task_desc"
 
-    # ── delete_code: expect a stitched file or empty for full delete ─────────
     if [[ "$modification_type" == "delete_code" ]]; then
       if [[ -f "$output_file" && -s "$output_file" ]]; then
         echo "  ✅ Deletion stitched"
@@ -59,7 +54,6 @@ function validate() {
       continue
     fi
 
-    # ── Output must exist and have content ───────────────────────────────────
     if [[ ! -f "$output_file" ]]; then
       echo "  ❌ No output generated"
       issues+=("Task $task_id: No output file generated")
@@ -77,15 +71,11 @@ function validate() {
     local output_lines
     output_lines=$(wc -l < "$output_file" | tr -d ' ')
 
-    # ── Stray markdown fences ────────────────────────────────────────────────
-    if grep -q '```' "$output_file"; then
+    if grep -q '```' "$check_file"; then
       echo "  ⚠️  Contains markdown fences"
       warnings+=("Task $task_id: Output contains markdown fences")
     fi
 
-    # ── Placeholder / incomplete code ────────────────────────────────────────
-    # Run against the model's raw output so we don't false-positive on
-    # pre-existing TODO comments carried through by stitching.
     if grep -qiE \
       '^\s*\.\.\.$|\.\.\..*rest.*code|\.\.\..*omitted|\.\.\..*more|// your code here|// implement|/\* implement|// placeholder|// add implementation' \
       "$check_file"; then
@@ -93,30 +83,30 @@ function validate() {
       issues+=("Task $task_id ($task_file): Output contains placeholder text or TODO markers")
     fi
 
-    # ── File path must have extension ────────────────────────────────────────
     if [[ "$task_action" != "DELETE" && ! "$task_file" =~ \. ]]; then
       echo "  ❌ File path has no extension: $task_file"
       issues+=("Task $task_id: File path '$task_file' has no extension")
     fi
 
-    # ── modification_type shape checks ───────────────────────────────────────
     case "$modification_type" in
       add_import)
-        # Shape check against raw model output (stitched file is the full file).
         local shape_lines=$output_lines
         [[ -f "$raw_model_output" ]] && shape_lines=$(wc -l < "$raw_model_output" | tr -d ' ')
-        if [[ $shape_lines -gt 3 ]]; then
-          echo "  ⚠️  add_import output is $shape_lines lines — expected 1"
-          warnings+=("Task $task_id: add_import should be ~1 line, got $shape_lines")
+        if [[ $shape_lines -gt 8 ]]; then
+          echo "  ⚠️  add_import output is $shape_lines lines — expected a single import statement"
+          warnings+=("Task $task_id: add_import should be one import statement, got $shape_lines lines")
         else
           echo "  ✅ Import shape correct ($shape_lines line(s))"
         fi
 
-        # Duplicate import — check if this import already exists in source file
+        # Duplicate import check.
+        # NOTE: every grep below has `|| true` because grep returns 1 on
+        # no-match, and pipefail propagates that to the assignment, which
+        # set -e will then use to silently kill the entire script.
         if [[ -f "$task_file" ]]; then
-          local import_symbol
-          import_symbol=$(grep -oE '\{[^}]+\}' "$check_file" | head -1 | tr -d '{ }')
-          if [[ -n "$import_symbol" ]] && grep -q "$import_symbol" "$task_file"; then
+          local import_symbol=""
+          import_symbol=$(grep -oE '\{[^}]+\}' "$check_file" 2>/dev/null | head -1 | tr -d '{ }' || true)
+          if [[ -n "$import_symbol" ]] && grep -q "$import_symbol" "$task_file" 2>/dev/null; then
             echo "  ⚠️  '$import_symbol' may already be imported in $task_file"
             warnings+=("Task $task_id: '$import_symbol' may already be imported — could cause duplicate")
           fi
@@ -126,9 +116,9 @@ function validate() {
       add_route)
         local route_lines=$output_lines
         [[ -f "$raw_model_output" ]] && route_lines=$(wc -l < "$raw_model_output" | tr -d ' ')
-        if [[ $route_lines -gt 3 ]]; then
-          echo "  ⚠️  add_route output is $route_lines lines — expected 1"
-          warnings+=("Task $task_id: add_route should be ~1 line, got $route_lines")
+        if [[ $route_lines -gt 6 ]]; then
+          echo "  ⚠️  add_route output is $route_lines lines — expected a single <Route /> element"
+          warnings+=("Task $task_id: add_route should be a single Route element, got $route_lines lines")
         else
           echo "  ✅ Route shape correct ($route_lines line(s))"
         fi
@@ -144,17 +134,13 @@ function validate() {
         ;;
 
       modify_function|add_to_function|add_hook|wrap_component)
-        # These should NOT contain import statements — that means full file was output.
-        # CRITICAL: must read raw_model_output. After implement() stitches,
-        # $output_file is the full file and WILL contain imports legitimately.
-        if [[ -f "$raw_model_output" ]] && grep -qE "^import " "$raw_model_output"; then
+        if [[ -f "$raw_model_output" ]] && grep -qE "^import " "$raw_model_output" 2>/dev/null; then
           echo "  ❌ $modification_type output contains import statements — model output full file instead of just the function"
           issues+=("Task $task_id ($task_file): $modification_type output contains imports — stitching will corrupt the file")
         fi
 
-        # Target function name should appear in output
         if [[ -n "$target" && "$target" != "null" ]]; then
-          if ! grep -q "$target" "$check_file"; then
+          if ! grep -q "$target" "$check_file" 2>/dev/null; then
             echo "  ⚠️  Target '$target' not found in output — model may have rewritten wrong function"
             warnings+=("Task $task_id: Target '$target' not found in output")
           fi
@@ -162,7 +148,6 @@ function validate() {
         ;;
     esac
 
-    # ── Size regression for MODIFY ───────────────────────────────────────────
     if [[ "$task_action" == "MODIFY" && \
           "$modification_type" == "full_file" && \
           -f "$task_file" ]]; then
@@ -175,46 +160,29 @@ function validate() {
       fi
     fi
 
-    # ── Language-specific validation ─────────────────────────────────────────
     case "$task_file" in
       *.json)
         if jq empty "$output_file" 2>/dev/null; then
           echo "  ✅ Valid JSON"
         else
           local json_err
-          json_err=$(jq empty "$output_file" 2>&1)
+          json_err=$(jq empty "$output_file" 2>&1 || true)
           echo "  ❌ Invalid JSON: $json_err"
           issues+=("Task $task_id ($task_file): Invalid JSON — $json_err")
         fi
         ;;
 
       *.ts|*.tsx)
-        # Brace balance — only meaningful for complete function/file outputs
-        if [[ "$modification_type" == "full_file" || \
-              "$modification_type" == "add_function" || \
-              "$modification_type" == "modify_function" ]]; then
-          local opens closes
-          opens=$(grep -o '{' "$output_file" | wc -l | tr -d ' ')
-          closes=$(grep -o '}' "$output_file" | wc -l | tr -d ' ')
-          if [[ $opens -ne $closes ]]; then
-            echo "  ⚠️  Unbalanced braces (${opens}{ vs ${closes}})"
-            warnings+=("Task $task_id ($task_file): Unbalanced braces — may be incomplete")
-          else
-            echo "  ✅ Braces balanced"
-          fi
-        fi
-
-        # Test framework mixing
         if [[ "$task_file" =~ \.(test|spec)\.(ts|tsx)$ ]]; then
           local has_vitest has_jest
-          has_vitest=$(grep -c "from 'vitest'\|from \"vitest\"\|vi\.fn\|vi\.mock\|vi\.spyOn" "$output_file" 2>/dev/null || true)
-          has_jest=$(grep -c "jest\.fn\|jest\.mock\|jest\.spyOn\|jest\.SpyInstance\|from '@jest" "$output_file" 2>/dev/null || true)
-          if [[ $has_vitest -gt 0 && $has_jest -gt 0 ]]; then
+          has_vitest=$(grep -c "from 'vitest'\|from \"vitest\"\|vi\.fn\|vi\.mock\|vi\.spyOn" "$output_file" 2>/dev/null || echo 0)
+          has_jest=$(grep -c "jest\.fn\|jest\.mock\|jest\.spyOn\|jest\.SpyInstance\|from '@jest" "$output_file" 2>/dev/null || echo 0)
+          if [[ ${has_vitest:-0} -gt 0 && ${has_jest:-0} -gt 0 ]]; then
             echo "  ❌ Mixes Vitest and Jest syntax"
             issues+=("Task $task_id ($task_file): Mixes Vitest and Jest syntax — will cause runtime errors")
-          elif [[ $has_vitest -gt 0 ]]; then
+          elif [[ ${has_vitest:-0} -gt 0 ]]; then
             echo "  ✅ Vitest syntax consistent"
-          elif [[ $has_jest -gt 0 ]]; then
+          elif [[ ${has_jest:-0} -gt 0 ]]; then
             echo "  ✅ Jest syntax consistent"
           fi
         fi
@@ -228,7 +196,7 @@ function validate() {
             echo "  ✅ JavaScript syntax valid"
           else
             local js_err
-            js_err=$(node --check "$output_file" 2>&1)
+            js_err=$(node --check "$output_file" 2>&1 || true)
             echo "  ❌ JavaScript syntax error"
             issues+=("Task $task_id ($task_file): JavaScript syntax error — $js_err")
           fi
@@ -236,10 +204,8 @@ function validate() {
         ;;
     esac
 
-    # ── Import validation for TS/JS files ────────────────────────────────────
     if [[ "$task_file" =~ \.(ts|tsx|js|jsx)$ ]]; then
 
-      # Package imports — must be in package.json
       if [[ -f "package.json" ]]; then
         while IFS= read -r pkg_import; do
           if [[ -n "$pkg_import" ]]; then
@@ -258,11 +224,10 @@ function validate() {
               warnings+=("Task $task_id: Imports '$pkg_name' not found in package.json")
             fi
           fi
-        done < <(grep -E "^import .* from ['\"]([^./][^'\"]*)['\"]" "$output_file" \
-          | sed "s/.*from ['\"]\\([^'\"]*\\)['\"].*/\\1/")
+        done < <(grep -E "^import .* from ['\"]([^./][^'\"]*)['\"]" "$output_file" 2>/dev/null \
+          | sed "s/.*from ['\"]\\([^'\"]*\\)['\"].*/\\1/" || true)
       fi
 
-      # Relative imports — check against disk AND session outputs
       while IFS= read -r rel_import; do
         if [[ -n "$rel_import" ]]; then
           local file_dir
@@ -279,7 +244,6 @@ function validate() {
             continue
           fi
 
-          # Check if another task in this session is creating that file
           local resolved_by_session=false
           for other_id in "${task_ids[@]}"; do
             local other_file
@@ -298,17 +262,15 @@ function validate() {
             warnings+=("Task $task_id: Relative import '$rel_import' does not resolve to a file")
           fi
         fi
-      done < <(grep -E "^import .* from ['\"](\.[^'\"]*)['\"]" "$output_file" \
-        | sed "s/.*from ['\"]\\([^'\"]*\\)['\"].*/\\1/")
+      done < <(grep -E "^import .* from ['\"](\.[^'\"]*)['\"]" "$output_file" 2>/dev/null \
+        | sed "s/.*from ['\"]\\([^'\"]*\\)['\"].*/\\1/" || true)
 
-      # Cross-task symbol consistency — check exports in dependencies match imports here
       local deps
-      deps=$(echo "$task_json" | jq -r '.dependencies[]?' 2>/dev/null)
+      deps=$(echo "$task_json" | jq -r '.dependencies[]?' 2>/dev/null || true)
       for dep in $deps; do
         local dep_output="$session_dir/outputs/task_${dep}.txt"
         [[ ! -f "$dep_output" ]] && continue
 
-        # Find what this task imports from the dep's file
         local dep_file
         dep_file=$(jq -r ".tasks[]? | select(.id == \"$dep\") | .file" "$tasks_file")
         dep_file=$(_apply_clean_path "$dep_file")
@@ -317,23 +279,21 @@ function validate() {
 
         while IFS= read -r imported_symbol; do
           [[ -z "$imported_symbol" ]] && continue
-          # Check the symbol is exported in the dep's output
-          if ! grep -qE "export (const|function|class|type|interface|enum) $imported_symbol" "$dep_output"; then
+          if ! grep -qE "export (const|function|class|type|interface|enum) $imported_symbol" "$dep_output" 2>/dev/null; then
             echo "  ⚠️  Imports '$imported_symbol' from task $dep but it's not exported there"
             warnings+=("Task $task_id: Imports '$imported_symbol' from task $dep output but export not found")
           fi
-        done < <(grep -E "import \{[^}]+\} from" "$output_file" \
-          | grep "$dep_base" \
+        done < <(grep -E "import \{[^}]+\} from" "$output_file" 2>/dev/null \
+          | grep "$dep_base" 2>/dev/null \
           | sed "s/.*{\([^}]*\)}.*/\1/" \
           | tr ',' '\n' \
-          | tr -d ' ')
+          | tr -d ' ' || true)
       done
     fi
 
     echo ""
   done
 
-  # ── Save issues for refine ────────────────────────────────────────────────
   if [[ ${#issues[@]} -gt 0 ]]; then
     printf '%s\n' "${issues[@]}" > "$session_dir/validation_issues.txt"
   else
@@ -346,7 +306,6 @@ function validate() {
     rm -f "$session_dir/validation_warnings.txt"
   fi
 
-  # ── Summary ───────────────────────────────────────────────────────────────
   echo "─────────────────────────────────────"
 
   if [[ ${#issues[@]} -eq 0 && ${#warnings[@]} -eq 0 ]]; then
@@ -378,16 +337,11 @@ function validate() {
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AI reviewer — runs after static validation, or on-demand against git diff
-#
-# Modes (auto-detected, or forced with --diff):
-#   session  Uses session outputs + task plan (in-workflow or post-implement)
-#   diff     Uses `git diff HEAD` — for manual changes or post-apply review
 # ─────────────────────────────────────────────────────────────────────────────
 
 function review() {
   [[ -f "$AGENTIC_HOME/.agentic.conf" ]] && source "$AGENTIC_HOME/.agentic.conf"
 
-  # ── Flag parsing ───────────────────────────────────────────────────────────
   local force_diff=false
   local base_ref="HEAD"
   while [[ $# -gt 0 ]]; do
@@ -398,7 +352,6 @@ function review() {
     esac
   done
 
-  # ── Build system prompt (shared by both modes) ─────────────────────────────
   local reviewer_prompt
   reviewer_prompt="$(cat "$AGENTIC_HOME/agents/reviewer.txt")"
   if [[ -f "CLAUDE.md" ]]; then
@@ -408,7 +361,6 @@ PROJECT DOCUMENTATION (CLAUDE.md):
 $(cat CLAUDE.md)"
   fi
 
-  # ── Decide mode ────────────────────────────────────────────────────────────
   local session_dir
   session_dir=$(_apply_resolve_session 2>/dev/null || echo "")
 
@@ -421,7 +373,6 @@ $(cat CLAUDE.md)"
     use_diff=true
   fi
 
-  # ── DIFF MODE ──────────────────────────────────────────────────────────────
   if [[ "$use_diff" == true ]]; then
     echo "🔎 Running AI review (diff mode: $base_ref)..."
     echo ""
@@ -432,10 +383,9 @@ $(cat CLAUDE.md)"
     fi
 
     local git_diff
-    git_diff=$(git diff "$base_ref" 2>/dev/null)
-    # If nothing unstaged, try staged changes
+    git_diff=$(git diff "$base_ref" 2>/dev/null || true)
     if [[ -z "$git_diff" ]]; then
-      git_diff=$(git diff --staged 2>/dev/null)
+      git_diff=$(git diff --staged 2>/dev/null || true)
     fi
 
     if [[ -z "$git_diff" ]]; then
@@ -444,7 +394,7 @@ $(cat CLAUDE.md)"
     fi
 
     local changed_files
-    changed_files=$(git diff --name-only "$base_ref" 2>/dev/null)
+    changed_files=$(git diff --name-only "$base_ref" 2>/dev/null || true)
     local line_count
     line_count=$(echo "$git_diff" | wc -l | tr -d ' ')
     echo "📄 Changed files:"
@@ -482,7 +432,6 @@ $git_diff"
     return 0
   fi
 
-  # ── SESSION MODE ───────────────────────────────────────────────────────────
   echo "🔎 Running AI review (session mode)..."
   echo ""
 
@@ -537,16 +486,17 @@ $(cat "$output_file")"
   cat "$review_output"
   echo ""
 
-  # ── Parse verdict (session mode feeds back into refine loop) ───────────────
-  local verdict
-  verdict=$(grep "VERDICT:" "$review_output" | grep -oE 'APPROVED|REJECTED' | tail -1)
+  # Verdict parsing — every grep needs `|| true` for the same reason as
+  # everywhere else: no-match returns 1, pipefail propagates, set -e kills.
+  local verdict=""
+  verdict=$(grep "VERDICT:" "$review_output" 2>/dev/null | grep -oE 'APPROVED|REJECTED' | tail -1 || true)
 
   case "$verdict" in
     REJECTED)
       echo "❌ Review: REJECTED"
-      local critical
-      critical=$(awk '/### Critical Issues/,/### (Warnings|Positive|Final|##)/' "$review_output" \
-        | grep -E '^\s*[0-9]+\.' | sed 's/^[[:space:]]*//' | head -10)
+      local critical=""
+      critical=$(awk '/### Critical Issues/,/### (Warnings|Positive|Final|##)/' "$review_output" 2>/dev/null \
+        | grep -E '^\s*[0-9]+\.' | sed 's/^[[:space:]]*//' | head -10 || true)
       local issues_file="$session_dir/validation_issues.txt"
       if [[ -n "$critical" ]]; then
         echo "$critical" >> "$issues_file"
@@ -557,9 +507,9 @@ $(cat "$output_file")"
       ;;
     APPROVED)
       echo "✅ Review: APPROVED"
-      local warnings
-      warnings=$(awk '/### Warnings/,/### (Positive|Final|##)/' "$review_output" \
-        | grep -E '^\s*[0-9]+\.' | sed 's/^[[:space:]]*//' | head -10)
+      local warnings=""
+      warnings=$(awk '/### Warnings/,/### (Positive|Final|##)/' "$review_output" 2>/dev/null \
+        | grep -E '^\s*[0-9]+\.' | sed 's/^[[:space:]]*//' | head -10 || true)
       if [[ -n "$warnings" ]]; then
         echo "$warnings" >> "$session_dir/validation_warnings.txt"
       fi

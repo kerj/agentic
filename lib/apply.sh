@@ -113,6 +113,7 @@ function apply() {
   local skipped=0
   local failed=0
   local counter=0
+  local files_staged=()   # track files touched so we stage only those at commit
 
   echo "📋 $([ "$dry_run" = true ] && echo "Previewing" || echo "Applying") $total tasks..."
   echo ""
@@ -165,6 +166,7 @@ function apply() {
           mkdir -p "$(dirname "$task_file")"
           cp "$output_file" "$task_file"
           echo "  ✅ Created"
+          files_staged+=("$task_file")
           ((applied++))
           ;;
 
@@ -178,6 +180,7 @@ function apply() {
             cp "$output_file" "$task_file"
             echo "  ✅ Modified"
           fi
+          files_staged+=("$task_file")
           ((applied++))
           ;;
 
@@ -187,10 +190,12 @@ function apply() {
             cp "$task_file" "$task_file.backup"
             cp "$output_file" "$task_file"
             echo "  ✅ Target removed from file (backup saved)"
+            files_staged+=("$task_file")
           elif [[ -f "$task_file" ]]; then
             # Full file deletion
             mv "$task_file" "$task_file.backup"
             echo "  ✅ File deleted (backup saved)"
+            files_staged+=("$task_file.backup")
           else
             echo "  ⊘ File not found — already deleted?"
             ((skipped++))
@@ -235,7 +240,9 @@ function apply() {
 
     read -p "Commit these changes? (y/n) " do_commit
     if [[ "$do_commit" =~ ^[Yy]$ ]]; then
-      git add -A
+      for _f in "${files_staged[@]}"; do
+        git add "$_f" 2>/dev/null || true
+      done
       git commit -m "agentic: $AGENTIC_SESSION"
       echo "✅ Committed"
       echo ""
