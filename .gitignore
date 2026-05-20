@@ -1,2 +1,8 @@
 .agentic.conf
 .ds_store
+queue/
+worktrees/
+serve.pid
+__pycache__/
+*.pyc
+.claude/

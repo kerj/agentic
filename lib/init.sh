@@ -24,7 +24,7 @@ function agentic-init() {
   echo ""
   
   # ── .claude/ directories ───────────────────────────────────────────────────
-  mkdir -p .claude/{sessions,plans,metrics}
+  mkdir -p .claude/{sessions,plans,metrics,worktrees}
   echo "✅ Created .claude/ directory"
   
   # ── .gitignore ─────────────────────────────────────────────────────────────

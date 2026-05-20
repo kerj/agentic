@@ -5,30 +5,19 @@ set -euo pipefail
 
 AGENTIC_HOME="${AGENTIC_HOME:-$HOME/.agentic}"
 
-# Source all modules
 source "$AGENTIC_HOME/lib/config.sh"
 source "$AGENTIC_HOME/lib/utils.sh"
 source "$AGENTIC_HOME/lib/init.sh"
 source "$AGENTIC_HOME/lib/doc.sh"
-source "$AGENTIC_HOME/lib/claude-api.sh"
-source "$AGENTIC_HOME/lib/architect.sh"
-source "$AGENTIC_HOME/lib/implement.sh"
-source "$AGENTIC_HOME/lib/validate.sh"
 source "$AGENTIC_HOME/lib/apply.sh"
-source "$AGENTIC_HOME/lib/refine.sh"
 source "$AGENTIC_HOME/lib/plan.sh"
-source "$AGENTIC_HOME/lib/metrics.sh"
-source "$AGENTIC_HOME/lib/retry.sh"
-source "$AGENTIC_HOME/lib/core.sh"
+source "$AGENTIC_HOME/lib/worker.sh"
+source "$AGENTIC_HOME/lib/queue.sh"
 
-# CLI interface
+_main() {
 case "${1:-}" in
-  # Main workflow
-  ""|run)
-    agentic
-    ;;
-  
-  # Setup & configuration
+
+  # ── Setup & configuration ────────────────────────────────────────────────────
   init)
     agentic-init
     ;;
@@ -39,144 +28,329 @@ case "${1:-}" in
     shift
     agentic-switch "${@:-}"
     ;;
-  
-  # Session management
-  list)
-    agentic-list
+
+  # ── Review workflow ──────────────────────────────────────────────────────────
+  accept)
+    shift
+    agentic-accept "${@:-}"
     ;;
-  use)
-    agentic-use
+  reject)
+    shift
+    agentic-reject "${@:-}"
     ;;
-  retry|regenerate)
-    agentic-retry
-    ;;
-  
-  # Planning & documentation
-  plan)
-    plan
-    ;;
+
+  # ── Documentation & planning ─────────────────────────────────────────────────
   doc)
     agentic-doc
     ;;
   doc-gen)
     agentic-doc-gen
     ;;
-  
-  # Metrics
-  metrics)
-    agentic-metrics "${2:-}"
+  plan)
+    plan
     ;;
-  
-  # Low-level workflow commands
-  archie|architect)
-    archie
-    ;;
-  implement)
-    implement
-    ;;
-  validate)
-    validate
-    ;;
-  review)
+
+  # ── Queue commands ───────────────────────────────────────────────────────────
+
+  # submit "<request>" [--repo PATH] [--model-hint HINT] [--priority N] [--after JOB-ID]
+  submit)
     shift
-    review "$@"
+    local _sq_request="" _sq_repo="$PWD" _sq_hint="auto" _sq_priority=0 _sq_after=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --repo)        _sq_repo="$2";     shift 2 ;;
+        --model-hint)  _sq_hint="$2";    shift 2 ;;
+        --priority)    _sq_priority="$2"; shift 2 ;;
+        --after)       _sq_after="$2";    shift 2 ;;
+        *)             _sq_request="$1"; shift ;;
+      esac
+    done
+    if [[ -z "$_sq_request" ]]; then
+      echo "❌ Usage: agentic submit \"<request>\" [--repo PATH] [--priority N] [--after JOB-ID]"
+      exit 1
+    fi
+    local _sq_id
+    _sq_id=$(queue_submit "$_sq_request" "$_sq_repo" "$_sq_hint" "$_sq_priority" "$_sq_after") || exit 1
+    echo "✅ Submitted $_sq_id (pending)${_sq_after:+ — chains from $_sq_after}"
     ;;
-  apply)
+
+  # inbox [--state STATE] [--json]
+  inbox)
     shift
-    apply "$@"
+    local _ib_state="" _ib_json=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --state) _ib_state="$2"; shift 2 ;;
+        --json)  _ib_json="json"; shift ;;
+        *)       shift ;;
+      esac
+    done
+    _queue_init
+
+    local _ib_states
+    if [[ -n "$_ib_state" ]]; then
+      _ib_states=("$_ib_state")
+    else
+      _ib_states=("pending" "running" "done" "failed" "abandoned" "cancelled")
+    fi
+
+    if [[ "$_ib_json" == "json" ]]; then
+      local _ib_tmpfile
+      _ib_tmpfile=$(mktemp /tmp/agentic_inbox_XXXXXX.json)
+      for _ib_s in "${_ib_states[@]}"; do
+        local _ib_dir="${AGENTIC_QUEUE_DIR}/${_ib_s}"
+        [[ -d "$_ib_dir" ]] || continue
+        for _ib_f in "$_ib_dir"/*.json; do
+          [[ -f "$_ib_f" ]] || continue
+          jq --arg s "$_ib_s" '. + {queue_state: $s}' "$_ib_f" >> "$_ib_tmpfile"
+        done
+      done
+      if [[ -s "$_ib_tmpfile" ]]; then
+        jq -s '.' "$_ib_tmpfile"
+      else
+        echo "[]"
+      fi
+      rm -f "$_ib_tmpfile"
+    else
+      local _ib_any=false
+      for _ib_s in "${_ib_states[@]}"; do
+        local _ib_dir="${AGENTIC_QUEUE_DIR}/${_ib_s}"
+        [[ -d "$_ib_dir" ]] || continue
+        local _ib_printed_header=false
+        for _ib_f in "$_ib_dir"/*.json; do
+          [[ -f "$_ib_f" ]] || continue
+          if [[ "$_ib_printed_header" == false ]]; then
+            echo "── ${_ib_s} ──────────────────────────────────────"
+            _ib_printed_header=true
+            _ib_any=true
+          fi
+          local _ib_id _ib_req _ib_at
+          _ib_id=$(jq -r '.id' "$_ib_f")
+          _ib_req=$(jq -r '.request' "$_ib_f")
+          _ib_at=$(jq -r '.submitted_at' "$_ib_f")
+          local _ib_short="${_ib_req:0:50}"
+          [[ ${#_ib_req} -gt 50 ]] && _ib_short="${_ib_short}..."
+          local _ib_when
+          _ib_when=$(_queue_relative_time "$_ib_at")
+          echo "  $_ib_id [$_ib_s] \"$_ib_short\" submitted $_ib_when"
+        done
+        [[ "$_ib_printed_header" == true ]] && echo ""
+      done
+      [[ "$_ib_any" == false ]] && echo "No jobs found."
+    fi
     ;;
-  verify|verify-apply)
-    verify-apply
+
+  # cancel <job-id>
+  cancel)
+    local _cjob="${2:-}"
+    if [[ -z "$_cjob" ]]; then
+      echo "❌ Usage: agentic cancel <job-id>"
+      exit 1
+    fi
+    _queue_init
+    local _cfound=""
+    for _cf in "${AGENTIC_QUEUE_DIR}/pending/"*.json; do
+      [[ -f "$_cf" ]] || continue
+      local _cid
+      _cid=$(jq -r '.id' "$_cf")
+      if [[ "$_cid" == "$_cjob" ]]; then
+        _cfound="$_cf"
+        break
+      fi
+    done
+    if [[ -z "$_cfound" ]]; then
+      echo "❌ Job not found in pending/: $_cjob"
+      echo "   Only pending jobs can be cancelled."
+      exit 1
+    fi
+    queue_complete "$_cfound" "cancelled" "cancelled by user"
+    echo "✅ Cancelled: $_cjob"
     ;;
-  refine)
-    refine
+
+  # worker-once — claim one job, run the Claude agent in an isolated worktree
+  worker-once)
+    _queue_init
+
+    local _wjob_path
+    if ! _wjob_path=$(queue_claim); then
+      echo "No pending jobs."
+      exit 0
+    fi
+
+    local _wid _wrequest _wtarget
+    _wid=$(jq -r '.id' "$_wjob_path")
+    _wrequest=$(jq -r '.request' "$_wjob_path")
+    _wtarget=$(jq -r '.target_repo' "$_wjob_path")
+
+    echo "🔧 Claimed: $_wid"
+    echo "   Request: ${_wrequest:0:80}"
+    echo "   Repo:    $_wtarget"
+    echo ""
+
+    local _wworktree="${AGENTIC_WORKTREES_DIR}/${_wid}"
+    local _wbranch="agentic/${_wid}"
+
+    # Chain: base from parent job's branch if it exists
+    local _wparent_id
+    _wparent_id=$(jq -r '.parent_request_id // empty' "$_wjob_path")
+    local _wbase_branch
+    if [[ -n "$_wparent_id" ]] && \
+       git -C "$_wtarget" show-ref --verify --quiet "refs/heads/agentic/${_wparent_id}" 2>/dev/null; then
+      _wbase_branch="agentic/${_wparent_id}"
+      echo "🔗 Chaining from: $_wbase_branch"
+    else
+      _wbase_branch=$(git -C "$_wtarget" symbolic-ref --short HEAD 2>/dev/null || echo "HEAD")
+    fi
+
+    # Clean up stale worktree/branch from previous run of this job
+    if [[ -d "$_wworktree" ]]; then
+      echo "♻️  Removing stale worktree from previous run..."
+      git -C "$_wtarget" worktree remove "$_wworktree" --force 2>/dev/null || rm -rf "$_wworktree"
+    fi
+    if git -C "$_wtarget" show-ref --verify --quiet "refs/heads/${_wbranch}" 2>/dev/null; then
+      echo "♻️  Removing stale branch from previous run..."
+      git -C "$_wtarget" branch -D "$_wbranch" 2>/dev/null || true
+    fi
+
+    if ! git -C "$_wtarget" worktree add "$_wworktree" -b "$_wbranch" "$_wbase_branch" 2>&1; then
+      echo "❌ Failed to create worktree at $_wworktree"
+      queue_complete "$_wjob_path" "failed" "worktree creation failed"
+      _queue_notify "agentic: failed" "Job $_wid — worktree creation failed"
+      exit 1
+    fi
+
+    echo "🌿 Worktree: $_wworktree"
+    echo "🌿 Branch:   $_wbranch"
+    echo ""
+
+    # Run the Claude Code agent inside the worktree
+    # Save the JSONL stream alongside the worktree for the dashboard audit view
+    local _wlog="${_wworktree}/.agent_log.jsonl"
+    local _wrc=0
+    (
+      cd "$_wworktree" || exit 1
+      run_worker_agent "$_wrequest" "$_wlog"
+    ) || _wrc=$?
+
+    if [[ $_wrc -eq 0 ]]; then
+      local _wsha
+      _wsha=$(git -C "$_wworktree" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+      local _wsummary="applied to ${_wbranch}, SHA ${_wsha}"
+      queue_complete "$_wjob_path" "done" "$_wsummary"
+      echo ""
+      echo "✅ Job complete: $_wid"
+      echo "   Branch: $_wbranch"
+      echo "   SHA:    $_wsha"
+      echo "   Inspect: cd $_wworktree"
+      _queue_notify "agentic: done" "Job $_wid complete — $_wbranch"
+    else
+      queue_complete "$_wjob_path" "failed" "agent exited with code ${_wrc}"
+      echo ""
+      echo "❌ Job failed: $_wid (exit code $_wrc)"
+      echo "   Worktree preserved: $_wworktree"
+      _queue_notify "agentic: failed" "Job $_wid failed — see $_wworktree"
+      exit 1
+    fi
     ;;
-  repair)
-    repair
+
+  # serve [PORT] | serve stop | serve status
+  serve)
+    local _spid_file="${HOME}/.agentic/serve.pid"
+    case "${2:-start}" in
+      stop)
+        if [[ ! -f "$_spid_file" ]]; then
+          echo "❌ Server is not running (no PID file found)"
+          exit 1
+        fi
+        local _scontent _spid
+        _scontent=$(cat "$_spid_file")
+        _spid="${_scontent%%:*}"
+        if kill -0 "$_spid" 2>/dev/null; then
+          kill "$_spid"
+          rm -f "$_spid_file"
+          echo "✅ Stopped server (PID $_spid)"
+        else
+          echo "⚠️  Process $_spid not found — removing stale PID file"
+          rm -f "$_spid_file"
+          exit 1
+        fi
+        ;;
+      status)
+        if [[ ! -f "$_spid_file" ]]; then
+          echo "Server is not running"
+          exit 1
+        fi
+        local _scontent _spid _sport
+        _scontent=$(cat "$_spid_file")
+        _spid="${_scontent%%:*}"
+        _sport="${_scontent##*:}"
+        if kill -0 "$_spid" 2>/dev/null; then
+          echo "✅ Running (PID $_spid) → http://localhost:${_sport}"
+        else
+          echo "⚠️  Stale PID file — run: agentic serve stop"
+          exit 1
+        fi
+        ;;
+      start|[0-9]*)
+        local _sport_arg=""
+        [[ "${2:-}" =~ ^[0-9]+$ ]] && _sport_arg="${2}"
+        exec python3 "$AGENTIC_HOME/lib/serve.py" ${_sport_arg:+"$_sport_arg"}
+        ;;
+      *)
+        exec python3 "$AGENTIC_HOME/lib/serve.py"
+        ;;
+    esac
     ;;
-  
-  # Version & help
+
+  # ── Version & help ───────────────────────────────────────────────────────────
   --version|-v)
-    echo "agentic v1.0.0"
-    echo "Model: ${AGENTIC_MODEL:-not configured}"
-    echo "Home: $AGENTIC_HOME"
+    echo "agentic v2.0.0"
+    echo "Engine: Claude Code agent"
+    echo "Home:   $AGENTIC_HOME"
     ;;
+
   --help|-h)
     cat <<HELP
-Agentic - AI-powered development workflow
+Agentic — AI-powered async development workflow
 
-MAIN COMMANDS:
-  agentic [run]           Run complete workflow with orchestration
-  agentic init            Initialize project (.claude/, CLAUDE.md)
-  agentic config          Configure settings interactively
-  agentic switch          Toggle provider (anthropic|ollama|status)
-  
-SESSION MANAGEMENT:
-  agentic list            List past sessions
-  agentic use             Switch to previous session (interactive)
-  agentic retry           Retry/regenerate corrupted session
-  
-PLANNING & DOCS:
-  agentic plan            Create agile plan (stories, acceptance criteria)
-  agentic doc             Edit CLAUDE.md in your editor
-  agentic doc-gen         Generate CLAUDE.md from project analysis
-  
-METRICS:
-  agentic metrics [file]  View session performance metrics
-  
-LOW-LEVEL WORKFLOW (Expert Mode):
-  agentic archie          Create task breakdown only
-  agentic implement       Generate code for tasks
-  agentic validate        Run quality validation
-  agentic review          AI review (auto: session or git diff)
-  agentic review --diff   Force git diff review against HEAD
-  agentic review --diff=<ref>  Review diff against a specific ref
-  agentic apply [--dry-run]  Apply changes to files
-  agentic verify          Verify applied changes match plan
-  agentic repair          Fix failing tasks in place (keeps the plan)
-  agentic refine          Replan from scratch (use when the plan itself is wrong)
+SETUP:
+  agentic init              Initialize project (CLAUDE.md, .gitignore)
+  agentic config            Configure settings
+  agentic switch [anthropic|ollama|status]
+
+QUEUE WORKFLOW (primary):
+  agentic submit "<request>" [--repo PATH] [--priority N] [--after JOB-ID]
+  agentic inbox [--state STATE] [--json]
+  agentic cancel <job-id>
+  agentic worker-once       Claim and run one pending job via Claude agent
+  agentic serve [PORT]      Start dashboard at http://localhost:4080
+  agentic serve stop
+  agentic serve status
+
+REVIEW:
+  agentic accept [JOB-ID]   Merge the job's branch into your current branch
+  agentic reject [JOB-ID]   Discard the job's branch and worktree
+
+DOCUMENTATION:
+  agentic doc               Edit CLAUDE.md in \$EDITOR
+  agentic doc-gen           Auto-generate CLAUDE.md from project analysis
+  agentic plan              Create agile plan from a request
 
 EXAMPLES:
-  # Complete workflow
-  agentic
-  
-  # Switch providers
-  agentic switch anthropic
-  agentic switch ollama
-  agentic switch status
-  
-  # Fix corrupted session
-  agentic use             # Pick corrupted session
-  agentic retry           # Regenerate tasks.json
-  agentic implement       # Continue from there
-  
-  # Step-by-step control
-  agentic archie          # Plan
-  agentic implement       # Generate
-  agentic apply           # Apply
-
-CONFIGURATION:
-  Model:    ${AGENTIC_MODEL:-not configured}
-  Endpoint: ${ANTHROPIC_BASE_URL:-not configured}
-  
-  Quick switch: agentic switch [anthropic|ollama]
-  Full config:  agentic config
-
-MORE INFO:
-  Documentation: $AGENTIC_HOME/README.md
-  Modules: $AGENTIC_HOME/lib/
+  agentic submit "Add a debounced search hook" --repo ~/my-project
+  agentic serve &
+  # review jobs in browser, then:
+  agentic accept j_xxx
 HELP
     ;;
+
   *)
-    echo "❌ Unknown command: $1"
-    echo ""
+    echo "❌ Unknown command: ${1:-}"
     echo "Run 'agentic --help' for usage"
-    echo ""
-    echo "Did you mean one of these?"
-    echo "  agentic run       - Run complete workflow"
-    echo "  agentic switch    - Toggle provider (anthropic|ollama)"
-    echo "  agentic retry     - Retry corrupted session"
-    echo "  agentic use       - Switch sessions"
     exit 1
     ;;
+
 esac
+}
+
+_main "$@"

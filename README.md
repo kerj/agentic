@@ -1,672 +1,142 @@
-# Agentic Workflow
+# Agentic
 
-An AI-powered development workflow that turns natural language requests into production-ready code through intelligent planning, context-aware generation, multi-level validation, and safe application.
-
-## 🎯 What It Does
-
-Agentic discovers your project structure, learns your patterns, generates code with full context awareness, validates quality at multiple levels, and safely applies changes—all while maintaining git safety and providing detailed metrics.
-
-**Workflow:**
-```
-Your Request → [Design?] → Plan → Generate → Static Validate → AI Review → Apply → Done
-                  ↓          ↓         ↓               ↓              ↓ (if issues)
-             UI layout   Discovers  Reads actual   Shape/import    Correctness    Refine → Iterate
-              spec        structure   source        checks          & quality
-```
-
-The `[Design?]` step is optional — you're always asked at the start of planning.
+Queue jobs for Claude Code to work on while you do something else. Review the diffs, merge what you like.
 
 ---
 
-## 🚀 Installation
+## What it does
 
-### Requirements
+You submit a request, Claude Code runs as an agent in an isolated git branch, does the work, verifies the build passes, and commits. You come back whenever, look at what it did, and decide whether to merge.
 
-- **zsh**
-- **jq**: `brew install jq`
-- **curl** (standard on macOS)
-- **git** (recommended for safety features)
-- **Ollama** (for local models) or an Anthropic API key
+Nothing touches your working tree until you explicitly merge it.
 
-### Quick Install
+---
+
+## Setup
+
+**Requirements:** zsh, jq, git, Python 3, Claude Code CLI (`claude`)
+
 ```bash
-# 1. Clone to ~/.agentic
 git clone <repo-url> ~/.agentic
-
-# 2. Run installer
 bash ~/.agentic/install.sh
-
-# 3. Edit config with your settings
-nano ~/.agentic/.agentic.conf
-
-# 4. Reload shell
-source ~/.zshrc
-
-# 5. Verify
-agentic --help
-```
-
-The installer will:
-- Make the `agentic` bin executable
-- Copy `.agentic.conf.example` → `.agentic.conf` (if not already present)
-- Add `AGENTIC_HOME`, `PATH`, and config sourcing to `.zshrc`
-
----
-
-## ⚙️ Configuration
-
-`~/.agentic/.agentic.conf` holds your settings and secrets. It is **gitignored** — never committed to the repo. The repo ships `.agentic.conf.example` as a safe template.
-
-### Switching Providers
-
-The fastest way to switch between Anthropic and Ollama:
-
-```bash
-agentic switch anthropic   # Switch to Anthropic API (claude-opus-4-20250514)
-agentic switch ollama      # Switch to Ollama (qwen2.5-coder:32b)
-agentic switch status      # Show current provider and settings
-```
-
-Then reload:
-```bash
 source ~/.zshrc
 ```
 
-### Full Configuration
-
-For fine-grained control over model, endpoint, and auth:
-```bash
-agentic config
-```
-
-This detects whether you're using the Anthropic API or a local Ollama endpoint and prompts accordingly.
-
-### Settings
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `AGENTIC_MODEL` | `qwen2.5-coder:32b` | Model name |
-| `ANTHROPIC_BASE_URL` | `http://localhost:11434` | API endpoint (Ollama or Anthropic) |
-| `ANTHROPIC_AUTH_TOKEN` | `ollama` | Auth token for Ollama/local endpoints |
-| `ANTHROPIC_API_KEY` | _(empty)_ | API key for Anthropic's API |
-| `OLLAMA_MAX_LOADED_MODELS` | `3` | Max concurrent models |
-| `OLLAMA_KEEP_ALIVE` | `30m` | Model cache duration |
-
-**For Anthropic API:** set `ANTHROPIC_BASE_URL=https://api.anthropic.com` and `ANTHROPIC_API_KEY=sk-ant-...`
-
-**For Ollama:** set `ANTHROPIC_BASE_URL=http://localhost:11434` and `ANTHROPIC_AUTH_TOKEN=ollama`
-
-`agentic switch` and `agentic config` both handle this automatically — they detect the backend from the URL and save the correct variables.
-
-### Agent Prompts
-
-System prompts are in `~/.agentic/agents/`:
-
-| File | Role | When used |
-|------|------|-----------|
-| `architect.txt` | Breaks request into atomic tasks (JSON) | Every run |
-| `implementor.txt` | Generates code per task | Every run |
-| `reviewer.txt` | AI code review for correctness & quality | After static validation passes |
-| `designer.txt` | UI layout spec before planning | Optional — prompted for UI tasks |
-| `documenter.txt` | CLAUDE.md generation | `agentic doc-gen` |
-
-All agents are JS/TS focused. Framework-specific conventions (MUI, React, Tailwind, etc.) belong in your project's `CLAUDE.md`, not in the agent prompts.
-
 ---
 
-## 📖 Usage
+## Usage
 
-### Complete Workflow (Recommended)
 ```bash
-cd my-project
-
-# 1. Initialize (first time only)
-agentic init
-
-# 2. Run the full workflow
-agentic
-# Enter: "Add user authentication to the login form"
-# → Discovers structure (reads tsconfig, package.json scripts, source files)
-# → Prompts for design spec if UI-related
-# → Plans tasks
-# → Generates code
-# → Static validation (shape, imports, brace balance, test framework)
-# → AI review (correctness, completeness, CLAUDE.md conventions)
-# → Applies safely
+cd your-project
+agentic serve
 ```
 
-The orchestrator runs up to 5 iterations of implement → validate → AI review → refine before asking whether to proceed or stop.
+Open [http://localhost:4080](http://localhost:4080). The dashboard is locked to the project you launched from.
 
-### Step-by-Step (Manual Control)
-```bash
-agentic archie          # Plan — creates .claude/latest/tasks.json
-agentic implement       # Generate code → .claude/latest/outputs/
-agentic validate        # Static quality checks
-agentic review          # AI review (correctness & quality)
-agentic apply --dry-run # Preview changes
-agentic apply           # Apply for real
-```
+**Submit a job** — describe what you want in the text area and hit Submit (or `Cmd+Enter`).
 
-### Iterative Refinement
+**Run it** — hit **▶ Run Worker** for one job, or **▶▶ Run All** to process the whole queue.
+
+**Review** — when a job finishes, click it to see what the agent did: files read, files modified, commands run, build result. Click **View Diff** to see the code changes.
+
+**Merge** — click **Accept** (single job) or **Accept Chain** (whole sequence) to collect the agent work onto a staging branch like `agent-work/20260520-a1b2`. Then merge that branch into your own work whenever you're ready.
+
 ```bash
-# If validation or review fails:
-agentic refine          # Reads issues, improves plan, re-runs architect
-agentic implement       # Regenerate with improved plan
-agentic apply
+git merge agent-work/20260520-a1b2
 ```
 
 ---
 
-## 🎮 Commands
+## Chaining jobs
 
-### Main Commands
+Jobs can build on each other. When submitting, fill in the **Chain after** field with a previous job's ID. Each chained job branches from the previous job's committed work, so the agent sees what the previous job actually built.
 
-| Command | Description |
-|---------|-------------|
-| `agentic` | Run complete workflow with orchestration |
-| `agentic init` | Initialize project (creates `.claude/`, `CLAUDE.md`) |
-| `agentic config` | Configure settings interactively (model, endpoint, API key) |
-| `agentic switch [anthropic\|ollama\|status]` | Quickly toggle between Anthropic and Ollama |
-| `agentic plan` | Create agile plan with user stories and acceptance criteria |
-| `agentic list` | List past sessions |
-| `agentic use` | Switch to a previous session interactively |
-| `agentic retry` | Regenerate `tasks.json` for a corrupted session |
-| `agentic metrics [file]` | View session performance metrics |
-| `agentic doc` | Open `CLAUDE.md` in `$EDITOR` |
-| `agentic doc-gen` | Auto-generate `CLAUDE.md` from project analysis |
-
-### Low-Level Commands (Expert Mode)
-
-| Command | Description |
-|---------|-------------|
-| `agentic archie` | Create task breakdown only |
-| `agentic implement` | Generate code for all tasks |
-| `agentic validate` | Run static quality checks |
-| `agentic review` | Run AI review on generated outputs |
-| `agentic apply` | Apply changes to files |
-| `agentic apply --dry-run` | Preview changes without applying |
-| `agentic verify` | Verify applied changes match plan |
-| `agentic refine` | Refine plan based on validation issues |
+**Accept Chain** on the first job in a sequence merges all of them together onto one staging branch in the correct order. You get one branch to review and merge rather than five.
 
 ---
 
-## 📂 Project Structure
+## Server commands
 
-### What Gets Created in Your Project
-```
-your-project/
-├── .claude/                    # Workflow data (gitignored)
-│   ├── sessions/
-│   │   └── 20260219-143000_add-auth/
-│   │       ├── request.txt         # Original request
-│   │       ├── context.txt         # Project context snapshot
-│   │       ├── tasks.json          # Task breakdown
-│   │       ├── design.txt          # UI design spec (if designer ran)
-│   │       ├── review.txt          # AI review output
-│   │       ├── architect_usage.json
-│   │       ├── review_usage.json
-│   │       ├── validation_issues.txt
-│   │       ├── validation_warnings.txt
-│   │       └── outputs/
-│   │           ├── task_001.txt         # Stitched output (ready to apply)
-│   │           ├── task_001_raw.txt     # Pre-stitch model output (for validation)
-│   │           ├── task_001_usage.json
-│   │           └── task_002.txt
-│   ├── plans/                  # Agile planning outputs
-│   └── metrics/                # Session performance metrics
-├── CLAUDE.md                   # Project documentation for AI
-└── .gitignore                  # Updated to ignore .claude/
+```bash
+agentic serve          # start on port 4080
+agentic serve 8080     # custom port
+agentic serve stop     # stop
+agentic serve status   # check if running
 ```
 
-### Agentic Installation Structure
+---
+
+## Review workflow
+
+| Action | What it does |
+|---|---|
+| **View Diff** | Colour-coded diff of everything the agent changed |
+| **Accept** | Merge the job's branch onto the staging branch |
+| **Accept Chain ↓** | Merge the whole chain onto a single staging branch |
+| **Reject** | Delete the branch and worktree |
+| **Abandon** | Move a stuck running job to failed so it can be retried |
+
+After **Accept Chain**, you have an `agent-work/<date>` branch. Merge it into your own branch when you're satisfied with it.
+
+---
+
+## What the agent does
+
+For each job the agent:
+
+1. Reads `CLAUDE.md` to understand project conventions
+2. Explores relevant source files
+3. Implements the requested change
+4. Runs `npm install` if `package.json` was modified
+5. Runs `npm run build` — fixes all type errors, missing imports, and bundler errors
+6. Runs `npm run lint` if available — fixes ESLint errors including React hook rules
+7. Runs `npx prettier --write src/` if Prettier is configured
+8. Commits with a descriptive message
+
+The job detail page shows everything the agent did: files read, files modified, every command run with pass/fail status, and the full agent reasoning if you want to see it.
+
+---
+
+## What gets created
+
 ```
 ~/.agentic/
-├── bin/
-│   └── agentic                 # Main CLI entry point
-├── lib/
-│   ├── config.sh               # Configuration management
-│   ├── utils.sh                # Shared utilities (_session_slug, format_duration, etc.)
-│   ├── claude-api.sh           # Direct Anthropic API client (curl-based, with retry)
-│   ├── architect.sh            # Task planning, project discovery, optional design step
-│   ├── implement.sh            # Code generation with stitching
-│   ├── validate.sh             # Static validation + AI review
-│   ├── apply.sh                # Safe file operations & verify-apply
-│   ├── refine.sh               # Iterative improvement
-│   ├── plan.sh                 # Agile planning tool
-│   ├── doc.sh                  # Smart documentation generation
-│   ├── metrics.sh              # Performance tracking
-│   ├── retry.sh                # Session retry/regeneration
-│   ├── init.sh                 # Project initialization
-│   └── core.sh                 # Main orchestrator
-├── agents/
-│   ├── architect.txt           # Task breakdown logic
-│   ├── implementor.txt         # Code generation rules
-│   ├── reviewer.txt            # AI code review (JS/TS, correctness & quality)
-│   ├── designer.txt            # UI layout spec (framework-agnostic)
-│   └── documenter.txt          # CLAUDE.md generation
-├── .agentic.conf               # Your config — gitignored
-└── .agentic.conf.example       # Safe template — committed to repo
+├── queue/
+│   ├── pending/      # submitted, waiting to run
+│   ├── running/      # claimed by worker, in progress
+│   ├── done/         # completed — branch ready to review
+│   ├── failed/       # build or agent error
+│   ├── abandoned/    # worker crashed or manually stopped
+│   └── cancelled/    # cancelled before running
+├── worktrees/
+│   └── j_xxx/        # isolated checkout per job, removed after accept/reject
+└── serve.pid         # server PID, removed on stop
+```
+
+In your project, the agent creates branches named `agentic/<job-id>`. Accept Chain creates `agent-work/<date>-<short-id>`. Neither touches your working tree.
+
+---
+
+## CLAUDE.md
+
+The agent reads `CLAUDE.md` at the root of your project before doing anything. Keep it current — it's the primary source of truth for naming conventions, import patterns, testing framework, component patterns, and anything else the agent needs to know.
+
+```bash
+agentic doc-gen   # generate from project analysis
+agentic doc       # open in $EDITOR
 ```
 
 ---
 
-## 🔬 How It Works
+## Other commands
 
-### 1. Project Discovery (Architect)
-
-The architect builds context by scanning the actual filesystem — no hardcoded assumptions about `src/` vs `app/` vs `lib/`:
-
-1. Reads `CLAUDE.md` for project conventions
-2. Reads `tsconfig.json` for path aliases and compiler options (helps generate correct import paths)
-3. Reads `package.json` scripts so it knows the test command, build command, etc.
-4. Lists all TS/JS source files excluding `node_modules`, `dist`, `build`, etc.
-5. Lists existing test files to infer co-location patterns
-6. Sends everything to the architect agent which outputs a `tasks.json` with accurate file paths and `modification_type` per task
-
-Each task specifies not just a file and action but a `modification_type`:
-
-| modification_type | What it means |
-|---|---|
-| `full_file` | Replace or create entire file |
-| `add_import` | Insert one import line |
-| `add_function` | Append a new function |
-| `add_type` | Insert a type/interface after imports |
-| `modify_function` | Replace a specific function by name |
-| `add_to_function` | Add code inside an existing function (outputs full replacement function) |
-| `add_route` | Insert a route before the closing router tag |
-| `delete_code` | Remove a specific function/export |
-
-### 1b. Optional Design Step (Designer)
-
-At the start of every planning run, `archie` prompts:
-
-```
-🎨 Run designer for a layout spec first? (y/n)
-```
-
-If accepted, the designer agent produces a layout specification — component hierarchy, layout structure, responsive behavior, interaction states — and passes it to the architect as additional context. The designer reads your `CLAUDE.md` to know which UI framework you use; it doesn't assume any specific library.
-
-The design spec is saved to `design.txt` in the session directory.
-
-### 2. Context-Aware Generation (Implementor)
-
-For each task the implementor:
-
-- Loads only the relevant section of the source file (not the whole file) based on `modification_type` — saves tokens and improves accuracy
-- For `modify_function` / `add_to_function` / `add_hook`: uses brace-counting to locate the exact function range. Detection covers:
-  - Named functions with optional modifiers: `export async function foo<T>(`
-  - Arrow functions: `const foo =`, `const foo: Type =`
-  - Class declarations including generics: `class Foo<T>`
-  - Class methods with all TypeScript modifiers: `private/public/protected/static/async/override/abstract methodName(`
-  - Class arrow methods: `methodName = async (`
-- For test files, runs a 4-strategy source file discovery process:
-  - **Strategy 0**: Parse full path from task description (e.g. `"Create tests for app/utils/table.ts"`)
-  - **Strategy 1**: Extract `src/` path from description
-  - **Strategy 2**: Derive from test filename — tries 15+ path transform patterns
-  - **Strategy 3**: Project-wide `find` fallback
-- Injects the actual source code into the prompt so generated tests use real function signatures
-
-After generation, partial outputs are **stitched** back into the original file:
-- `add_import` → inserted after the last existing import (handles multi-line imports correctly)
-- `add_function` / `add_export` → appended to end of file
-- `add_type` → inserted after imports
-- `modify_function` / `add_to_function` → replaces the located line range
-- `add_route` → inserted before `</Routes>` / `</Switch>`
-
-### 3. Static Validation
-
-**Content validation (`validate`):**
-- Stray markdown fences
-- Placeholder/TODO markers (`...`, `// implement`, etc.)
-- Brace balance for TypeScript/JS files (strips template literals and `${}` expressions before counting)
-- Vitest/Jest mixing detection in test files
-- JSON validity for `.json` files
-- Package import existence in `package.json`
-- Relative import path resolution (checks disk + other tasks in session)
-- Cross-task symbol consistency (imported names must be exported by the dependency task)
-- Size regression warning (output >30 lines shorter than original)
-- `modification_type` shape checks (`add_import` should be ~1 line, etc.)
-
-Issues are saved to `validation_issues.txt` for `refine` to consume. Warnings are saved separately and don't block `apply`.
-
-**Pre-apply (inside `apply`):**
-- File paths have extensions
-- Output files exist for non-DELETE tasks
-
-**Post-apply (`verify-apply`):**
-- Confirms CREATE/MODIFY/DELETE actually happened
-- For MODIFY, checks the file changed vs its backup
-- For `delete_code`, checks the file still exists but differs from backup
-
-### 4. AI Review
-
-When static validation passes, the AI reviewer runs automatically before apply. It receives:
-- The original request
-- The full task plan
-- All generated outputs with their file paths and `modification_type`
-- Your `CLAUDE.md` (for conventions)
-
-The reviewer checks:
-- **Correctness** — does the implementation actually do what was asked?
-- **Edge cases** — null/undefined handling, error handling, empty inputs
-- **Type safety** — no untyped `any`, no unsafe casts
-- **Completeness** — all tasks implemented, no missing exports
-- **Conventions** — follows CLAUDE.md patterns, correct test framework, correct import paths
-- **Minimal change** — didn't touch things it wasn't asked to change
-
-`VERDICT: APPROVED` → proceeds to apply (warnings written to `validation_warnings.txt`)
-`VERDICT: REJECTED` → critical issues appended to `validation_issues.txt`, triggers refine loop
-
-The full review is saved to `review.txt` in the session directory.
-
-### 5. Safe Application
-
-`apply` runs these steps in order:
-1. Pre-apply validation (file paths, output existence)
-2. Git uncommitted-change warning
-3. Creates a new branch `agentic/{session-id}`
-4. Backs up modified files as `.backup`
-5. Applies CREATE / MODIFY / DELETE operations
-6. Prompts for a git commit
-7. Runs `verify-apply` automatically
-
-`apply --dry-run` shows exactly what would happen without touching the filesystem.
-
-### 6. Iterative Refinement
-
-`refine` reads `validation_issues.txt` (which can contain issues from both static validation and the AI reviewer), appends them to the original request, and re-runs the architect agent. It backs up `tasks.json` as `tasks.json.iteration-N` and clears old outputs so `implement` starts clean.
-
-The `agentic` orchestrator loops this automatically up to 5 times before prompting the user.
-
----
-
-## 📊 Smart Documentation Generation (`doc-gen`)
-
-`agentic doc-gen` analyzes the project and generates `CLAUDE.md` using the AI. It collects:
-
-1. `package.json` (dependencies)
-2. Directory tree (via `tree` or `find`)
-3. Test framework config files (vitest, jest)
-4. `tsconfig.json`
-5. Real test file examples (first 30 lines of up to 3 test files)
-6. Real export patterns from source files
-7. Real import patterns from source files
-8. Real function signatures from source files
-9. Full content of up to 3 representative source files
-
-**Note on macOS compatibility:** Export/import/function pattern extraction uses `grep -m N -E` (separate flags) and process substitution `< <(find ...)` to avoid pipeline hangs under `set -euo pipefail`.
-
----
-
-## 🎯 Best Practices
-
-### Specify File Paths in Requests
 ```bash
-✅  "Create tests for app/utils/validation.ts"
-✅  "Add error handling to src/api/client.ts"
-❌  "Add tests for the validation utilities"
-❌  "Fix the API client"
-```
-
-The architect uses these paths in `task.description`, which is the highest-priority source for the implementor's source file discovery.
-
-### Always Preview Before Applying
-```bash
-agentic apply --dry-run   # See what would change
-agentic apply             # Apply when confident
-```
-
-### Keep CLAUDE.md Updated
-```bash
-agentic doc-gen   # Regenerate after major structural changes
-agentic doc       # Open in $EDITOR for manual edits
-```
-
-Framework-specific conventions (styling rules, component patterns, test utilities) belong in `CLAUDE.md` — that's how the agents learn your project's style without being hardcoded to any particular library.
-
-### Recover a Corrupted Session
-```bash
-agentic use       # Pick the broken session
-agentic retry     # Backs up bad tasks.json, regenerates it
-agentic implement # Continue from there
+agentic init          # initialize project (creates CLAUDE.md, updates .gitignore)
+agentic accept <id>   # merge a single job's branch
+agentic reject <id>   # discard a job's branch and worktree
+agentic plan          # create an agile plan from a request
 ```
 
 ---
 
-## 🐛 Troubleshooting
-
-### "No active session"
-```bash
-agentic list      # Show available sessions
-agentic use       # Pick one interactively
-# or
-export AGENTIC_SESSION="20260219-143000_add-auth"
-```
-
-### "Pre-apply validation failed: no extension"
-The architect produced a bad file path (e.g. `utils` instead of `utils/validation.ts`).
-```bash
-agentic refine    # Auto-fix via re-planning
-agentic implement
-agentic apply
-# or manually:
-nano .claude/latest/tasks.json
-```
-
-### "Test generated placeholder functions"
-The implementor couldn't find the source file. Be explicit:
-```bash
-# Include the full path in your request:
-agentic archie
-> "Create tests for app/utils/table.ts"
-```
-Or update `CLAUDE.md` with the correct test location pattern.
-
-### "Function not found — falling back to full file"
-The implementor couldn't locate the target function. This usually means:
-- The `target` field in `tasks.json` doesn't exactly match the function name in source
-- The function uses an unusual TypeScript pattern
-
-```bash
-cat .claude/latest/tasks.json        # Check the target field
-grep -n "targetName" path/to/file.ts # Verify exact identifier
-nano .claude/latest/tasks.json       # Fix target, then re-run implement
-```
-
-### Validation keeps failing
-```bash
-cat .claude/latest/validation_issues.txt   # See exact issues
-cat .claude/latest/review.txt              # See AI review details
-nano .claude/latest/outputs/task_001.txt   # Fix manually
-agentic validate
-agentic apply
-```
-
-### API not responding / hanging
-Check `~/.agentic/.agentic.conf` — ensure `ANTHROPIC_BASE_URL` and credentials are correct. For Ollama, confirm the model is loaded: `ollama list`.
-
----
-
-## 📈 Metrics
-
-```bash
-agentic metrics              # Last session
-agentic metrics .claude/metrics/20260219-143000.json   # Specific file
-```
-
-**Example output:**
-```
-📊 Metrics Report
-─────────────────────────────────────
-
-Session:  20260219-143000_add-authentication
-Status:   success
-Duration: 3m 45s
-Tokens:   15200
-
-Steps:
-  architect:     5s | 2100 tokens  | success
-  implement_1: 125s | 11800 tokens | success
-  validate_1:    2s | 0 tokens     | success
-  review_1:     18s | 1200 tokens  | success
-  apply:         8s | 0 tokens     | success
-```
-
-Real token counts (including cache reads and cache writes) are tracked per-task in `outputs/task_N_usage.json` and summed in the metrics report.
-
----
-
-## 🚦 Quick Reference
-
-```bash
-# Setup
-agentic init              # Initialize project
-agentic config            # Configure model / endpoint / keys
-agentic switch anthropic  # Quick switch to Anthropic
-agentic switch ollama     # Quick switch to Ollama
-agentic switch status     # Show current provider
-
-# Main workflow
-agentic                   # Complete orchestrated workflow
-agentic archie            # Plan only (always prompts for optional design step)
-agentic implement         # Generate only
-agentic validate          # Static checks only
-agentic review            # AI review only
-agentic apply --dry-run   # Preview
-agentic apply             # Apply
-
-# Iteration
-agentic refine            # Fix issues and re-plan
-agentic use               # Switch sessions
-agentic retry             # Regenerate tasks.json
-
-# Utilities
-agentic list              # List sessions
-agentic metrics           # View metrics
-agentic doc               # Edit CLAUDE.md
-agentic doc-gen           # Generate CLAUDE.md
-agentic plan              # Agile planning
-```
-
----
-
-## 🤝 Contributing
-
-- **Add validation rules**: `lib/validate.sh` — `validate()` function
-- **Improve AI review**: `agents/reviewer.txt` or `lib/validate.sh` — `review()` function
-- **Improve function detection**: `lib/implement.sh` — `_find_function_range()`
-- **Improve test discovery**: `lib/implement.sh` — `_find_source_for_test()`
-- **Improve stitching**: `lib/implement.sh` — `_stitch_*` helpers
-- **Better prompts**: `agents/*.txt`
-- **New commands**: `bin/agentic`
-
----
-
-## 📝 License
-
-MIT — use freely, modify as needed.
-
----
-
-## 🙏 Philosophy
-
-**AI should augment, not replace.**
-
-This tool handles tedious boilerplate, file structure, imports, test scaffolding, and repetitive patterns. You focus on architecture decisions, creative solutions, code review, and business logic.
-
-**Result:** 10x productivity without sacrificing quality.
-
-
----
-
-## 🚫 .llmignore
-
-Similar to `.gitignore`, a `.llmignore` file in your project root controls which files are excluded from the LLM's context. This is useful for keeping secrets, generated files, large data files, and low-signal noise out of the AI's view — reducing token usage and improving output quality.
-
-**`.llmignore` should be committed to your repo.** It is not a secrets file itself — it just tells agentic which files to hide from the AI.
-
-### Where It Applies
-
-| Command | What it filters |
-|---------|----------------|
-| `agentic archie` | Source file and test file lists sent in the planning context |
-| `agentic doc-gen` | All file discovery during project analysis |
-| `agentic implement` | Strategy 3 source file discovery (project-wide `find` fallback) |
-
-### Setup
-
-```bash
-# Copy the example as a starting point
-cp ~/.agentic/.llmignore.example .llmignore
-
-# Edit for your project
-nano .llmignore
-```
-
-When a `.llmignore` is active, agentic will confirm at the start of `archie` and `doc-gen`:
-```
-🚫 .llmignore active (12 patterns)
-```
-
-### Syntax
-
-Standard gitignore-style patterns:
-
-```gitignore
-# Comments and blank lines are ignored
-
-# Directory (trailing slash) — matches the dir and everything inside
-secrets/
-dist/
-migrations/
-
-# Bare filename glob — matches that filename anywhere in the tree
-*.env
-*.log
-*.lock
-
-# Path glob — matches relative to project root
-src/generated/*.ts
-
-# ** recursive glob
-**/fixtures/**
-**/*.min.js
-```
-
-### Recommended Patterns
-
-```gitignore
-# Secrets
-*.env
-*.env.*
-*.pem
-*.key
-secrets/
-credentials/
-
-# Build output
-dist/
-build/
-.next/
-coverage/
-*.d.ts
-*.min.js
-
-# Large data / low signal
-*.sql
-*.sqlite
-migrations/
-fixtures/
-seed-data/
-
-# Lock files
-package-lock.json
-yarn.lock
-pnpm-lock.yaml
-
-# Vendor
-vendor/
-third-party/
-```
-
-A full example is available at `~/.agentic/.llmignore.example`.
+MIT License
