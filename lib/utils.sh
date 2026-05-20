@@ -25,13 +25,21 @@ _apply_clean_path() {
   echo "$path"
 }
 
-# Resolve active session dir — returns empty string if none found
+# Resolve active session dir — returns empty string if none found.
+# Primary path: AGENTIC_SESSION env var (must be set by workers explicitly).
+# Fallback: most recently modified session dir (interactive shell convenience only —
+# not safe under concurrent workers; workers must always supply AGENTIC_SESSION).
 _apply_resolve_session() {
   if [[ -n "${AGENTIC_SESSION:-}" ]]; then
-    echo ".claude/sessions/$AGENTIC_SESSION"
-  elif [[ -L ".claude/latest" ]]; then
-    AGENTIC_SESSION=$(basename "$(readlink .claude/latest)")
-    echo ".claude/latest"
+    local dir=".claude/sessions/$AGENTIC_SESSION"
+    [[ -d "$dir" ]] && echo "$dir" || echo ""
+    return
+  fi
+
+  local newest
+  newest=$(ls -td .claude/sessions/*/ 2>/dev/null | grep -v '/queued_' | head -1)
+  if [[ -n "$newest" && -d "$newest" ]]; then
+    echo "${newest%/}"
   else
     echo ""
   fi
@@ -44,6 +52,61 @@ _apply_get_task_ids() {
   task_ids=($(jq -r '.execution_order[]?' "$tasks_file" 2>/dev/null))
   [[ ${#task_ids[@]} -eq 0 ]] && task_ids=($(jq -r '.tasks[]?.id' "$tasks_file"))
   echo "${task_ids[@]}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Repo map — compact symbol index of the project
+# Returns lines of the form: "src/hooks/useFoo.ts: FooReturn, useFoo"
+# Gives the model a table of contents so it knows where every symbol lives
+# without having to read every file.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_build_repo_map() {
+  python3 - <<'PYEOF'
+import os, re
+
+EXCLUDES = {'node_modules', '.git', 'dist', 'build', '.next', '.claude',
+            'coverage', '__pycache__', '.turbo', 'out', '.vercel',
+            'worktrees', 'queue'}
+
+# Matches: export [async|default|declare]* (function*|const|let|var|class|interface|type|enum|abstract class) NAME
+EXPORT_RE = re.compile(
+    r'^export\s+(?:(?:async|default|declare|abstract)\s+)*'
+    r'(?:function\*?\s+|const\s+|let\s+|var\s+|class\s+|interface\s+|type\s+|enum\s+)'
+    r'(\w+)',
+    re.MULTILINE,
+)
+# Matches: export { Foo, Bar as Baz }
+REEXPORT_RE = re.compile(r'^export\s+\{([^}]+)\}', re.MULTILINE)
+
+lines = []
+for root, dirs, files in os.walk('.'):
+    dirs[:] = sorted(d for d in dirs if d not in EXCLUDES and not d.startswith('.'))
+    for fname in sorted(files):
+        if not (fname.endswith('.ts') or fname.endswith('.tsx')):
+            continue
+        path = os.path.join(root, fname)
+        rel = path[2:] if path.startswith('./') else path
+        try:
+            content = open(path, errors='replace').read()
+        except Exception:
+            continue
+        names = [m.group(1) for m in EXPORT_RE.finditer(content)]
+        for m in REEXPORT_RE.finditer(content):
+            for part in m.group(1).split(','):
+                n = part.strip().split(' as ')[0].strip()
+                if n and n not in ('default', ''):
+                    names.append(n)
+        seen, unique = set(), []
+        for n in names:
+            if n not in seen:
+                seen.add(n)
+                unique.append(n)
+        if unique:
+            lines.append(f'{rel}: {", ".join(unique)}')
+
+print('\n'.join(lines))
+PYEOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -195,8 +258,6 @@ function agentic-use() {
   if [[ "$choice" -gt 0 && "$choice" -le "${#sessions[@]}" ]] 2>/dev/null; then
     local selected="${sessions[$((choice - 1))]}"
 
-    rm -f .claude/latest
-    ln -s "sessions/$selected" .claude/latest
     export AGENTIC_SESSION="$selected"
 
     echo "✅ Active session: $selected"
