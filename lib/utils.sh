@@ -62,7 +62,7 @@ _apply_get_task_ids() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 _build_repo_map() {
-  python3 - <<'PYEOF'
+  "${AGENTIC_HOME}/venv/bin/python3" - <<'PYEOF'
 import os, re
 
 EXCLUDES = {'node_modules', '.git', 'dist', 'build', '.next', '.claude',

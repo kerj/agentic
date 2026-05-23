@@ -2,7 +2,10 @@
 .ds_store
 queue/
 worktrees/
+diffs/
+logs/
 serve.pid
 __pycache__/
 *.pyc
+venv/
 .claude/

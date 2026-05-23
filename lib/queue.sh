@@ -25,8 +25,8 @@
 #   state_history:     append-only [{state, at}] — makes post-mortem debugging easy
 #   summary:           (optional) one-line result, added by queue_complete on completion
 
-AGENTIC_QUEUE_DIR="${HOME}/.agentic/queue"
-AGENTIC_WORKTREES_DIR="${HOME}/.agentic/worktrees"
+AGENTIC_QUEUE_DIR="${AGENTIC_HOME}/queue"
+AGENTIC_WORKTREES_DIR="${AGENTIC_HOME}/worktrees"
 
 # _queue_init — creates the queue and worktrees directories if absent. Idempotent.
 _queue_init() {
@@ -113,8 +113,10 @@ queue_submit() {
 }
 
 # queue_claim — atomically claims the highest-priority oldest job from pending/.
+# Skips any job whose parent_request_id is still in pending/ or running/ so that
+# chained jobs never execute before their parent has completed.
 # Echoes the path to the now-running/ job file on stdout.
-# Returns 1 if nothing is pending.
+# Returns 1 if nothing claimable is pending.
 queue_claim() {
   _queue_init
 
@@ -130,6 +132,17 @@ queue_claim() {
       | sort -t_ -k1,1rn -k2,3); do
     local src="${AGENTIC_QUEUE_DIR}/pending/${candidate}"
     local dst="${AGENTIC_QUEUE_DIR}/running/${candidate}"
+
+    # Chain-dependency check: skip if the parent job is still pending or running
+    local parent_id
+    parent_id=$(jq -r '.parent_request_id // empty' "$src" 2>/dev/null)
+    if [[ -n "$parent_id" ]]; then
+      if grep -rl "\"id\": \"${parent_id}\"" \
+           "${AGENTIC_QUEUE_DIR}/pending" \
+           "${AGENTIC_QUEUE_DIR}/running" 2>/dev/null | grep -q .; then
+        continue
+      fi
+    fi
 
     # Atomic rename — first claimer wins; ENOENT from a concurrent claimer is silently skipped
     if mv "$src" "$dst" 2>/dev/null; then

@@ -32,10 +32,13 @@ from typing import Optional
 OLLAMA_HOST   = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 MODEL         = os.environ.get("AGENTIC_LOCAL_MODEL", "qwen2.5-coder:32b")
 AGENTIC_HOME  = Path(os.environ.get("AGENTIC_HOME", Path.home() / ".agentic"))
-MAX_TURNS     = int(os.environ.get("AGENTIC_MAX_TURNS", "60"))
+MAX_TURNS         = int(os.environ.get("AGENTIC_MAX_TURNS", "60"))
 MAX_REPAIR_ROUNDS = 5
-CONTEXT_BUDGET    = 20000  # tokens; compress when exceeded
-KEEP_RECENT_TURNS = 15     # turns to keep verbatim during compression
+# Context budget before compression kicks in.
+# qwen-coder (128K window) — leave ~28K headroom for output and tool defs.
+# Override via AGENTIC_CONTEXT_BUDGET in .agentic.conf
+CONTEXT_BUDGET    = int(os.environ.get("AGENTIC_CONTEXT_BUDGET", "100000"))
+KEEP_RECENT_TURNS = int(os.environ.get("AGENTIC_KEEP_RECENT_TURNS", "15"))
 
 # ── TypeScript / ESLint error hints ────────────────────────────────────────────
 
@@ -161,6 +164,44 @@ def _make_tools(write_enabled: bool = True) -> list[dict]:
                 }
             }
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "Setup",
+                "description": (
+                    "Install project dependencies. Call this once at the start of PHASE 1 "
+                    "before editing any files. Detects yarn/pnpm/npm from lock files automatically. "
+                    "Pass packages=[] to also add new libraries in the same step."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "packages": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Extra packages to install, e.g. ['react-window', '@types/react-window']"
+                        }
+                    },
+                    "required": []
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "Build",
+                "description": (
+                    "Run the project build and return pass/fail with any errors. "
+                    "Reads package.json scripts to find the right build command. "
+                    "Use this instead of running npm/yarn/pnpm build via Bash."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        },
     ]
     if write_enabled:
         tools.insert(2, {
@@ -214,11 +255,11 @@ def tool_write(file_path: str, content: str) -> str:
     p.write_text(content)
     return f"Wrote {file_path} ({len(content.splitlines())} lines)"
 
-def tool_bash(command: str, description: str = "", timeout: int = 120000) -> str:
+def tool_bash(command: str, description: str = "", timeout: int = 300000) -> str:
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True,
-            timeout=min(timeout / 1000, 300)
+            timeout=min(timeout / 1000, 600)
         )
         out = result.stdout + result.stderr
         if result.returncode != 0:
@@ -254,6 +295,92 @@ def tool_ls(path: str = ".") -> str:
     ]
     return "\n".join(lines) or "(empty)"
 
+def _detect_package_manager() -> tuple[str, str, str]:
+    """Return (name, install_cmd, add_cmd) based on lock files in cwd."""
+    cwd = Path.cwd()
+    if (cwd / "yarn.lock").exists():
+        return "yarn", "yarn install", "yarn add"
+    if (cwd / "pnpm-lock.yaml").exists():
+        return "pnpm", "pnpm install", "pnpm add"
+    return "npm", "npm install", "npm install"
+
+def tool_setup(packages: list | None = None) -> str:
+    """
+    Install project dependencies and optionally add new packages.
+    Detects yarn/pnpm/npm from lock files. Returns clear success or error.
+    """
+    cwd = Path.cwd()
+    if not (cwd / "package.json").exists():
+        return "No package.json found — skipping setup (not a Node.js project)."
+
+    pm, install_cmd, add_cmd = _detect_package_manager()
+
+    result = subprocess.run(
+        install_cmd, shell=True, capture_output=True, text=True, timeout=300
+    )
+    if result.returncode != 0:
+        out = (result.stdout + result.stderr).strip()
+        return f"✗ Setup failed ({install_cmd}):\n{out}"
+
+    extras = []
+    if packages:
+        pkg_str = " ".join(packages)
+        r2 = subprocess.run(
+            f"{add_cmd} {pkg_str}", shell=True, capture_output=True, text=True, timeout=120
+        )
+        if r2.returncode != 0:
+            out = (r2.stdout + r2.stderr).strip()
+            return f"✗ Failed to add {pkg_str}:\n{out}"
+        extras = packages
+
+    msg = f"✓ Setup complete ({pm}). node_modules ready."
+    if extras:
+        msg += f" Added: {', '.join(extras)}."
+    return msg
+
+def _find_build_cmd() -> str:
+    """Return the build shell command for the current project, with 2>&1 appended."""
+    import json as _json
+    cwd = Path.cwd()
+    pkg_path = cwd / "package.json"
+    if not pkg_path.exists():
+        return "npx tsc --noEmit 2>&1"
+    try:
+        scripts = _json.loads(pkg_path.read_text()).get("scripts", {})
+    except Exception:
+        scripts = {}
+    pm, _, _ = _detect_package_manager()
+    runner = pm if pm in ("yarn", "pnpm") else "npm run"
+    build_script = next(
+        (s for s in ("build", "build:prod", "build:app", "compile") if s in scripts),
+        None,
+    )
+    return f"{runner} {build_script} 2>&1" if build_script else "npx tsc --noEmit 2>&1"
+
+
+def tool_build() -> str:
+    """Run the project build and return pass/fail with any errors."""
+    cmd = _find_build_cmd()
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return "✗ Build timed out after 300s."
+    raw = r.stdout or ""
+    errors = parse_errors(raw)
+    if r.returncode == 0 and not errors:
+        return f"✓ Build passed ({cmd.split()[0]})."
+    return _format_build_result(errors, raw, cmd)
+
+def _format_build_result(errors: list, raw: str, cmd: str) -> str:
+    if errors:
+        lines = [f"✗ Build failed — {len(errors)} error(s):"]
+        for e in errors[:15]:
+            lines.append(f"  {e['file']}:{e.get('line','?')} [{e['code']}] {e['message']}")
+        return "\n".join(lines)
+    snippet = raw.strip()[-1500:] if raw.strip() else "No output."
+    return f"✗ Build failed (bundler/import error):\n{snippet}"
+
+
 def execute_tool(name: str, args: dict,
                  locked_files: Optional[set] = None) -> tuple[str, bool]:
     """Execute a tool. locked_files blocks Edit/Write on non-error files during repair."""
@@ -266,10 +393,20 @@ def execute_tool(name: str, args: dict,
         if name == "Read":   return tool_read(**args),  False
         if name == "Edit":   return tool_edit(**args),  False
         if name == "Write":  return tool_write(**args), False
-        if name == "Bash":   return tool_bash(**args),  False
+        if name == "Bash":
+            cmd = args.get("command", "")
+            blocked = next((p for p in ("rm -rf", "killall", "pkill", "rmdir /s") if p in cmd), None)
+            if blocked:
+                return (f"Blocked: '{blocked}' is not allowed. "
+                        f"Read the error output and fix the code with Edit instead."), True
+            return tool_bash(**args), False
         if name == "Glob":   return tool_glob(**args),  False
         if name == "Grep":   return tool_grep(**args),  False
         if name == "LS":     return tool_ls(**args),    False
+        if name == "Setup":  return tool_setup(**args), False
+        if name == "Build":
+            result = tool_build()
+            return result, result.startswith("✗")
         return f"Unknown tool: {name}", True
     except TypeError as e:
         return f"Bad arguments for {name}: {e}", True
@@ -279,14 +416,26 @@ def execute_tool(name: str, args: dict,
 # ── Build verification & error parsing ─────────────────────────────────────────
 
 def run_build() -> tuple[bool, list[dict], str]:
-    """Run npm run build. Returns (passed, errors, raw_output)."""
-    result = subprocess.run(
-        "npm run build 2>&1", shell=True, capture_output=False,
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        timeout=120
-    )
+    """Run the project build command. Returns (passed, errors, raw_output)."""
+    cmd = _find_build_cmd()
+    try:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=False,
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=300
+        )
+    except subprocess.TimeoutExpired:
+        msg = f"Build timed out after 300s — {cmd.split()[0]} did not finish."
+        return False, [{"file": "<build>", "line": 0, "code": "TIMEOUT", "message": msg}], msg
     raw = result.stdout or ""
     errors = parse_errors(raw)
+    if result.returncode != 0 and not errors:
+        # Vite/bundler error not matching TS/ESLint patterns — pass tail of output to repair
+        snippet = raw[-1500:].strip() or "No output captured."
+        errors.append({
+            "file": "<build>", "line": 0, "code": "BUILD_ERROR",
+            "message": f"Build failed (bundler/import error). Output:\n{snippet}"
+        })
     passed = result.returncode == 0 and len(errors) == 0
     return passed, errors, raw
 
@@ -305,11 +454,20 @@ def parse_errors(output: str) -> list[dict]:
 
     # ESLint: /path/file.tsx:84:5: Error: message (rule/name)
     for m in re.finditer(
-        r"([^\s:]+\.(?:tsx?|jsx?))\s*:(\d+):\d+:\s+Error:\s+(.+?)\s+\(([^)]+)\)", output
+        r"([^\s:]+\.(?:tsx?|jsx?|js|ts))\s*:(\d+):\d+:\s+Error:\s+(.+?)\s+\(([^)]+)\)", output
     ):
         errors.append({
             "file": m.group(1), "line": int(m.group(2)),
             "code": m.group(4), "message": m.group(3).strip()
+        })
+
+    # esbuild/Vite: /path/file.tsx:42:1: error: message
+    for m in re.finditer(
+        r"([^\s:]+\.(?:tsx?|jsx?)):(\d+):\d+:\s+error:\s+(.+)", output
+    ):
+        errors.append({
+            "file": m.group(1), "line": int(m.group(2)),
+            "code": "ESBUILD", "message": m.group(3).strip()
         })
 
     # Deduplicate by (file, line, code)
@@ -442,8 +600,12 @@ def emit(event: dict) -> None:
 def call_ollama(messages: list, model: str,
                 tools: list) -> tuple[dict, dict]:
     payload = {
-        "model": model, "messages": messages,
-        "tools": tools, "tool_choice": "auto", "stream": False,
+        "model":       model,
+        "messages":    messages,
+        "tools":       tools,
+        "tool_choice": "auto",
+        "stream":      False,
+        "options":     {"think": False},
     }
     req = urllib.request.Request(
         f"{OLLAMA_HOST}/v1/chat/completions",
@@ -467,6 +629,7 @@ def run_agent_loop(messages: list, model: str, tools: list,
                    locked_files: Optional[set] = None) -> tuple[list, int, int]:
     """Run tool-use loop until no more tool calls. Returns (messages, in_tok, out_tok)."""
     total_in = total_out = 0
+    consecutive_bash = 0  # reset when a Read/Edit/Write happens
 
     for _ in range(max_turns):
         messages = maybe_compress(messages)
@@ -487,12 +650,44 @@ def run_agent_loop(messages: list, model: str, tools: list,
 
         for tc in tool_calls:
             name = tc["function"]["name"]
+            raw_args = tc["function"].get("arguments", "{}")
             try:
-                args = json.loads(tc["function"]["arguments"])
+                args = json.loads(raw_args)
             except json.JSONDecodeError:
-                args = {}
+                # Model produced malformed JSON — emit error and let it self-correct
+                emit({"type": "tool_use", "id": tc["id"], "name": name, "input": {}})
+                emit({"type": "tool_result", "tool_use_id": tc["id"],
+                      "content": f"Invalid JSON in tool arguments: {raw_args[:200]}\n"
+                                 f"Please provide valid JSON arguments for {name}.",
+                      "is_error": True})
+                messages.append({
+                    "role": "tool", "tool_call_id": tc["id"],
+                    "content": f"Malformed arguments. Retry {name} with valid JSON."
+                })
+                continue
 
             emit({"type": "tool_use", "id": tc["id"], "name": name, "input": args})
+
+            # Track consecutive Bash calls — spiral detection
+            if name == "Bash":
+                consecutive_bash += 1
+            elif name in ("Read", "Edit", "Write"):
+                consecutive_bash = 0
+
+            if consecutive_bash >= 5:
+                result = (
+                    "SPIRAL DETECTED: You have run 5 Bash commands in a row without "
+                    "reading or editing any files. Stop running commands. "
+                    "If npm install output was unclear, assume it succeeded and move on. "
+                    "Use Read on the relevant source file. Use Edit to make changes. "
+                    "Do not run any more Bash commands until you have made an edit."
+                )
+                is_error = True
+                emit({"type": "tool_result", "tool_use_id": tc["id"],
+                      "content": result, "is_error": True})
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                consecutive_bash = 0
+                continue
 
             # Detect loop: same call repeated
             recent = [
@@ -518,18 +713,18 @@ def run_agent_loop(messages: list, model: str, tools: list,
 # ── Repair strategies ──────────────────────────────────────────────────────────
 
 REPAIR_STRATEGIES = [
-    # Round 0 — direct
-    ("Fix these build errors using Edit only (Write is disabled). "
-     "Only modify files listed below.\n\n"
+    # Round 0 — metacognitive first (local models need to reason before acting)
+    ("Build failed. Before making ANY changes:\n"
+     "1. Read each file listed below\n"
+     "2. For each error, state the ROOT CAUSE in one sentence — not the symptom\n"
+     "3. Describe exactly which string you will change and why that fixes the cause\n"
+     "Then use Edit only (Write is disabled) to make those specific changes.\n\n"
      "Files with errors: {files}\n\nErrors:\n{errors}"),
 
-    # Round 1 — metacognitive
-    ("Build still failing. Before making ANY changes:\n"
-     "1. Read each file with errors\n"
-     "2. For each error, explain the root cause in one sentence\n"
-     "3. Describe exactly which string you will change\n"
-     "Then make only those specific edits.\n\n"
-     "Files: {files}\nErrors:\n{errors}"),
+    # Round 1 — single error focus
+    ("Still failing. Ignore all other errors. Fix only this one:\n\n"
+     "{first_error}\n\n"
+     "Read the file. Identify the root cause. Use Edit for the minimal change."),
 
     # Round 2 — single error focus
     ("Ignore all other errors. Fix only this one error, nothing else:\n\n"
@@ -548,10 +743,10 @@ REPAIR_STRATEGIES = [
 ]
 
 def repair_single_error(error: dict, messages: list, model: str,
-                        all_error_files: set, strategy_idx: int) -> tuple[bool, list]:
+                        all_error_files: set, strategy_idx: int) -> list:
     """
-    Attempt to fix one error surgically.
-    Returns (success, updated_messages).
+    Attempt to fix one error surgically. Returns updated messages.
+    Whether the fix succeeded is determined by the caller running the build.
     """
     enriched = enrich_error(error)
     files     = sorted(all_error_files)
@@ -589,11 +784,15 @@ def repair_loop(request: str, messages: list, model: str,
 
     for round_num in range(MAX_REPAIR_ROUNDS):
         if not errors:
-            return True, messages, total_in, total_out
+            # No errors left — verify the build actually passes before declaring success
+            passed_check, _, _ = run_build()
+            return passed_check, messages, total_in, total_out
 
-        # Files with errors — locked for repair
-        error_files = {e["file"] for e in errors}
-        prev_count  = len(errors)
+        # Separate real file errors from synthetic bundler errors
+        real_errors    = [e for e in errors if not e["file"].startswith("<")]
+        bundler_errors = [e for e in errors if e["file"].startswith("<")]
+        error_files    = {e["file"] for e in real_errors}  # only real files are locked
+        prev_count     = len(errors)
 
         emit({"type": "assistant", "message": {"content": [{
             "type": "text",
@@ -604,9 +803,24 @@ def repair_loop(request: str, messages: list, model: str,
         # Checkpoint before each repair round
         checkpoint = save_checkpoint()
 
-        # Fix one error at a time
-        for error in list(errors):
-            messages = repair_single_error(error, messages, model, error_files, strategy)
+        if real_errors:
+            # Fix structured errors one at a time (file-locked)
+            for error in real_errors:
+                messages = repair_single_error(error, messages, model, error_files, strategy)
+        else:
+            # Bundler/import error with no file pointer — let model diagnose freely
+            build_msg = "\n\n".join(e["message"] for e in bundler_errors)
+            prompt = (
+                f"Build failed with no TypeScript errors detected.\n"
+                f"This is likely a bundler, import, or export error.\n\n"
+                f"{build_msg}\n\n"
+                f"Read the relevant source files, find the root cause, and fix it. "
+                f"Use Edit only (Write is disabled)."
+            )
+            messages = messages + [{"role": "user", "content": prompt}]
+            messages, _, _ = run_agent_loop(
+                messages, model, TOOLS_REPAIR, max_turns=8, locked_files=None
+            )
 
         # Verify
         passed, new_errors, _ = run_build()
@@ -645,10 +859,64 @@ def repair_loop(request: str, messages: list, model: str,
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
+def build_repo_map() -> str:
+    """Build a compact symbol index of the project for upfront context."""
+    try:
+        result = subprocess.run(
+            r"""find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) \
+                -not -path "*/node_modules/*" -not -path "*/.git/*" \
+                -not -path "*/.claude/*" -not -path "*/dist/*" \
+                -not -path "*/build/*" | sort | head -100""",
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        files = [f for f in result.stdout.strip().splitlines() if f]
+        if not files:
+            return ""
+
+        lines = []
+        for fp in files[:60]:          # cap at 60 files
+            content = Path(fp).read_text(errors="replace")
+            exports = []
+            for m in re.finditer(
+                r"^(?:export\s+(?:(?:async|default|declare|abstract)\s+)*"
+                r"(?:function\*?\s+|const\s+|let\s+|class\s+|interface\s+|type\s+|enum\s+)"
+                r"|module\.exports\s*=\s*)"
+                r"(\w+)", content, re.MULTILINE
+            ):
+                exports.append(m.group(1))
+            if exports:
+                lines.append(f"{fp[2:]}: {', '.join(exports[:8])}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
 def run(request: str, model: str, system_prompt: str) -> int:
+    # Inject repo map as first user turn so model starts with project overview
+    repo_map = build_repo_map()
+    worktree = os.getcwd()  # bash commands and file ops run here
+    target_repo = os.environ.get("AGENTIC_TARGET_REPO", worktree)
+    initial_context = request
+    if repo_map:
+        initial_context = (
+            f"WORKING DIRECTORY: {worktree}\n"
+            f"(Isolated worktree for project: {target_repo})\n"
+            f"All commands run from this directory. Never use cd.\n\n"
+            f"PROJECT SYMBOL MAP (file → exported symbols):\n{repo_map}\n\n"
+            f"Use this to understand what already exists before reading files.\n\n"
+            f"TASK:\n{request}"
+        )
+    else:
+        initial_context = (
+            f"WORKING DIRECTORY: {worktree}\n"
+            f"(Isolated worktree for project: {target_repo})\n"
+            f"All commands run from this directory. Never use cd.\n\n"
+            f"TASK:\n{request}"
+        )
+
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": request},
+        {"role": "user",   "content": initial_context},
     ]
 
     # Phase 1: Main agent loop
@@ -696,8 +964,11 @@ if __name__ == "__main__":
         print("Usage: ollama_worker.py '<request>'", file=sys.stderr)
         sys.exit(1)
 
-    request       = sys.argv[1]
-    prompt_file   = AGENTIC_HOME / "agents" / "worker.txt"
+    request     = sys.argv[1]
+    prompt_path = os.environ.get("AGENTIC_WORKER_PROMPT", "")
+    prompt_file = Path(prompt_path) if prompt_path else AGENTIC_HOME / "agents" / "worker_local.txt"
+    if not prompt_file.exists():
+        prompt_file = AGENTIC_HOME / "agents" / "worker.txt"
     system_prompt = prompt_file.read_text() if prompt_file.exists() else ""
 
     sys.exit(run(request, MODEL, system_prompt))

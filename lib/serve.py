@@ -8,480 +8,27 @@ import atexit
 import http.server
 import json
 import os
-import pathlib
-import random
 import signal
 import subprocess
 import sys
 import threading
 import time
-import urllib.request
-import urllib.error
-
-# ── Paths ──────────────────────────────────────────────────────────────────────
-
-AGENTIC_HOME  = pathlib.Path(os.environ.get("AGENTIC_HOME", pathlib.Path.home() / ".agentic"))
-QUEUE_DIR     = AGENTIC_HOME / "queue"
-WORKTREES_DIR = AGENTIC_HOME / "worktrees"
-STATES        = ("pending", "running", "done", "failed", "abandoned", "cancelled")
-
-# ── Queue helpers ──────────────────────────────────────────────────────────────
-
-def queue_init() -> None:
-    for state in STATES:
-        (QUEUE_DIR / state).mkdir(parents=True, exist_ok=True)
-    WORKTREES_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def new_job_id() -> str:
-    suffix = format(random.randint(0, 0xFFFF), "04x")
-    return "j_" + time.strftime("%Y%m%d_%H%M%S") + "_" + suffix
-
-
-def submit_job(request: str, repo: str, priority: int, model_hint: str, after: str = None) -> str:
-    result = subprocess.run(
-        ["git", "-C", repo, "rev-parse", "--git-dir"],
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        raise ValueError(f"Not a git repository: {repo}")
-
-    job_id       = new_job_id()
-    now_iso      = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    submitted_by = f"{os.uname().nodename}:{os.getpid()}"
-    ts           = time.strftime("%Y%m%d_%H%M%S")
-
-    # Record the branch at submit time so accept always merges into the right place
-    base_result  = subprocess.run(
-        ["git", "-C", repo, "symbolic-ref", "--short", "HEAD"],
-        capture_output=True, text=True,
-    )
-    base_branch  = base_result.stdout.strip() or "HEAD"
-
-    job = {
-        "id": job_id, "request": request, "target_repo": repo,
-        "model_hint": model_hint, "priority": priority,
-        "base_branch": base_branch,
-        "parent_request_id": after or None,
-        "submitted_at": now_iso, "submitted_by": submitted_by,
-        "state_history": [{"state": "pending", "at": now_iso}],
-        "summary": None,
-    }
-    filename = f"{priority}_{ts}_{job_id}.json"
-    (QUEUE_DIR / "pending" / filename).write_text(json.dumps(job, indent=2))
-    return job_id
-
-
-def find_job(job_id: str, states=None):
-    """Return (data_dict, file_path) for a job, searching the given states."""
-    for state in (states or STATES):
-        d = QUEUE_DIR / state
-        if not d.is_dir():
-            continue
-        for f in d.glob("*.json"):
-            try:
-                data = json.loads(f.read_text())
-                if data.get("id") == job_id:
-                    data["_state"] = state
-                    return data, f
-            except Exception:
-                pass
-    raise ValueError(f"Job not found: {job_id}")
-
-
-def cancel_job(job_id: str) -> None:
-    _, f = find_job(job_id, states=["pending"])
-    data = json.loads(f.read_text())
-    now  = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    data.setdefault("state_history", []).append({"state": "cancelled", "at": now})
-    data["summary"] = data.get("summary") or "cancelled via dashboard"
-    (QUEUE_DIR / "cancelled" / f.name).write_text(json.dumps(data, indent=2))
-    f.unlink()
-
-
-def accept_job(job_id: str) -> str:
-    """Checkout base_branch in target_repo, merge agentic/<id> into it, remove worktree."""
-    job, _ = find_job(job_id, states=["done"])
-    target       = job["target_repo"]
-    branch       = f"agentic/{job_id}"
-    wt           = WORKTREES_DIR / job_id
-    base_branch  = job.get("base_branch") or "HEAD"
-
-    # Always merge into the branch that was active when the job was submitted —
-    # this means the user never needs to switch branches before clicking Accept.
-    if base_branch != "HEAD":
-        co = subprocess.run(
-            ["git", "-C", target, "checkout", base_branch],
-            capture_output=True, text=True,
-        )
-        if co.returncode != 0:
-            raise RuntimeError(f"Could not checkout {base_branch}: {co.stderr.strip()}")
-
-    r = subprocess.run(
-        ["git", "-C", target, "merge", branch, "--no-ff", "-m", f"Accept agentic job: {job_id}"],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr.strip() or "git merge failed")
-
-    if wt.exists():
-        subprocess.run(
-            ["git", "-C", target, "worktree", "remove", str(wt), "--force"],
-            capture_output=True,
-        )
-    return f"Merged {branch} into {base_branch}"
-
-
-def accept_chain(job_id: str) -> dict:
-    """
-    Collect all done jobs in the chain into a single staging branch.
-    Creates agent-work/<date>-<short-id> from the base branch, merges each
-    agentic/<id> branch into it in order, then removes worktrees.
-    The user then merges the staging branch into their own branch when ready.
-    """
-    all_jobs = read_jobs()
-
-    # Walk forward through done descendants
-    chain, current = [job_id], job_id
-    while True:
-        child = next(
-            (j["id"] for j in all_jobs
-             if j.get("parent_request_id") == current and j["_state"] == "done"),
-            None,
-        )
-        if not child:
-            break
-        chain.append(child)
-        current = child
-
-    # Use the first job's base branch and target repo
-    first_job, _ = find_job(chain[0])
-    target      = first_job["target_repo"]
-    base_branch = first_job.get("base_branch") or "HEAD"
-    stamp       = time.strftime("%Y%m%d")
-    short_id    = chain[0][-4:]
-    staging     = f"agent-work/{stamp}-{short_id}"
-
-    # Create staging branch from base
-    r = subprocess.run(
-        ["git", "-C", target, "checkout", "-b", staging, base_branch],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        # Branch may already exist — check it out instead
-        subprocess.run(
-            ["git", "-C", target, "checkout", staging],
-            capture_output=True,
-        )
-
-    # Merge each agent branch in order
-    accepted = []
-    for jid in chain:
-        branch = f"agentic/{jid}"
-        r = subprocess.run(
-            ["git", "-C", target, "merge", branch, "--no-ff",
-             "-m", f"Agent job: {jid}"],
-            capture_output=True, text=True,
-        )
-        if r.returncode != 0:
-            raise RuntimeError(
-                f"Merge conflict on {branch}: {r.stderr.strip()}\n"
-                f"Resolve manually in {target} on branch {staging}"
-            )
-        wt = WORKTREES_DIR / jid
-        if wt.exists():
-            subprocess.run(
-                ["git", "-C", target, "worktree", "remove", str(wt), "--force"],
-                capture_output=True,
-            )
-        accepted.append(jid)
-
-    return {"accepted": accepted, "staging_branch": staging, "target": target}
-
-
-def abandon_job(job_id: str) -> None:
-    """Move a stuck running job to abandoned/ so it can be retried or rejected."""
-    _, f = find_job(job_id, states=["running"])
-    data = json.loads(f.read_text())
-    now  = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    data.setdefault("state_history", []).append({"state": "abandoned", "at": now})
-    data["summary"] = "abandoned via dashboard (worker did not complete)"
-    (QUEUE_DIR / "abandoned" / f.name).write_text(json.dumps(data, indent=2))
-    f.unlink()
-
-
-def set_chain(job_id: str, parent_id: str | None) -> None:
-    """Set or clear a job's parent_request_id (chain position)."""
-    if parent_id == job_id:
-        raise ValueError("A job cannot be its own parent")
-    _, f = find_job(job_id)
-    data = json.loads(f.read_text())
-    data["parent_request_id"] = parent_id or None
-    f.write_text(json.dumps(data, indent=2))
-
-
-def set_job_status(job_id: str, new_status: str) -> None:
-    """Manually move a job to any state, appending a manual transition to state_history."""
-    if new_status not in STATES:
-        raise ValueError(f"Invalid status: {new_status}")
-    job, f = find_job(job_id)
-    if job["_state"] == new_status:
-        return
-    data = json.loads(f.read_text())
-    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    data.setdefault("state_history", []).append({"state": new_status, "at": now, "manual": True})
-    if new_status == "pending":
-        data["summary"] = None  # clear summary on retry
-    (QUEUE_DIR / new_status / f.name).write_text(json.dumps(data, indent=2))
-    f.unlink()
-
-
-def reject_job(job_id: str) -> None:
-    """Remove worktree and delete branch without merging."""
-    job, _ = find_job(job_id, states=["done", "failed"])
-    target  = job["target_repo"]
-    branch  = f"agentic/{job_id}"
-    wt      = WORKTREES_DIR / job_id
-
-    if wt.exists():
-        subprocess.run(
-            ["git", "-C", target, "worktree", "remove", str(wt), "--force"],
-            capture_output=True,
-        )
-    subprocess.run(
-        ["git", "-C", target, "branch", "-D", branch],
-        capture_output=True,
-    )
-
-
-def get_diff(job_id: str) -> str:
-    wt = WORKTREES_DIR / job_id
-    if not wt.exists():
-        raise ValueError(f"Worktree not found for job {job_id}")
-    r = subprocess.run(
-        ["git", "-C", str(wt), "diff", "HEAD~1"],
-        capture_output=True, text=True,
-    )
-    return r.stdout
-
-
-def get_agent_activity(job_id: str) -> dict:
-    """Parse agent JSONL log into rich activity data."""
-    log_file = WORKTREES_DIR / job_id / ".agent_log.jsonl"
-    if not log_file.exists():
-        return {"available": False}
-
-    files_read: set[str] = set()
-    files_modified: set[str] = set()
-    tool_calls: list[dict] = []
-    assistant_parts: list[str] = []
-    pending: dict[str, dict] = {}
-    input_tokens = output_tokens = 0
-
-    try:
-        lines = log_file.read_text(errors="replace").splitlines()
-    except Exception:
-        return {"available": True, "error": "Could not read log"}
-
-    for raw in lines:
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            ev = json.loads(raw)
-        except Exception:
-            continue
-
-        t = ev.get("type", "")
-
-        if t == "assistant":
-            for block in ev.get("message", {}).get("content", []):
-                if block.get("type") == "text":
-                    txt = block.get("text", "").strip()
-                    if txt:
-                        assistant_parts.append(txt)
-                elif block.get("type") == "tool_use":
-                    pending[block.get("id", "")] = block
-
-        elif t == "tool_use":
-            pending[ev.get("id", "")] = ev
-            name = ev.get("name", "")
-            inp  = ev.get("input", {})
-            path = inp.get("file_path") or inp.get("path", "")
-            if name == "Read" and path:
-                files_read.add(str(path))
-            elif name in ("Edit", "Write") and path:
-                files_modified.add(str(path))
-
-        elif t == "tool_result":
-            uid = ev.get("tool_use_id", "")
-            tu  = pending.pop(uid, None)
-            if tu:
-                name = tu.get("name", "")
-                inp  = tu.get("input", {})
-                is_error = ev.get("is_error", False)
-                content  = ev.get("content", "")
-                if isinstance(content, list):
-                    content = "\n".join(
-                        c.get("text", "") for c in content if isinstance(c, dict)
-                    )
-                tool_calls.append({
-                    "name":    name,
-                    "input":   inp,
-                    "output":  str(content)[:1000],
-                    "success": not is_error,
-                })
-
-        elif t == "result":
-            usage = ev.get("usage", {})
-            input_tokens  += usage.get("input_tokens", 0)
-            output_tokens += usage.get("output_tokens", 0)
-
-    # Detect key command outcomes
-    build_result = lint_result = None
-    for tc in tool_calls:
-        if tc["name"] != "Bash":
-            continue
-        cmd = (tc["input"].get("command") or "").strip()
-        if any(x in cmd for x in ("npm run build", "vite build", "tsc")):
-            build_result = "passed" if tc["success"] else "failed"
-        elif any(x in cmd for x in ("npm run lint", "eslint", "prettier")):
-            lint_result = "passed" if tc["success"] else "failed"
-
-    return {
-        "available":      True,
-        "files_modified": sorted(files_modified),
-        "files_read":     sorted(files_read - files_modified),
-        "tool_calls":     tool_calls,
-        "assistant_text": "\n\n".join(assistant_parts),
-        "build_result":   build_result,
-        "lint_result":    lint_result,
-        "input_tokens":   input_tokens,
-        "output_tokens":  output_tokens,
-        "total_tokens":   input_tokens + output_tokens,
-    }
-
-
-def read_jobs() -> list:
-    jobs = []
-    for state in STATES:
-        d = QUEUE_DIR / state
-        if not d.is_dir():
-            continue
-        for f in d.glob("*.json"):
-            try:
-                data = json.loads(f.read_text())
-                data["_state"] = state
-                jobs.append(data)
-            except Exception:
-                pass
-    jobs.sort(key=lambda j: j.get("submitted_at", ""), reverse=True)
-    return jobs
-
-
-FALLBACK_MODELS = [
-    "auto",
-    "claude-opus-4-7",
-    "claude-opus-4-5",
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-5",
-    "claude-haiku-4-5-20251001",
-]
-
-_models_cache: list[str] | None = None
-
-def fetch_models() -> list[str]:
-    """Return available Anthropic models, fetched live or from cache. Falls back to static list."""
-    global _models_cache
-    if _models_cache is not None:
-        return _models_cache
-
-    api_key  = os.environ.get("ANTHROPIC_API_KEY", "")
-    base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
-
-    if not api_key or not base_url.startswith("https://api.anthropic.com"):
-        _models_cache = FALLBACK_MODELS
-        return _models_cache
-
-    try:
-        req = urllib.request.Request(
-            f"{base_url}/v1/models",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-        ids = ["auto"] + sorted(
-            [m["id"] for m in data.get("data", []) if "claude" in m.get("id", "")],
-            reverse=True,
-        )
-        _models_cache = ids if ids else FALLBACK_MODELS
-    except Exception:
-        _models_cache = FALLBACK_MODELS
-
-    return _models_cache
-
-
-def get_job_detail(job_id: str) -> dict:
-    """Return full job data plus a 'session' key with parsed session artifacts."""
-    data, _ = find_job(job_id)  # raises ValueError if not found
-
-    session_dir = AGENTIC_HOME / "worktrees" / job_id / ".claude" / "sessions" / f"queued_{job_id}"
-    if not session_dir.exists():
-        data["session"] = None
-        return data
-
-    session: dict = {}
-
-    # tasks.json
-    tasks_file = session_dir / "tasks.json"
-    if tasks_file.exists():
-        try:
-            session["tasks"] = json.loads(tasks_file.read_text())
-        except Exception:
-            session["tasks"] = None
-    else:
-        session["tasks"] = None
-
-    # outputs/task_*.txt (exclude _raw.txt and _usage.json)
-    outputs: dict = {}
-    outputs_dir = session_dir / "outputs"
-    if outputs_dir.exists():
-        for f in sorted(outputs_dir.glob("task_*.txt")):
-            if f.name.endswith("_raw.txt"):
-                continue
-            stem = f.stem  # e.g. "task_001"
-            outputs[stem] = f.read_text()
-    session["outputs"] = outputs
-
-    # usage: *_usage.json from session root and outputs/
-    usage: dict = {}
-    for f in sorted(session_dir.glob("*_usage.json")):
-        usage[f.stem] = json.loads(f.read_text())
-    if outputs_dir.exists():
-        for f in sorted(outputs_dir.glob("*_usage.json")):
-            usage[f.stem] = json.loads(f.read_text())
-    session["usage"] = usage
-
-    # optional text files
-    for key, filename in (
-        ("validation_issues",   "validation_issues.txt"),
-        ("validation_warnings", "validation_warnings.txt"),
-        ("review",              "review.txt"),
-    ):
-        p = session_dir / filename
-        session[key] = p.read_text() if p.exists() else None
-
-    data["session"] = session
-    return data
+from typing import Any
+
+from job_queue import (
+    AGENTIC_HOME, STATES,
+    queue_init, submit_job, find_job, read_jobs,
+    cancel_job, accept_job, accept_chain, abandon_job,
+    set_chain, set_job_status, reject_job, delete_job, review_job, submit_review_job,
+    get_diff, get_agent_activity, fetch_models, get_ollama_models,
+    get_job_chain, get_job_detail, get_job_full, get_repos,
+)
 
 # ── Worker state (global, guarded by _worker_lock) ────────────────────────────
 
 _worker_lock    = threading.Lock()
 _worker_running = False
-_worker_proc: "subprocess.Popen | None" = None
+_worker_proc: "subprocess.Popen[str] | None" = None
 
 # ── HTML template ──────────────────────────────────────────────────────────────
 
@@ -547,6 +94,8 @@ input[type=text] { flex: 1; min-width: 200px; }
 .btn-green  { background: #238636; color: #fff; }
 .btn-blue   { background: #1f4391; color: #88b4ff; border: 1px solid #1f4391; }
 .btn-red    { background: #3d1515; color: #f47067; border: 1px solid #6d2120; }
+.btn-amber  { background: #3a1f00; color: #e8943a; border: 1px solid #7a4010; }
+.btn-amber:hover { border-color: #e8943a; }
 .btn-ghost  { background: transparent; color: #8b949e; border: 1px solid #30363d; }
 .btn-ghost:hover { border-color: #8b949e; color: #e6edf3; }
 
@@ -575,10 +124,13 @@ input[type=text] { flex: 1; min-width: 200px; }
 .dot-failed    { background: #f85149; }
 .dot-abandoned { background: #d29922; }
 .dot-cancelled { background: #6e7681; }
+.dot-merged    { background: #8957e5; }
 .job-body { flex: 1; min-width: 0; cursor: pointer; }
-.job-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 4px; }
-.job-id { font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; color: #8b949e; }
-a.job-id { color: #8b949e; text-decoration: none; }
+.job-top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 2px; }
+.job-name { font-size: 13px; font-weight: 600; color: #e6edf3; }
+.job-id-sub { margin-bottom: 4px; }
+.job-id { font-family: "SFMono-Regular", Consolas, monospace; font-size: 11px; color: #6e7681; }
+a.job-id { color: #6e7681; text-decoration: none; }
 a.job-id:hover { color: #388bfd; text-decoration: underline; }
 .state-badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 12px; border: 1px solid transparent; }
 .badge-pending   { color: #388bfd; border-color: #1f4391; background: #0d1f42; }
@@ -587,6 +139,7 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
 .badge-failed    { color: #f85149; border-color: #6d2120; background: #2c0b0b; }
 .badge-abandoned { color: #d29922; border-color: #5a3e1b; background: #2a1f00; }
 .badge-cancelled { color: #6e7681; border-color: #30363d; background: #161b22; }
+.badge-merged    { color: #8957e5; border-color: #3d2364; background: #1a0e2e; }
 .job-request { font-size: 13px; color: #e6edf3; margin-bottom: 6px; word-break: break-word; }
 .job-meta { font-size: 12px; color: #8b949e; display: flex; flex-wrap: wrap; gap: 10px; }
 .job-summary { font-size: 12px; color: #3fb950; margin-top: 4px; font-family: "SFMono-Regular", Consolas, monospace; }
@@ -598,6 +151,8 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
 /* Chain connectors */
 .chain-child { margin-left: 24px; position: relative; }
 .chain-child::before { content: ''; position: absolute; left: -16px; top: 0; bottom: 50%; border-left: 2px solid #30363d; border-bottom: 2px solid #30363d; width: 14px; border-radius: 0 0 0 4px; }
+.chain-review > .job-card { border-left: 3px solid #388bfd; }
+.badge-review-type { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px; color: #79c0ff; border: 1px solid #1f4391; background: #0d1f42; margin-left: 6px; vertical-align: middle; }
 
 /* Status popover menu */
 .status-menu { position: relative; display: inline-block; }
@@ -608,15 +163,19 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
 .status-dropdown button { display: block; width: 100%; text-align: left; padding: 8px 12px; background: none; border: none; color: #e6edf3; cursor: pointer; font-size: 13px; }
 .status-dropdown button:hover { background: #21262d; }
 .status-dropdown .divider { border-top: 1px solid #21262d; margin: 4px 0; }
+.status-dropdown button.menu-danger { color: #f85149; }
+.status-dropdown button.menu-danger:hover { background: #2d1a1a; }
 
 /* Log panel — slides up from bottom */
 #log-panel {
-  position: fixed; bottom: 0; left: 0; right: 0; height: 300px;
+  position: fixed; bottom: 0; left: 0; right: 0; height: var(--log-h, 300px);
   background: #0d1117; border-top: 2px solid #30363d;
   transform: translateY(100%); transition: transform .25s ease;
   z-index: 200; display: flex; flex-direction: column;
 }
 #log-panel.open { transform: translateY(0); }
+#log-resize { height: 6px; cursor: ns-resize; background: #30363d; flex-shrink: 0; }
+#log-resize:hover { background: #484f58; }
 #log-header {
   display: flex; align-items: center; gap: 8px;
   padding: 8px 16px; border-bottom: 1px solid #21262d; flex-shrink: 0;
@@ -624,6 +183,8 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
 #log-header span { font-size: 13px; font-weight: 600; }
 #log-close { margin-left: auto; background: none; border: none; color: #8b949e; cursor: pointer; font-size: 18px; line-height: 1; padding: 0 4px; }
 #log-close:hover { color: #e6edf3; }
+#log-collapse { background: none; border: none; color: #8b949e; cursor: pointer; font-size: 14px; line-height: 1; padding: 0 4px; }
+#log-collapse:hover { color: #e6edf3; }
 #log-body {
   flex: 1; overflow-y: auto; padding: 12px 16px;
   font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; line-height: 1.6;
@@ -641,7 +202,7 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
 #diff-modal.open { display: flex; }
 #diff-box {
   background: #161b22; border: 1px solid #30363d; border-radius: 10px;
-  width: 100%; max-width: 860px; display: flex; flex-direction: column;
+  width: 100%; max-width: 1200px; display: flex; flex-direction: column;
   max-height: calc(100vh - 80px);
 }
 #diff-box-header {
@@ -659,6 +220,31 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
 .diff-remove { color: #f85149; background: #2c0b0b; display: block; }
 .diff-hunk   { color: #388bfd; display: block; }
 .diff-meta   { color: #8b949e; display: block; }
+.sd-table { width: 100%; border-collapse: collapse; font-family: "SFMono-Regular", Consolas, monospace; font-size: 11px; line-height: 1.45; }
+.sd-hunk-row td { background: #1c2d3a; color: #388bfd; padding: 2px 8px; font-size: 11px; }
+.sd-ln { width: 44px; min-width: 44px; padding: 1px 8px; text-align: right; color: #6e7681; user-select: none; border-right: 1px solid #21262d; white-space: nowrap; vertical-align: top; }
+.sd-cell { padding: 1px 8px; white-space: pre; overflow: hidden; width: 50%; vertical-align: top; }
+.sd-div { width: 1px; min-width: 1px; background: #30363d; padding: 0; }
+.sd-a { background: #0a2614; }
+.sd-d { background: #2c0b0b; }
+.sd-e { background: #0d1117; }
+.sd-ln[data-line] { cursor: pointer; }
+.sd-ln[data-line]:hover { background: #1c2d3a; color: #e6edf3; }
+.sd-ln.ln-anchor { background: #1c2d3a; color: #388bfd; }
+#review-panel { border-top: 1px solid #30363d; flex-shrink: 0; max-height: 320px; overflow-y: auto; }
+#review-composer { padding: 10px 14px; display: none; border-bottom: 1px solid #21262d; }
+#review-composer-label { font-size: 11px; color: #8b949e; margin-bottom: 6px; font-family: monospace; }
+#review-textarea { width: 100%; box-sizing: border-box; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; padding: 8px; font-family: inherit; font-size: 12px; resize: vertical; }
+#review-textarea:focus { outline: none; border-color: #388bfd; }
+.review-actions { display: flex; gap: 6px; justify-content: flex-end; margin-top: 6px; }
+.review-comment { display: flex; align-items: flex-start; gap: 8px; padding: 7px 14px; border-bottom: 1px solid #21262d; font-size: 12px; }
+.review-comment-loc { font-family: monospace; font-size: 11px; color: #8b949e; flex-shrink: 0; padding-top: 1px; }
+.review-comment-text { color: #e6edf3; flex: 1; white-space: pre-wrap; word-break: break-word; }
+.review-comment-del { background: none; border: none; color: #6e7681; cursor: pointer; font-size: 16px; padding: 0; flex-shrink: 0; line-height: 1; }
+.review-comment-del:hover { color: #f85149; }
+#review-submit-row { padding: 8px 14px; display: none; align-items: center; gap: 10px; justify-content: flex-end; border-top: 1px solid #21262d; }
+#review-count { font-size: 12px; color: #8b949e; }
+.sd-ln.ln-commented { background: #0d1f38 !important; border-left: 3px solid #388bfd !important; padding-left: 5px; color: #58a6ff !important; }
 
 /* Chain editor modal */
 #chain-modal {
@@ -742,7 +328,7 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
 <header>
   <div class="dot pulse"></div>
   <h1>agentic</h1>
-  <span style="font-size:12px;color:#6e7681;font-family:monospace">__DEFAULT_REPO__</span>
+  __LOCAL_BADGE__
   <button id="run-btn" onclick="runWorker(false)">▶ Run Worker</button>
   <button id="run-all-btn" onclick="runWorker(true)" style="background:#1f4391;color:#88b4ff;padding:6px 14px;border-radius:6px;border:none;cursor:pointer;font-size:13px;font-weight:500;margin-left:4px;">▶▶ Run All</button>
   <button id="stop-btn" onclick="stopWorker()" style="display:none;background:#6d2120;color:#f47067;padding:6px 14px;border-radius:6px;border:1px solid #6d2120;cursor:pointer;font-size:13px;font-weight:500;margin-left:4px;">■ Stop</button>
@@ -752,7 +338,9 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
 <div class="container">
   <div class="card">
     <h2>Submit Job</h2>
-    <div style="font-size:12px;color:#6e7681;margin-bottom:8px;font-family:monospace">📁 __DEFAULT_REPO__</div>
+    <select id="repo-select" style="width:100%;margin-bottom:8px;font-family:monospace;font-size:12px" onchange="onRepoChange(this.value)">
+      <option value="__DEFAULT_REPO_HTML__">__DEFAULT_REPO_HTML__</option>
+    </select>
     <textarea id="req" placeholder="Describe the change you want…" rows="3"></textarea>
     <div class="form-row">
       <select id="priority">
@@ -760,13 +348,15 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
         <option value="1">Priority 1 — high</option>
         <option value="5">Priority 5 — urgent</option>
       </select>
-      <select id="model"><option value="auto">auto</option></select>
+      __MODEL_FIELD__
       <button class="btn btn-green" onclick="submitJob()">Submit</button>
     </div>
     <div class="form-row" style="margin-top:6px">
-      <input type="text" id="after" placeholder="Chain after job ID (optional — leave blank for independent)" style="font-family:monospace;font-size:12px">
+      <select id="after" style="flex:1">
+        <option value="">— no chain (independent job) —</option>
+      </select>
     </div>
-    <div style="font-size:11px;color:#6e7681;margin-top:4px">Cmd+Enter / Ctrl+Enter to submit · Fill <em>Chain after</em> to base this job on a previous job's branch</div>
+    <div style="font-size:11px;color:#6e7681;margin-top:4px">Cmd+Enter / Ctrl+Enter to submit · Pick a job above to chain this one after it</div>
   </div>
 
   <div class="filters">
@@ -774,11 +364,13 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
     <button class="filter-btn"        data-state="pending"   onclick="setFilter('pending',this)">Pending   <span id="cnt-pending"   class="badge">0</span></button>
     <button class="filter-btn"        data-state="running"   onclick="setFilter('running',this)">Running   <span id="cnt-running"   class="badge">0</span></button>
     <button class="filter-btn"        data-state="done"      onclick="setFilter('done',this)">Done      <span id="cnt-done"      class="badge">0</span></button>
+    <button class="filter-btn"        data-state="merged"    onclick="setFilter('merged',this)">Merged    <span id="cnt-merged"    class="badge">0</span></button>
     <button class="filter-btn"        data-state="failed"    onclick="setFilter('failed',this)">Failed    <span id="cnt-failed"    class="badge">0</span></button>
     <button class="filter-btn"        data-state="abandoned" onclick="setFilter('abandoned',this)">Abandoned <span id="cnt-abandoned" class="badge">0</span></button>
     <button class="filter-btn"        data-state="cancelled" onclick="setFilter('cancelled',this)">Cancelled <span id="cnt-cancelled" class="badge">0</span></button>
   </div>
 
+  <input type="text" id="job-search" placeholder="Search jobs…" style="width:100%;margin-bottom:12px" oninput="searchQuery=this.value.trim().toLowerCase();renderJobs()">
   <div id="job-list"></div>
 </div>
 
@@ -795,9 +387,11 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
 
 <!-- Log panel -->
 <div id="log-panel">
+  <div id="log-resize"></div>
   <div id="log-header">
     <div class="dot pulse" id="log-dot" style="background:#f0883e"></div>
     <span id="log-title">Worker output</span>
+    <button id="log-collapse" title="Collapse">⌄</button>
     <button id="log-close" onclick="closeLog()">×</button>
   </div>
   <div id="log-body"></div>
@@ -830,6 +424,21 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
       <button id="diff-close" onclick="closeDiff()">×</button>
     </div>
     <div id="diff-content"></div>
+    <div id="review-panel">
+      <div id="review-comments-list"></div>
+      <div id="review-composer">
+        <div id="review-composer-label"></div>
+        <textarea id="review-textarea" placeholder="Leave a comment…" rows="3"></textarea>
+        <div class="review-actions">
+          <button class="btn btn-ghost btn-sm" onclick="cancelReviewComment()">Cancel</button>
+          <button class="btn btn-primary btn-sm" onclick="saveReviewComment()">Save comment</button>
+        </div>
+      </div>
+      <div id="review-submit-row">
+        <span id="review-count"></span>
+        <button class="btn btn-primary" onclick="submitReview()">Submit Review</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -837,8 +446,11 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
 
 <script>
 let currentFilter = 'all';
+let searchQuery = '';
 let allJobs = [];
 let lastFetch = null;
+let selectedRepo = __DEFAULT_REPO_JS__;
+const IS_LOCAL = __IS_LOCAL__;
 
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
@@ -869,24 +481,37 @@ function buildJobCard(j) {
     actions.push(`<button class="btn btn-ghost" onclick="${sp}cancelJob('${escHtml(j.id)}')">Cancel</button>`);
   if (s === 'running')
     actions.push(`<button class="btn btn-red" onclick="${sp}abandonJob('${escHtml(j.id)}')">Abandon</button>`);
-  if (s === 'done' || s === 'failed')
+  const isReviewJob = j.job_type === 'review';
+  if (s === 'done') {
+    const _rd = _loadDraft(j.id);
+    const _rcount = _rd ? (_rd.comments || []).length : 0;
+    const _rlabel = _rcount ? `Review (${_rcount})` : 'Review';
+    const _rcls   = (_rcount && !(_rd && _rd.submitted)) ? 'btn btn-amber' : 'btn btn-ghost';
+    actions.push(`<button class="${_rcls}" onclick="${sp}viewDiff('${escHtml(j.id)}')">${_rlabel}</button>`);
+  }
+  if (s === 'failed' || s === 'merged')
     actions.push(`<button class="btn btn-ghost" onclick="${sp}viewDiff('${escHtml(j.id)}')">View Diff</button>`);
   if (s === 'done') {
-    const hasDoneChild = allJobs.some(x => x.parent_request_id === j.id && x._state === 'done');
-    if (hasDoneChild)
+    // Accept Chain only makes sense when there are manual chain children (non-review)
+    const hasChainChild = allJobs.some(x => x.parent_request_id === j.id && x._state === 'done' && x.job_type !== 'review');
+    if (hasChainChild)
       actions.push(`<button class="btn btn-blue" onclick="${sp}acceptChain('${escHtml(j.id)}')">Accept Chain ↓</button>`);
+    actions.push(`<button class="btn btn-ghost" onclick="${sp}reviewJob('${escHtml(j.id)}')">Review in IDE</button>`);
     actions.push(`<button class="btn btn-blue" style="opacity:.7" onclick="${sp}acceptJob('${escHtml(j.id)}')">Accept</button>`);
   }
   if (s === 'done' || s === 'failed')
     actions.push(`<button class="btn btn-red" onclick="${sp}rejectJob('${escHtml(j.id)}')">Reject</button>`);
 
   // Status + chain menu — always present
-  const allStatuses = ['pending','running','done','failed','abandoned','cancelled'];
+  const allStatuses = ['pending','running','done','merged','failed','abandoned','cancelled'];
   const statusItems = allStatuses.filter(x => x !== s).map(st =>
     `<button onclick="event.stopPropagation();setStatus('${escHtml(j.id)}','${st}')">→ ${st}</button>`
   ).join('');
   const chainLabel = j.parent_request_id ? '🔗 Edit chain…' : '🔗 Set chain…';
-  const menuItems = `<button onclick="event.stopPropagation();openChain('${escHtml(j.id)}')">${chainLabel}</button><div class="divider"></div>${statusItems}`;
+  const deleteItem = s !== 'running'
+    ? `<div class="divider"></div><button class="menu-danger" onclick="event.stopPropagation();deleteJob('${escHtml(j.id)}')">🗑 Delete…</button>`
+    : '';
+  const menuItems = `<button onclick="event.stopPropagation();openChain('${escHtml(j.id)}')">${chainLabel}</button><div class="divider"></div>${statusItems}${deleteItem}`;
   actions.push(`<div class="status-menu">
     <button class="status-menu-btn" onclick="event.stopPropagation();toggleMenu(this)">⋯</button>
     <div class="status-dropdown">${menuItems}</div>
@@ -897,14 +522,15 @@ function buildJobCard(j) {
   <div class="state-dot dot-${escHtml(s)}"></div>
   <div class="job-body" onclick="openDrawer('${escHtml(j.id)}')">
     <div class="job-top">
-      <a class="job-id" href="/job/${escHtml(j.id)}">${escHtml(j.id)}</a>
+      <span class="job-name">${escHtml(j.name || j.id)}</span>${isReviewJob ? '<span class="badge-review-type">review</span>' : ''}
       <span class="state-badge badge-${escHtml(s)}">${escHtml(s)}</span>
     </div>
+    <div class="job-id-sub"><a class="job-id" href="/job/${escHtml(j.id)}" onclick="event.stopPropagation()">${escHtml(j.id)}</a></div>
     <div class="job-request">${escHtml(j.request || '')}</div>
     <div class="job-meta">
       <span>⏱ ${relTime(j.submitted_at)}</span>
       <span>📁 ${escHtml(j.target_repo || '')}</span>
-      ${j.model_hint ? '<span>🤖 ' + escHtml(j.model_hint) + '</span>' : ''}
+      <span>🤖 ${escHtml(j.model_hint || 'auto')}</span>
       ${j.priority   ? '<span>⬆ p' + escHtml(String(j.priority)) + '</span>' : ''}
     </div>
     ${j.summary ? `<div class="${sumCls}">↳ ${escHtml(j.summary)}</div>` : ''}
@@ -914,8 +540,18 @@ function buildJobCard(j) {
 }
 
 function renderJobs() {
+  if (document.querySelector('.status-dropdown.open, #chain-modal.open')) return;
   const list = document.getElementById('job-list');
-  const jobs = currentFilter === 'all' ? allJobs : allJobs.filter(j => j._state === currentFilter);
+  let jobs = currentFilter === 'all' ? allJobs : allJobs.filter(j => j._state === currentFilter);
+  if (selectedRepo) jobs = jobs.filter(j => j.target_repo === selectedRepo);
+  if (searchQuery) {
+    jobs = jobs.filter(j =>
+      (j.name || '').toLowerCase().includes(searchQuery) ||
+      (j.request || '').toLowerCase().includes(searchQuery) ||
+      (j.target_repo || '').toLowerCase().includes(searchQuery) ||
+      (j.id || '').toLowerCase().includes(searchQuery)
+    );
+  }
   if (jobs.length === 0) {
     list.innerHTML = '<div class="empty"><div style="font-size:32px">📭</div><p>No jobs' +
       (currentFilter !== 'all' ? ' in <strong>' + escHtml(currentFilter) + '</strong>' : '') + '</p></div>';
@@ -936,8 +572,16 @@ function renderJobs() {
   function renderChain(job, depth) {
     const children = (childMap[job.id] || []).map(cid => jobById[cid]).filter(Boolean);
     const cardHtml = buildJobCard(job);
-    const childrenHtml = children.map(c => `<div class="chain-child">${renderChain(c, depth + 1)}</div>`).join('');
-    return cardHtml + childrenHtml;
+    // Separate review children (same-branch) from manual chain children (own branch)
+    const reviewChildren = children.filter(c => c.job_type === 'review');
+    const chainChildren  = children.filter(c => c.job_type !== 'review');
+    const reviewHtml = reviewChildren.map(c =>
+      `<div class="chain-child chain-review">${renderChain(c, depth + 1)}</div>`
+    ).join('');
+    const chainHtml = chainChildren.map(c =>
+      `<div class="chain-child">${renderChain(c, depth + 1)}</div>`
+    ).join('');
+    return cardHtml + reviewHtml + chainHtml;
   }
 
   // Identify root jobs: no parent, or parent not in current filtered list
@@ -946,9 +590,34 @@ function renderJobs() {
 }
 
 function updateCounts(jobs) {
-  const c = {all:0,pending:0,running:0,done:0,failed:0,abandoned:0,cancelled:0};
+  const c = {all:0,pending:0,running:0,done:0,merged:0,failed:0,abandoned:0,cancelled:0};
   jobs.forEach(j => { c.all++; if (c[j._state] !== undefined) c[j._state]++; });
   Object.keys(c).forEach(k => { const el = document.getElementById('cnt-'+k); if(el) el.textContent = c[k]; });
+}
+
+async function fetchRepos() {
+  try {
+    const r = await fetch('/api/repos');
+    if (!r.ok) return;
+    const repos = await r.json();
+    const sel = document.getElementById('repo-select');
+    const current = sel.value;
+    sel.innerHTML = '';
+    repos.forEach(repo => {
+      const opt = document.createElement('option');
+      opt.value = repo;
+      opt.textContent = repo;
+      if (repo === current) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    if (!sel.value && repos.length) sel.value = repos[0];
+  } catch(e) {}
+}
+
+function onRepoChange(repo) {
+  selectedRepo = repo;
+  renderJobs();
+  populateAfterDropdown();
 }
 
 async function fetchJobs() {
@@ -959,12 +628,27 @@ async function fetchJobs() {
     lastFetch = Date.now();
     updateCounts(allJobs);
     renderJobs();
+    populateAfterDropdown();
   } catch(e) {}
+}
+
+function populateAfterDropdown() {
+  const sel = document.getElementById('after');
+  const current = sel.value;
+  sel.innerHTML = '<option value="">— no chain (independent job) —</option>';
+  allJobs.filter(j => !selectedRepo || j.target_repo === selectedRepo).forEach(j => {
+    const opt = document.createElement('option');
+    opt.value = j.id;
+    const label = (j.name || j.id) + '  [' + j._state + ']  ' + (j.request || '').slice(0, 50);
+    opt.textContent = label;
+    if (j.id === current) opt.selected = true;
+    sel.appendChild(opt);
+  });
 }
 
 async function submitJob() {
   const request    = document.getElementById('req').value.trim();
-  const repo       = '__DEFAULT_REPO__';
+  const repo       = selectedRepo || __DEFAULT_REPO_JS__;
   const priority   = parseInt(document.getElementById('priority').value, 10);
   const model_hint = document.getElementById('model').value;
   const after      = document.getElementById('after').value.trim();
@@ -975,7 +659,7 @@ async function submitJob() {
       body: JSON.stringify({request, repo, priority, model_hint, after}),
     });
     const d = await r.json();
-    if (d.ok) { document.getElementById('req').value = ''; toast('Submitted ' + d.id, 'success'); fetchJobs(); }
+    if (d.ok) { document.getElementById('req').value = ''; document.getElementById('after').value = ''; toast('Submitted ' + (d.name || d.id), 'success'); fetchJobs(); }
     else toast('Error: ' + (d.error || 'unknown'), 'error');
   } catch(e) { toast('Network error', 'error'); }
 }
@@ -996,6 +680,28 @@ document.addEventListener('click', () => {
   document.querySelectorAll('.status-dropdown.open').forEach(d => d.classList.remove('open'));
 });
 
+/* ── Review ── */
+let reviewJobId = null;
+let anchorLine = null;     // {file, line, side}
+let reviewComments = [];
+let reviewSubmitted = false;
+
+function _loadDraft(jobId) {
+  try {
+    const raw = localStorage.getItem('agentic_review_' + jobId);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+function _saveDraft(jobId, comments, submitted) {
+  try {
+    if (comments.length || submitted) {
+      localStorage.setItem('agentic_review_' + jobId, JSON.stringify({ comments, submitted: !!submitted }));
+    } else {
+      localStorage.removeItem('agentic_review_' + jobId);
+    }
+  } catch {}
+}
+
 /* ── Chain editor ── */
 let _chainJobId = null;
 
@@ -1003,8 +709,10 @@ function openChain(id) {
   _chainJobId = id;
   const job = allJobs.find(j => j.id === id);
   const current = job && job.parent_request_id;
+  const currentJob = current && allJobs.find(j => j.id === current);
+  const currentLabel = currentJob ? (currentJob.name || current) : 'none (independent)';
   document.getElementById('chain-current-label').innerHTML =
-    'Current parent: <span>' + (current ? escHtml(current) : 'none (independent)') + '</span>';
+    'Current parent: <span>' + escHtml(currentLabel) + '</span>';
 
   // Populate dropdown — all jobs except this one and its own descendants
   const sel = document.getElementById('chain-select');
@@ -1012,7 +720,7 @@ function openChain(id) {
   allJobs.filter(j => j.id !== id).forEach(j => {
     const opt = document.createElement('option');
     opt.value = j.id;
-    opt.textContent = j.id + '  [' + j._state + ']  ' + j.request.slice(0, 50);
+    opt.textContent = (j.name || j.id) + '  [' + j._state + ']  ' + (j.request || '').slice(0, 50);
     opt.selected = j.id === current;
     sel.appendChild(opt);
   });
@@ -1029,7 +737,7 @@ async function saveChain() {
   const parentId = document.getElementById('chain-select').value || null;
   const r = await fetch('/api/set-chain', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:_chainJobId, parent_id:parentId})});
   const d = await r.json();
-  if (d.ok) { toast(parentId ? 'Chained after ' + parentId : 'Removed from chain', 'success'); closeChain(); fetchJobs(); }
+  if (d.ok) { const pJob = parentId && allJobs.find(j => j.id === parentId); toast(parentId ? 'Chained after ' + (pJob && pJob.name ? pJob.name : parentId) : 'Removed from chain', 'success'); closeChain(); fetchJobs(); }
   else toast('Error: ' + (d.error || 'unknown'), 'error');
 }
 
@@ -1055,13 +763,39 @@ async function abandonJob(id) {
   else toast('Error: ' + (d.error || 'unknown'), 'error');
 }
 
+async function deleteJob(id) {
+  const job = allJobs.find(j => j.id === id);
+  const label = (job && job.name) ? job.name : id;
+  if (!confirm(`Permanently delete "${label}"?\n\nThis removes the job, its branch, worktree, diff, and log. There is no undo.`)) return;
+  const r = await fetch('/api/delete', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+  const d = await r.json();
+  if (d.ok) { toast('Deleted ' + label, 'success'); fetchJobs(); }
+  else toast('Error: ' + (d.error || 'unknown'), 'error');
+}
+
 async function acceptChain(id) {
-  const children = allJobs.filter(j => j.parent_request_id === id && j._state === 'done');
-  if (!confirm(`Accept this job and ${children.length} chained job(s) in order? (${children.length + 1} total merges)`)) return;
+  const job = allJobs.find(j => j.id === id);
+  const base = job ? (job.base_branch || 'base branch') : 'base branch';
+  // Walk the full chain (all descendants in 'done' state)
+  const doneChain = [];
+  let cur = id;
+  while (cur) {
+    const next = allJobs.find(j => j.parent_request_id === cur && j._state === 'done');
+    if (!next) break;
+    doneChain.push(next);
+    cur = next.id;
+  }
+  // Review jobs don't produce a separate merge (commits already on parent branch)
+  const mergeJobs   = doneChain.filter(j => j.job_type !== 'review').length + 1;
+  const reviewJobs  = doneChain.filter(j => j.job_type === 'review').length;
+  const reviewNote  = reviewJobs ? ` (includes ${reviewJobs} review job(s) already baked in)` : '';
+  if (!confirm(`Merge ${mergeJobs} job(s) into a new staging branch based on '${base}'${reviewNote}.\n\nThe staging branch will NOT be merged into your working branch automatically — run:\n  git merge <staging-branch>\n\nProceed?`)) return;
   const r = await fetch('/api/accept-chain', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
   const d = await r.json();
-  if (d.ok) { toast(`${d.accepted.length} job(s) merged → ${d.staging_branch}`, 'success'); fetchJobs(); }
-  else toast('Error: ' + (d.error || 'unknown'), 'error');
+  if (d.ok) {
+    toast(`${d.accepted.length} job(s) accepted → staging: ${d.staging_branch}  (run: git merge ${d.staging_branch})`, 'success');
+    fetchJobs();
+  } else toast('Error: ' + (d.error || 'unknown'), 'error');
 }
 
 async function acceptJob(id) {
@@ -1078,6 +812,13 @@ async function rejectJob(id) {
   const d = await r.json();
   if (d.ok) { toast('Rejected ' + id, 'success'); fetchJobs(); }
   else toast('Reject failed: ' + (d.error || 'unknown'), 'error');
+}
+
+async function reviewJob(id) {
+  const r = await fetch('/api/apply-to-tree', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+  const d = await r.json();
+  if (d.ok) toast((d.message || 'Changes applied — review in your IDE, then commit.'), 'success');
+  else toast('Review failed: ' + (d.error || 'unknown'), 'error');
 }
 
 /* ── Worker streaming ── */
@@ -1137,8 +878,9 @@ function runWorker(loop = false) {
         }
       });
       if (window._lastClaimedJobId && !_runAll) {
-        setTimeout(() => openDrawer(window._lastClaimedJobId), 500);
+        const _openId = window._lastClaimedJobId;
         window._lastClaimedJobId = null;
+        setTimeout(() => openDrawer(_openId), 500);
       }
       return;
     }
@@ -1169,32 +911,298 @@ function closeLog() {
   _syncDrawerWithLog(false);
 }
 
+/* ── Log panel resize & collapse ── */
+(function() {
+  const panel = document.getElementById('log-panel');
+  const handle = document.getElementById('log-resize');
+  const collapseBtn = document.getElementById('log-collapse');
+  const COLLAPSED_H = 36;
+  const STORAGE_KEY = 'agentic_log_h';
+  let _isCollapsed = false;
+
+  function getStoredH() {
+    return parseInt(localStorage.getItem(STORAGE_KEY) || '300', 10);
+  }
+  function setH(h) {
+    panel.style.setProperty('--log-h', h + 'px');
+  }
+
+  // Restore saved height
+  setH(getStoredH());
+
+  handle.addEventListener('mousedown', function(e) {
+    e.preventDefault();
+    const startY = e.clientY;
+    const startH = panel.getBoundingClientRect().height;
+    function onMove(ev) {
+      const newH = Math.max(80, startH - (ev.clientY - startY));
+      setH(newH);
+    }
+    function onUp(ev) {
+      const finalH = panel.getBoundingClientRect().height;
+      if (finalH > COLLAPSED_H + 10) {
+        localStorage.setItem(STORAGE_KEY, String(Math.round(finalH)));
+        _isCollapsed = false;
+      }
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+
+  collapseBtn.addEventListener('click', function() {
+    if (_isCollapsed) {
+      setH(getStoredH());
+      _isCollapsed = false;
+      collapseBtn.textContent = '⌄';
+    } else {
+      setH(COLLAPSED_H);
+      _isCollapsed = true;
+      collapseBtn.textContent = '⌃';
+    }
+  });
+})();
+
+/* ── Diff helpers (duplicated from detail page — both are standalone documents) ── */
+function parseSplitDiff(raw) {
+  const files = [];
+  let file = null, hunk = null;
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      if (file) files.push(file);
+      const m = line.match(/diff --git a\/(.*) b\/(.*)/);
+      file = { name: m ? m[2] : line, hunks: [] }; hunk = null;
+    } else if (file && line.startsWith('@@ ')) {
+      hunk = { header: line, lines: [] }; file.hunks.push(hunk);
+    } else if (hunk) {
+      if      (line.startsWith('+') && !line.startsWith('+++')) hunk.lines.push({ t:'a', c:line.slice(1) });
+      else if (line.startsWith('-') && !line.startsWith('---')) hunk.lines.push({ t:'d', c:line.slice(1) });
+      else if (!line.startsWith('\\') && !line.startsWith('index ') && !line.startsWith('diff ')
+            && !line.startsWith('---') && !line.startsWith('+++'))
+        hunk.lines.push({ t:'c', c:line.slice(1) });
+    }
+  }
+  if (file) files.push(file);
+  return files;
+}
+
+function buildSplitRows(hunk) {
+  const rows = [], pending = [];
+  const m = hunk.header.match(/@@ -(\d+)(?:,\d+)? \+(\d+)/);
+  let lo = m ? +m[1] : 1, ln = m ? +m[2] : 1;
+  const flush = () => { while (pending.length) rows.push({ l:{n:lo++,c:pending.shift().c,t:'d'}, r:null }); };
+  for (const line of hunk.lines) {
+    if      (line.t === 'c') { flush(); rows.push({ l:{n:lo++,c:line.c,t:'c'}, r:{n:ln++,c:line.c,t:'c'} }); }
+    else if (line.t === 'd') { pending.push(line); }
+    else { pending.length ? rows.push({ l:{n:lo++,c:pending.shift().c,t:'d'}, r:{n:ln++,c:line.c,t:'a'} })
+                          : rows.push({ l:null, r:{n:ln++,c:line.c,t:'a'} }); }
+  }
+  flush();
+  return rows;
+}
+
+/* ── Review comment UI ── */
+function initReview(id) {
+  reviewJobId = id;
+  anchorLine = null;
+  const draft = _loadDraft(id);
+  reviewComments = draft ? [...draft.comments] : [];
+  reviewSubmitted = !!(draft && draft.submitted);
+  document.getElementById('review-composer').style.display = 'none';
+  renderReviewComments();
+  const job = allJobs.find(j => j.id === id);
+  document.getElementById('review-panel').style.display =
+    (job && job._state === 'merged') ? 'none' : '';
+}
+
+function _clearAnchor() {
+  anchorLine = null;
+  document.querySelectorAll('.sd-ln.ln-anchor').forEach(el => el.classList.remove('ln-anchor'));
+}
+
+function _highlightRange(file, start, end, side) {
+  document.querySelectorAll('.sd-ln[data-side]').forEach(el => {
+    if (el.dataset.file === file && el.dataset.side === side) {
+      const ln = +el.dataset.line;
+      if (ln >= start && ln <= end) el.classList.add('ln-anchor');
+    }
+  });
+}
+
+function openComposer(file, startLine, endLine, side) {
+  const loc = startLine === endLine ? `${file}:${startLine}` : `${file}:${startLine}–${endLine}`;
+  document.getElementById('review-composer-label').textContent = loc;
+  document.getElementById('review-textarea').value = '';
+  const c = document.getElementById('review-composer');
+  c.dataset.file = file; c.dataset.start = startLine; c.dataset.end = endLine; c.dataset.side = side;
+  c.style.display = 'block';
+  document.getElementById('review-textarea').focus();
+}
+
+function saveReviewComment() {
+  const text = document.getElementById('review-textarea').value.trim();
+  if (!text) return;
+  const c = document.getElementById('review-composer');
+  reviewComments.push({ file: c.dataset.file, startLine: +c.dataset.start, endLine: +c.dataset.end, side: c.dataset.side, comment: text });
+  c.style.display = 'none';
+  _clearAnchor();
+  reviewSubmitted = false;
+  if (reviewJobId) _saveDraft(reviewJobId, reviewComments, false);
+  renderReviewComments();
+  renderCommentMarkers();
+  renderJobs();
+}
+
+function cancelReviewComment() {
+  document.getElementById('review-composer').style.display = 'none';
+  _clearAnchor();
+}
+
+function deleteReviewComment(idx) {
+  reviewComments.splice(idx, 1);
+  if (reviewJobId) _saveDraft(reviewJobId, reviewComments, false);
+  renderReviewComments();
+  renderCommentMarkers();
+  renderJobs();
+}
+
+function renderCommentMarkers() {
+  document.querySelectorAll('.sd-ln.ln-commented').forEach(el => el.classList.remove('ln-commented'));
+  for (const c of reviewComments) {
+    document.querySelectorAll('.sd-ln[data-side]').forEach(el => {
+      if (el.dataset.file === c.file && el.dataset.side === c.side) {
+        const ln = +el.dataset.line;
+        if (ln >= c.startLine && ln <= c.endLine) el.classList.add('ln-commented');
+      }
+    });
+  }
+}
+
+function renderReviewComments() {
+  const list = document.getElementById('review-comments-list');
+  const row  = document.getElementById('review-submit-row');
+  if (!reviewComments.length) { list.innerHTML = ''; row.style.display = 'none'; return; }
+  list.innerHTML = reviewComments.map((c, i) => {
+    const loc = c.startLine === c.endLine ? `${c.file}:${c.startLine}` : `${c.file}:${c.startLine}–${c.endLine}`;
+    const del = reviewSubmitted ? '' : `<button class="review-comment-del" onclick="deleteReviewComment(${i})" title="Remove">×</button>`;
+    return `<div class="review-comment">
+      <span class="review-comment-loc">${escHtml(loc)}</span>
+      <span class="review-comment-text">${escHtml(c.comment)}</span>
+      ${del}
+    </div>`;
+  }).join('');
+  if (reviewSubmitted) {
+    row.innerHTML = '<span style="color:#3fb950;font-size:12px">✓ Review submitted</span>';
+  } else {
+    const n = reviewComments.length;
+    row.innerHTML = `<span id="review-count">${n} comment${n !== 1 ? 's' : ''}</span><button class="btn btn-primary" onclick="submitReview()">Submit Review</button>`;
+  }
+  row.style.display = 'flex';
+}
+
+async function submitReview() {
+  if (!reviewComments.length || !reviewJobId) return;
+  const btn = document.querySelector('#review-submit-row button');
+  btn.disabled = true; btn.textContent = 'Submitting…';
+  try {
+    const r = await fetch('/api/review', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ job_id: reviewJobId, comments: reviewComments }),
+    });
+    const d = await r.json();
+    if (d.ok) { _saveDraft(reviewJobId, reviewComments, true); reviewSubmitted = true; renderReviewComments(); renderJobs(); toast('Review submitted — ' + (d.name || d.id), 'success'); closeDiff(); }
+    else { toast('Failed: ' + (d.error || 'unknown'), 'error'); btn.disabled = false; btn.textContent = 'Submit Review'; }
+  } catch(e) { toast('Network error', 'error'); btn.disabled = false; btn.textContent = 'Submit Review'; }
+}
+
+document.getElementById('diff-content').addEventListener('click', e => {
+  const td = e.target.closest('.sd-ln[data-line]');
+  if (!td) { _clearAnchor(); return; }
+  const file = td.dataset.file, line = +td.dataset.line, side = td.dataset.side;
+  if (!anchorLine || anchorLine.file !== file) {
+    _clearAnchor();
+    anchorLine = { file, line, side };
+    td.classList.add('ln-anchor');
+  } else {
+    const start = Math.min(anchorLine.line, line), end = Math.max(anchorLine.line, line);
+    _clearAnchor();
+    _highlightRange(file, start, end, side);
+    openComposer(file, start, end, side);
+  }
+});
+
 /* ── Diff modal ── */
 async function viewDiff(id) {
-  document.getElementById('diff-title').textContent = 'diff — ' + id;
+  const job = allJobs.find(j => j.id === id);
+  const label = (job && job.name) ? job.name : id;
+  document.getElementById('diff-title').textContent = label;
   document.getElementById('diff-content').innerHTML = '<div style="padding:16px;color:#8b949e">Loading…</div>';
   document.getElementById('diff-modal').classList.add('open');
+  initReview(id);
   try {
     const r = await fetch('/api/diff/' + encodeURIComponent(id));
     const d = await r.json();
-    if (!d.ok) { document.getElementById('diff-content').innerHTML = '<div style="padding:16px;color:#f85149">' + escHtml(d.error) + '</div>'; return; }
-    const lines = (d.diff || '').split('\n');
-    document.getElementById('diff-content').innerHTML = lines.map(l => {
-      const cls = l.startsWith('+') && !l.startsWith('+++') ? 'diff-add'
-                : l.startsWith('-') && !l.startsWith('---') ? 'diff-remove'
-                : l.startsWith('@@') ? 'diff-hunk'
-                : l.startsWith('diff ') || l.startsWith('index ') || l.startsWith('---') || l.startsWith('+++') ? 'diff-meta'
-                : '';
-      return `<span class="${cls}">${escHtml(l)}</span>`;
-    }).join('\n');
+    if (!d.ok) {
+      document.getElementById('diff-content').innerHTML = '<div style="padding:16px;color:#f85149">' + escHtml(d.error) + '</div>';
+      return;
+    }
+    const raw = d.diff || '';
+    if (!raw.trim()) {
+      document.getElementById('diff-content').innerHTML = '<div style="padding:16px;color:#6e7681">No diff available.</div>';
+      return;
+    }
+    const files = parseSplitDiff(raw);
+    if (!files.length) {
+      document.getElementById('diff-content').innerHTML = '<div style="padding:16px;color:#6e7681">No changes found.</div>';
+      return;
+    }
+    const html = files.map(fileObj => {
+      let diffHtml = '<div style="padding:8px;font-size:11px;color:#6e7681">No hunks.</div>';
+      if (fileObj.hunks.length) {
+        const tbl = fileObj.hunks.map(h => {
+          const dataRows = buildSplitRows(h).map(row => {
+            const L=row.l, R=row.r, lt=L?L.t:'e', rt=R?R.t:'e';
+            const fn = escHtml(fileObj.name);
+            const lnL = L ? ` data-file="${fn}" data-line="${L.n}" data-side="L"` : '';
+            const lnR = R ? ` data-file="${fn}" data-line="${R.n}" data-side="R"` : '';
+            return `<tr>`
+              + `<td class="sd-ln sd-${lt}"${lnL}>${L?L.n:''}</td>`
+              + `<td class="sd-cell sd-${lt}">${L?escHtml(L.c):''}</td>`
+              + `<td class="sd-div"></td>`
+              + `<td class="sd-ln sd-${rt}"${lnR}>${R?R.n:''}</td>`
+              + `<td class="sd-cell sd-${rt}">${R?escHtml(R.c):''}</td>`
+              + `</tr>`;
+          }).join('');
+          return `<tr class="sd-hunk-row"><td colspan="5">${escHtml(h.header)}</td></tr>${dataRows}`;
+        }).join('');
+        diffHtml = `<div style="overflow-x:auto"><table class="sd-table">${tbl}</table></div>`;
+      }
+      return `<details open style="border:1px solid #21262d;border-radius:6px;margin-bottom:6px;overflow:hidden">
+        <summary style="display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;padding:6px 10px;background:#161b22">
+          <span style="color:#3fb950;font-size:13px">±</span>
+          <span style="font-family:monospace;font-size:12px;color:#e6edf3">${escHtml(fileObj.name)}</span>
+        </summary>
+        ${diffHtml}
+      </details>`;
+    }).join('');
+    document.getElementById('diff-content').innerHTML = `<div style="padding:12px">${html}</div>`;
+    renderCommentMarkers();
   } catch(e) {
     document.getElementById('diff-content').innerHTML = '<div style="padding:16px;color:#f85149">Failed to load diff</div>';
   }
 }
 
 function closeDiff(e) {
-  if (!e || e.target === document.getElementById('diff-modal') || e.currentTarget === document.getElementById('diff-close'))
+  if (!e || e.target === document.getElementById('diff-modal') || e.currentTarget === document.getElementById('diff-close')) {
+    if (reviewJobId) _saveDraft(reviewJobId, reviewComments, reviewSubmitted);
     document.getElementById('diff-modal').classList.remove('open');
+    _clearAnchor();
+    reviewComments = [];
+    document.getElementById('review-composer').style.display = 'none';
+    renderReviewComments();
+    renderJobs();
+  }
 }
 
 /* ── Toast ── */
@@ -1251,16 +1259,21 @@ function _syncDrawerWithLog(open) {
   }
 }
 
-// Populate model dropdown from API
-fetch('/api/models').then(r => r.json()).then(models => {
-  const sel = document.getElementById('model');
-  sel.innerHTML = models.map(m =>
-    `<option value="${escHtml(m)}">${escHtml(m)}</option>`
-  ).join('');
-}).catch(() => {});
+// Populate model selector — dropdown in local mode, readonly label in cloud mode
+if (IS_LOCAL) {
+  fetch('/api/ollama-models').then(r => r.json()).then(models => {
+    const sel = document.getElementById('model');
+    if (!sel || sel.tagName !== 'SELECT') return;
+    sel.innerHTML = models.length
+      ? models.map(m => `<option value="${escHtml(m)}">${escHtml(m)}</option>`).join('')
+      : '<option value="">no models found</option>';
+  }).catch(() => {});
+}
 
+fetchRepos();
 fetchJobs();
 setInterval(fetchJobs, 3000);
+setInterval(fetchRepos, 30000);
 setInterval(() => {
   const el = document.getElementById('age');
   if (!lastFetch) return;
@@ -1348,6 +1361,17 @@ pre {
 details summary { cursor: pointer; color: #8b949e; font-size: 12px; margin-top: 8px; user-select: none; }
 details summary:hover { color: #388bfd; }
 details[open] summary { margin-bottom: 6px; }
+/* Split diff */
+.sd-file { margin-bottom: 10px; border: 1px solid #30363d; border-radius: 6px; overflow: hidden; }
+.sd-file-hdr { background: #161b22; color: #e6edf3; padding: 6px 12px; font-size: 12px; font-family: "SFMono-Regular", Consolas, monospace; border-bottom: 1px solid #30363d; }
+.sd-table { width: 100%; border-collapse: collapse; font-family: "SFMono-Regular", Consolas, monospace; font-size: 11px; line-height: 1.45; }
+.sd-hunk-row td { background: #1c2d3a; color: #388bfd; padding: 2px 8px; font-size: 11px; }
+.sd-ln { width: 44px; min-width: 44px; padding: 1px 8px; text-align: right; color: #6e7681; user-select: none; border-right: 1px solid #21262d; white-space: nowrap; vertical-align: top; }
+.sd-cell { padding: 1px 8px; white-space: pre; overflow: hidden; width: 50%; vertical-align: top; }
+.sd-div { width: 1px; min-width: 1px; background: #30363d; padding: 0; }
+.sd-a { background: #0a2614; }
+.sd-d { background: #2c0b0b; }
+.sd-e { background: #0d1117; }
 /* Usage table */
 table { width: 100%; border-collapse: collapse; font-size: 12px; }
 th { text-align: left; padding: 6px 8px; color: #8b949e; border-bottom: 1px solid #30363d; font-weight: 600; }
@@ -1375,6 +1399,12 @@ tr.totals-row td { border-top: 1px solid #30363d; color: #e6edf3; }
 #toast.success { border-color: #238636; }
 #toast.error   { border-color: #da3633; }
 #error-msg { text-align: center; padding: 48px 24px; color: #f85149; }
+/* Chain visualizer */
+.chain-flow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.chain-chip { display: inline-block; padding: 4px 10px; border-radius: 12px; font-family: "SFMono-Regular", Consolas, monospace; font-size: 12px; border: 1px solid #30363d; background: #161b22; color: #8b949e; cursor: pointer; text-decoration: none; }
+.chain-chip:hover { border-color: #8b949e; color: #e6edf3; }
+.chain-chip.current { border-color: #388bfd; background: #0d1f42; color: #388bfd; cursor: default; }
+.chain-arrow { color: #30363d; font-size: 14px; }
 </style>
 </head>
 <body>
@@ -1404,6 +1434,51 @@ function toast(msg, type) {
 
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function parseSplitDiff(raw) {
+  const files = [];
+  let file = null, hunk = null;
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('diff --git ')) {
+      if (file) files.push(file);
+      const m = line.match(/diff --git a\/(.*) b\/(.*)/);
+      file = { name: m ? m[2] : line, hunks: [] }; hunk = null;
+    } else if (file && line.startsWith('@@ ')) {
+      hunk = { header: line, lines: [] }; file.hunks.push(hunk);
+    } else if (hunk) {
+      if      (line.startsWith('+') && !line.startsWith('+++')) hunk.lines.push({ t:'a', c:line.slice(1) });
+      else if (line.startsWith('-') && !line.startsWith('---')) hunk.lines.push({ t:'d', c:line.slice(1) });
+      else if (!line.startsWith('\\') && !line.startsWith('index ') && !line.startsWith('diff ')
+            && !line.startsWith('---') && !line.startsWith('+++'))
+        hunk.lines.push({ t:'c', c:line.slice(1) });
+    }
+  }
+  if (file) files.push(file);
+  return files;
+}
+
+function buildSplitRows(hunk) {
+  const rows = [], pending = [];
+  const m = hunk.header.match(/@@ -(\d+)(?:,\d+)? \+(\d+)/);
+  let lo = m ? +m[1] : 1, ln = m ? +m[2] : 1;
+  const flush = () => { while (pending.length) rows.push({ l:{n:lo++,c:pending.shift().c,t:'d'}, r:null }); };
+  for (const line of hunk.lines) {
+    if      (line.t === 'c') { flush(); rows.push({ l:{n:lo++,c:line.c,t:'c'}, r:{n:ln++,c:line.c,t:'c'} }); }
+    else if (line.t === 'd') { pending.push(line); }
+    else { pending.length ? rows.push({ l:{n:lo++,c:pending.shift().c,t:'d'}, r:{n:ln++,c:line.c,t:'a'} })
+                          : rows.push({ l:null, r:{n:ln++,c:line.c,t:'a'} }); }
+  }
+  flush();
+  return rows;
+}
+
+function estimateCost(model, inputTokens, outputTokens) {
+  const r = {haiku:[0.80,4], sonnet:[3,15], opus:[15,75]};
+  const k = Object.keys(r).find(k => (model||'').toLowerCase().includes(k));
+  if (!k) return null;
+  const cost = (inputTokens * r[k][0] + outputTokens * r[k][1]) / 1e6;
+  return cost < 0.01 ? '<$0.01' : '$' + cost.toFixed(2);
 }
 
 function relTime(iso) {
@@ -1439,29 +1514,193 @@ async function abandonJob(id) {
   else toast('Error: ' + (d.error || 'unknown'), 'error');
 }
 
-function renderPage(job) {
+async function reviewJob(id) {
+  const r = await fetch('/api/apply-to-tree', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+  const d = await r.json();
+  if (d.ok) toast((d.message || 'Changes applied — review in your IDE, then commit.'), 'success');
+  else toast('Review failed: ' + (d.error || 'unknown'), 'error');
+}
+
+/* ── Diff cache — loaded once per page load for done/failed jobs ── */
+let _diffCache = null;
+
+async function loadDiff(state) {
+  if (_diffCache !== null) return _diffCache;
+  if (state !== 'done' && state !== 'failed') return '';
+  try {
+    const r = await fetch('/api/diff/' + encodeURIComponent(JOB_ID));
+    const d = await r.json();
+    _diffCache = (d.ok && d.diff) ? d.diff : '';
+  } catch(e) {
+    _diffCache = '';
+  }
+  return _diffCache;
+}
+
+function renderPage(job, activity, chain, diff) {
   const s = job._state || 'pending';
-  document.title = 'agentic — ' + job.id;
-  document.getElementById('job-id-title').textContent = job.id;
+  const displayName = job.name || job.id;
+  document.title = 'agentic — ' + displayName;
+  document.getElementById('job-id-title').textContent = displayName;
   document.getElementById('state-badge-header').innerHTML =
     `<span class="state-badge badge-${escHtml(s)}">${escHtml(s)}</span>`;
 
-  // Action buttons
   const actions = [];
   if (s === 'running')
     actions.push(`<button class="btn btn-red" onclick="abandonJob('${escHtml(job.id)}')">Abandon</button>`);
-  if (s === 'done')
+  if (s === 'done') {
+    actions.push(`<button class="btn btn-ghost" onclick="reviewJob('${escHtml(job.id)}')">Review in IDE</button>`);
     actions.push(`<button class="btn btn-blue" onclick="acceptJob('${escHtml(job.id)}')">Accept</button>`);
+  }
   if (s === 'done' || s === 'failed')
     actions.push(`<button class="btn btn-red" onclick="rejectJob('${escHtml(job.id)}')">Reject</button>`);
   document.getElementById('header-actions').innerHTML = actions.join('');
 
   let html = '';
 
-  // ── 1. Request ──
+  // ── 1. Agent Activity ──
+  if (activity && activity.available) {
+    const act = activity;
+    html += `<div class="card" id="activity-card"><h2>Agent Activity</h2>`;
+
+    // Stats row
+    html += `<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px;padding:12px;background:#010409;border-radius:6px;border:1px solid #21262d">`;
+    html += `<div style="text-align:center"><div style="font-size:20px;font-weight:600;color:#e6edf3">${(act.files_modified||[]).length}</div><div style="font-size:11px;color:#8b949e">files changed</div></div>`;
+    html += `<div style="text-align:center"><div style="font-size:20px;font-weight:600;color:#e6edf3">${(act.tool_calls||[]).length}</div><div style="font-size:11px;color:#8b949e">tool calls</div></div>`;
+    if (act.build_result) {
+      const bc = act.build_result === 'passed' ? '#3fb950' : '#f85149';
+      const bi = act.build_result === 'passed' ? '✓' : '✗';
+      html += `<div style="text-align:center"><div style="font-size:20px;font-weight:600;color:${bc}">${bi}</div><div style="font-size:11px;color:#8b949e">build</div></div>`;
+    }
+    if (act.lint_result) {
+      const lc = act.lint_result === 'passed' ? '#3fb950' : '#f85149';
+      const li = act.lint_result === 'passed' ? '✓' : '✗';
+      html += `<div style="text-align:center"><div style="font-size:20px;font-weight:600;color:${lc}">${li}</div><div style="font-size:11px;color:#8b949e">lint</div></div>`;
+    }
+    if (act.total_tokens) {
+      html += `<div style="text-align:center"><div style="font-size:20px;font-weight:600;color:#e6edf3">${(act.total_tokens/1000).toFixed(1)}k</div><div style="font-size:11px;color:#8b949e">tokens</div></div>`;
+    }
+    const estCost = estimateCost(job.model_hint || '', act.input_tokens || 0, act.output_tokens || 0);
+    if (estCost !== null) {
+      html += `<div style="text-align:center"><div style="font-size:20px;font-weight:600;color:#e6edf3">${escHtml(estCost)}</div><div style="font-size:11px;color:#8b949e">est. cost</div></div>`;
+    }
+    html += `</div>`;
+
+    // Phase summary
+    const readCount   = (act.tool_calls||[]).filter(tc => tc.name === 'Read').length;
+    const editCount   = (act.tool_calls||[]).filter(tc => tc.name === 'Edit' || tc.name === 'Write').length;
+    const buildOk     = act.build_result === 'passed' ? '✓' : act.build_result === 'failed' ? '✗' : '—';
+    const buildColor  = act.build_result === 'passed' ? '#3fb950' : act.build_result === 'failed' ? '#f85149' : '#6e7681';
+    const hasCommit   = (act.tool_calls||[]).some(tc => tc.name === 'Bash' && (tc.input.command||'').includes('git commit'));
+    const commitMark  = hasCommit ? '✓' : '—';
+    const commitColor = hasCommit ? '#3fb950' : '#6e7681';
+    html += `<div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px;padding:10px 12px;background:#010409;border-radius:6px;border:1px solid #21262d;font-size:12px">
+      <span style="color:#8b949e">📖 <strong style="color:#e6edf3">${readCount}</strong> reads</span>
+      <span style="color:#8b949e">✏️ <strong style="color:#e6edf3">${editCount}</strong> edits</span>
+      <span style="color:#8b949e">🔨 build <strong style="color:${buildColor}">${buildOk}</strong></span>
+      <span style="color:#8b949e">📦 committed <strong style="color:${commitColor}">${commitMark}</strong></span>
+    </div>`;
+
+    // Files modified (split diff per file) — diff is already loaded
+    const buildErrFiles = new Set(act.build_error_files || []);
+    if ((act.files_modified||[]).length) {
+      const byFile = {};
+      if (diff) parseSplitDiff(diff).forEach(f => { byFile[f.name] = f; });
+      const norm = p => p.replace(/^\.\//, '');
+      html += `<div style="margin-bottom:14px">
+        <div style="font-size:11px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px">Files Modified</div>`;
+      act.files_modified.forEach(f => {
+        const hasBuildErr = buildErrFiles.has(f);
+        const nf = norm(f);
+        const fileObj = byFile[nf] || byFile[f]
+          || Object.values(byFile).find(o => norm(o.name) === nf || o.name.endsWith('/'+nf) || nf.endsWith('/'+norm(o.name)));
+        let diffHtml = diff
+          ? '<div style="padding:8px;font-size:11px;color:#6e7681">Diff not available for this file.</div>'
+          : '<div style="padding:8px;font-size:11px;color:#6e7681">Diff not yet available (job still running).</div>';
+        if (fileObj && fileObj.hunks.length) {
+          const tbl = fileObj.hunks.map(h => {
+            const dataRows = buildSplitRows(h).map(row => {
+              const L=row.l, R=row.r, lt=L?L.t:'e', rt=R?R.t:'e';
+              return `<tr>`
+                + `<td class="sd-ln sd-${lt}">${L?L.n:''}</td>`
+                + `<td class="sd-cell sd-${lt}">${L?escHtml(L.c):''}</td>`
+                + `<td class="sd-div"></td>`
+                + `<td class="sd-ln sd-${rt}">${R?R.n:''}</td>`
+                + `<td class="sd-cell sd-${rt}">${R?escHtml(R.c):''}</td>`
+                + `</tr>`;
+            }).join('');
+            return `<tr class="sd-hunk-row"><td colspan="5">${escHtml(h.header)}</td></tr>${dataRows}`;
+          }).join('');
+          diffHtml = `<div style="overflow-x:auto;max-height:420px;overflow-y:auto"><table class="sd-table">${tbl}</table></div>`;
+        } else if (fileObj) {
+          diffHtml = '<div style="padding:8px;font-size:11px;color:#6e7681">No changes in this file.</div>';
+        }
+        html += `<details style="border:1px solid #21262d;border-radius:6px;margin-bottom:6px;overflow:hidden">
+          <summary style="display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;padding:6px 10px;background:#161b22">
+            <span style="color:#3fb950;font-size:13px">±</span>
+            <span style="font-family:monospace;font-size:12px;color:#e6edf3">${escHtml(f)}</span>
+            ${hasBuildErr?'<span style="color:#f85149;font-size:11px;font-weight:600" title="Build error in this file">✗ build error</span>':''}
+          </summary>
+          ${diffHtml}
+        </details>`;
+      });
+      html += `</div>`;
+    }
+
+    // Files read
+    if ((act.files_read||[]).length) {
+      html += `<div style="margin-bottom:14px">
+        <div style="font-size:11px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Files Read</div>
+        <div style="display:flex;flex-wrap:wrap;gap:6px">`;
+      act.files_read.forEach(f => {
+        html += `<span style="font-family:monospace;font-size:11px;color:#6e7681;background:#161b22;border:1px solid #30363d;border-radius:4px;padding:2px 6px">${escHtml(f)}</span>`;
+      });
+      html += `</div></div>`;
+    }
+
+    // Commands run
+    const cmds = (act.tool_calls||[]).filter(tc => tc.name === 'Bash');
+    if (cmds.length) {
+      html += `<div style="margin-bottom:14px">
+        <div style="font-size:11px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Commands Run</div>`;
+      cmds.forEach(tc => {
+        const cmd = (tc.input.command||'').trim().slice(0, 150);
+        const ok  = tc.success;
+        html += `<div style="margin-bottom:6px">
+          <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:#010409;border-radius:4px;border-left:3px solid ${ok?'#3fb950':'#f85149'}">
+            <span style="font-size:12px">${ok?'✓':'✗'}</span>
+            <code style="font-size:12px;color:#e6edf3;word-break:break-all">$ ${escHtml(cmd)}</code>
+          </div>
+          ${!ok && tc.output ? `<details style="margin-top:4px"><summary style="font-size:11px;color:#f85149;cursor:pointer;padding-left:10px">Show error output</summary><pre style="margin-top:4px;max-height:200px;overflow-y:auto;font-size:11px">${escHtml(tc.output.slice(0,2000))}</pre></details>` : ''}
+        </div>`;
+      });
+      html += `</div>`;
+    }
+
+    // Agent reasoning
+    if (act.assistant_text && act.assistant_text.trim().length > 50) {
+      html += `<details>
+        <summary style="font-size:12px;color:#8b949e;cursor:pointer;user-select:none;padding:6px 0">
+          Agent reasoning (${act.assistant_text.length.toLocaleString()} chars)
+        </summary>
+        <pre style="margin-top:8px;max-height:400px;overflow-y:auto;font-size:12px;white-space:pre-wrap">${escHtml(act.assistant_text.slice(0,8000))}</pre>
+      </details>`;
+    }
+
+    // Token detail
+    if (act.input_tokens || act.output_tokens) {
+      html += `<div style="margin-top:12px;padding-top:12px;border-top:1px solid #21262d;font-size:12px;color:#6e7681">
+        ${act.input_tokens.toLocaleString()} input + ${act.output_tokens.toLocaleString()} output = <strong style="color:#8b949e">${act.total_tokens.toLocaleString()}</strong> total tokens
+      </div>`;
+    }
+
+    html += `</div>`; // close activity card
+  }
+
+  // ── 2. Request ──
   html += `<div class="card"><h2>Request</h2><pre>${escHtml(job.request || '')}</pre></div>`;
 
-  // ── 2. State History ──
+  // ── 3. State History ──
   const hist = job.state_history || [];
   if (hist.length) {
     html += `<div class="card"><h2>State History</h2><div class="timeline">`;
@@ -1478,9 +1717,30 @@ function renderPage(job) {
     html += `</div></div>`;
   }
 
-  const sess = job.session;
+  // ── 4. Chain visualizer ──
+  if (chain && chain.ok) {
+    const hasParent = chain.parent !== null;
+    const hasChildren = (chain.children || []).length > 0;
+    if (hasParent || hasChildren) {
+      html += `<div class="card"><h2>Job Chain</h2><div class="chain-flow">`;
+      if (hasParent) {
+        const p = chain.parent;
+        html += `<a class="chain-chip" href="/job/${escHtml(p.id)}" title="${escHtml(p.request||'')}">↑ ${escHtml(p.name || p.id)}</a>`;
+        html += `<span class="chain-arrow">→</span>`;
+      }
+      html += `<span class="chain-chip current">${escHtml(job.name || job.id)}</span>`;
+      if (hasChildren) {
+        chain.children.forEach(c => {
+          html += `<span class="chain-arrow">→</span>`;
+          html += `<a class="chain-chip" href="/job/${escHtml(c.id)}" title="${escHtml(c.request||'')}">↓ ${escHtml(c.name || c.id)}</a>`;
+        });
+      }
+      html += `</div></div>`;
+    }
+  }
 
-  // ── 3. Tasks ──
+  // ── 5. Session tasks (legacy) ──
+  const sess = job.session;
   if (sess && sess.tasks && sess.tasks.tasks && sess.tasks.tasks.length) {
     html += `<div class="card"><h2>Tasks</h2>`;
     sess.tasks.tasks.forEach(task => {
@@ -1502,99 +1762,7 @@ function renderPage(job) {
     html += `</div>`;
   }
 
-  // ── 4. Agent Activity ──
-  fetch('/api/activity/' + encodeURIComponent(JOB_ID))
-    .then(r => r.json())
-    .then(act => {
-      if (!act.available) return;
-
-      let ahtml = `<div class="card" id="activity-card">
-        <h2>Agent Activity</h2>`;
-
-      // ── Stats row ──
-      ahtml += `<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px;padding:12px;background:#010409;border-radius:6px;border:1px solid #21262d">`;
-      ahtml += `<div style="text-align:center"><div style="font-size:20px;font-weight:600;color:#e6edf3">${(act.files_modified||[]).length}</div><div style="font-size:11px;color:#8b949e">files changed</div></div>`;
-      ahtml += `<div style="text-align:center"><div style="font-size:20px;font-weight:600;color:#e6edf3">${(act.tool_calls||[]).length}</div><div style="font-size:11px;color:#8b949e">tool calls</div></div>`;
-      if (act.build_result) {
-        const bc = act.build_result === 'passed' ? '#3fb950' : '#f85149';
-        const bi = act.build_result === 'passed' ? '✓' : '✗';
-        ahtml += `<div style="text-align:center"><div style="font-size:20px;font-weight:600;color:${bc}">${bi}</div><div style="font-size:11px;color:#8b949e">build</div></div>`;
-      }
-      if (act.lint_result) {
-        const lc = act.lint_result === 'passed' ? '#3fb950' : '#f85149';
-        const li = act.lint_result === 'passed' ? '✓' : '✗';
-        ahtml += `<div style="text-align:center"><div style="font-size:20px;font-weight:600;color:${lc}">${li}</div><div style="font-size:11px;color:#8b949e">lint</div></div>`;
-      }
-      if (act.total_tokens) {
-        ahtml += `<div style="text-align:center"><div style="font-size:20px;font-weight:600;color:#e6edf3">${(act.total_tokens/1000).toFixed(1)}k</div><div style="font-size:11px;color:#8b949e">tokens</div></div>`;
-      }
-      ahtml += `</div>`;
-
-      // ── Files modified ──
-      if ((act.files_modified||[]).length) {
-        ahtml += `<div style="margin-bottom:14px">
-          <div style="font-size:11px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Files Modified</div>`;
-        act.files_modified.forEach(f => {
-          ahtml += `<div style="display:flex;align-items:center;gap:8px;padding:4px 0;border-bottom:1px solid #21262d">
-            <span style="color:#3fb950;font-size:13px">✎</span>
-            <span style="font-family:monospace;font-size:12px;color:#e6edf3">${escHtml(f)}</span>
-          </div>`;
-        });
-        ahtml += `</div>`;
-      }
-
-      // ── Files read ──
-      if ((act.files_read||[]).length) {
-        ahtml += `<div style="margin-bottom:14px">
-          <div style="font-size:11px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Files Read</div>
-          <div style="display:flex;flex-wrap:wrap;gap:6px">`;
-        act.files_read.forEach(f => {
-          ahtml += `<span style="font-family:monospace;font-size:11px;color:#6e7681;background:#161b22;border:1px solid #30363d;border-radius:4px;padding:2px 6px">${escHtml(f)}</span>`;
-        });
-        ahtml += `</div></div>`;
-      }
-
-      // ── Commands ──
-      const cmds = (act.tool_calls||[]).filter(tc => tc.name === 'Bash');
-      if (cmds.length) {
-        ahtml += `<div style="margin-bottom:14px">
-          <div style="font-size:11px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:6px">Commands Run</div>`;
-        cmds.forEach(tc => {
-          const cmd = (tc.input.command||'').trim().slice(0, 150);
-          const ok  = tc.success;
-          ahtml += `<div style="margin-bottom:6px">
-            <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:#010409;border-radius:4px;border-left:3px solid ${ok?'#3fb950':'#f85149'}">
-              <span style="font-size:12px">${ok?'✓':'✗'}</span>
-              <code style="font-size:12px;color:#e6edf3;word-break:break-all">$ ${escHtml(cmd)}</code>
-            </div>
-            ${!ok && tc.output ? `<details style="margin-top:4px"><summary style="font-size:11px;color:#f85149;cursor:pointer;padding-left:10px">Show error output</summary><pre style="margin-top:4px;max-height:200px;overflow-y:auto;font-size:11px">${escHtml(tc.output.slice(0,2000))}</pre></details>` : ''}
-          </div>`;
-        });
-        ahtml += `</div>`;
-      }
-
-      // ── Agent reasoning (collapsible) ──
-      if (act.assistant_text && act.assistant_text.trim().length > 50) {
-        ahtml += `<details>
-          <summary style="font-size:12px;color:#8b949e;cursor:pointer;user-select:none;padding:6px 0">
-            Agent reasoning (${act.assistant_text.length.toLocaleString()} chars)
-          </summary>
-          <pre style="margin-top:8px;max-height:400px;overflow-y:auto;font-size:12px;white-space:pre-wrap">${escHtml(act.assistant_text.slice(0,8000))}</pre>
-        </details>`;
-      }
-
-      // ── Token detail ──
-      if (act.input_tokens || act.output_tokens) {
-        ahtml += `<div style="margin-top:12px;padding-top:12px;border-top:1px solid #21262d;font-size:12px;color:#6e7681">
-          ${act.input_tokens.toLocaleString()} input + ${act.output_tokens.toLocaleString()} output = <strong style="color:#8b949e">${act.total_tokens.toLocaleString()}</strong> total tokens
-        </div>`;
-      }
-
-      ahtml += `</div>`;
-      document.getElementById('main-content').insertAdjacentHTML('afterbegin', ahtml);
-    }).catch(() => {});
-
-  // ── 5. Token Usage (legacy pipeline sessions) ──
+  // ── 6. Token Usage (legacy) ──
   if (sess && sess.usage && Object.keys(sess.usage).length) {
     html += `<div class="card"><h2>Token Usage</h2>
       <table>
@@ -1631,42 +1799,72 @@ function renderPage(job) {
       </table></div>`;
   }
 
-  // ── 5. Validation ──
+  // ── 7. Validation ──
   if (sess && (sess.validation_issues || sess.validation_warnings)) {
     html += `<div class="card"><h2>Validation</h2>`;
-    if (sess.validation_issues) {
+    if (sess.validation_issues)
       html += `<div class="validation-issues"><div class="validation-label">Issues</div><pre>${escHtml(sess.validation_issues)}</pre></div>`;
-    }
-    if (sess.validation_warnings) {
+    if (sess.validation_warnings)
       html += `<div class="validation-warnings"><div class="validation-label">Warnings</div><pre>${escHtml(sess.validation_warnings)}</pre></div>`;
-    }
     html += `</div>`;
   }
 
-  // ── 6. AI Review ──
+  // ── 8. AI Review ──
   if (sess && sess.review) {
     html += `<div class="card"><h2>AI Review</h2><pre>${escHtml(sess.review)}</pre></div>`;
   }
 
   document.getElementById('main-content').innerHTML = html;
+  scheduleRefresh(s);
+}
+
+function saveUIState() {
+  const container = document.getElementById('main-content');
+  const openDetails = Array.from(container.querySelectorAll('details[open]'))
+    .map(el => el.dataset.key || el.querySelector('summary')?.textContent?.trim() || '');
+  return { openDetails, scrollTop: container.scrollTop };
+}
+
+function restoreUIState(state) {
+  if (!state) return;
+  const container = document.getElementById('main-content');
+  container.scrollTop = state.scrollTop;
+  container.querySelectorAll('details').forEach(el => {
+    const key = el.dataset.key || el.querySelector('summary')?.textContent?.trim() || '';
+    if (state.openDetails.includes(key)) el.open = true;
+  });
 }
 
 async function loadJob() {
+  const uiState = saveUIState();
   try {
-    const r = await fetch('/api/job/' + encodeURIComponent(JOB_ID));
+    const r = await fetch('/api/job-full/' + encodeURIComponent(JOB_ID));
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
       document.getElementById('main-content').innerHTML =
         `<div id="error-msg">Job not found: ${escHtml(d.error || r.status)}</div>`;
       return;
     }
-    const job = await r.json();
-    renderPage(job);
+    const data = await r.json();
+    const diff = await loadDiff(data.job._state);
+    renderPage(data.job, data.activity, data.chain, diff);
+    restoreUIState(uiState);
   } catch(e) {
     document.getElementById('main-content').innerHTML =
       `<div id="error-msg">Failed to load job: ${escHtml(String(e))}</div>`;
   }
 }
+
+let _refreshTimer = null;
+function scheduleRefresh(state) {
+  if (_refreshTimer) { clearTimeout(_refreshTimer); _refreshTimer = null; }
+  if (state === 'running') {
+    _refreshTimer = setTimeout(() => loadJob(), 5000);
+  }
+}
+window.addEventListener('beforeunload', () => {
+  if (_refreshTimer) clearTimeout(_refreshTimer);
+});
 
 loadJob();
 
@@ -1688,7 +1886,7 @@ function _notifyParent() {
 
 class Handler(http.server.BaseHTTPRequestHandler):
 
-    def log_message(self, format, *args):
+    def log_message(self, format: str, *args: object) -> None:
         pass  # suppress per-request noise
 
     def _send_json(self, data: object, status: int = 200) -> None:
@@ -1699,16 +1897,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _read_body(self) -> dict:
+    def _read_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
         return json.loads(raw) if raw else {}
 
-    def do_GET(self):
+    def do_GET(self) -> None:
         if self.path in ("/", "/index.html"):
             self._serve_dashboard()
         elif self.path == "/api/jobs":
             self._api_jobs()
+        elif self.path == "/api/repos":
+            self._send_json(get_repos(DEFAULT_REPO))
+        elif self.path == "/api/ollama-models":
+            self._send_json(get_ollama_models() if LOCAL_MODE else [])
         elif self.path == "/api/models":
             self._send_json(fetch_models())
         elif self.path == "/api/worker-stream":
@@ -1717,6 +1919,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._api_diff()
         elif self.path.startswith("/api/activity/"):
             self._api_activity()
+        elif self.path.startswith("/api/chain/"):
+            self._api_chain()
+        elif self.path.startswith("/api/job-full/"):
+            self._api_job_full()
         elif self.path.startswith("/api/job/"):
             self._api_job_detail()
         elif self.path.startswith("/job/"):
@@ -1724,7 +1930,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def do_POST(self):
+    def do_POST(self) -> None:
         if self.path == "/api/submit":
             self._api_submit()
         elif self.path == "/api/cancel":
@@ -1733,10 +1939,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._api_accept()
         elif self.path == "/api/accept-chain":
             self._api_accept_chain()
+        elif self.path == "/api/review":
+            self._api_review()
+        elif self.path == "/api/apply-to-tree":
+            self._api_apply_to_tree()
         elif self.path == "/api/stop-worker":
             self._api_stop_worker()
         elif self.path == "/api/reject":
             self._api_reject()
+        elif self.path == "/api/delete":
+            self._api_delete()
         elif self.path == "/api/abandon":
             self._api_abandon()
         elif self.path == "/api/set-status":
@@ -1748,8 +1960,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # ── GET handlers ──
 
-    def _serve_dashboard(self):
-        html = HTML_TEMPLATE.replace("__DEFAULT_REPO__", json.dumps(DEFAULT_REPO)[1:-1])
+    def _serve_dashboard(self) -> None:
+        local_badge = (
+            f'<span style="font-size:11px;background:#2a1f00;color:#d29922;'
+            f'border:1px solid #5a3e1b;border-radius:10px;padding:2px 8px;margin-left:4px">'
+            f'🏠 {LOCAL_MODEL}</span>'
+            if LOCAL_MODE else ""
+        )
+        cloud_model = os.environ.get("AGENTIC_MODEL", "auto")
+        model_field = (
+            '<select id="model"><option value="auto">loading…</option></select>'
+            if LOCAL_MODE else
+            f'<span id="model" style="font-size:12px;color:#8b949e;padding:6px 4px">'
+            f'☁ {cloud_model}</span>'
+        )
+        html = (HTML_TEMPLATE
+                .replace("__DEFAULT_REPO_HTML__", DEFAULT_REPO)
+                .replace("__DEFAULT_REPO_JS__",   json.dumps(DEFAULT_REPO))
+                .replace("__LOCAL_BADGE__",        local_badge)
+                .replace("__IS_LOCAL__",           "true" if LOCAL_MODE else "false")
+                .replace("__MODEL_FIELD__",        model_field))
         body = html.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -1757,13 +1987,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _api_jobs(self):
+    def _api_jobs(self) -> None:
         try:
             self._send_json(read_jobs())
         except Exception as exc:
             self._send_json({"error": str(exc)}, 500)
 
-    def _api_worker_stream(self):
+    def _api_worker_stream(self) -> None:
         global _worker_running, _worker_proc
         with _worker_lock:
             if _worker_running:
@@ -1795,7 +2025,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
             with _worker_lock:
                 _worker_proc = proc
-            for line in iter(proc.stdout.readline, ""):
+            for line in iter(proc.stdout.readline, "") if proc.stdout else []:
                 msg = json.dumps({"line": line.rstrip("\n")})
                 self.wfile.write(f"data: {msg}\n\n".encode())
                 self.wfile.flush()
@@ -1814,15 +2044,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         finally:
             if proc and proc.poll() is None:
                 try:
-                    import os, signal as _sig
-                    os.killpg(os.getpgid(proc.pid), _sig.SIGTERM)
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 except Exception:
                     proc.terminate()
             with _worker_lock:
                 _worker_running = False
                 _worker_proc = None
 
-    def _api_stop_worker(self):
+    def _api_stop_worker(self) -> None:
         global _worker_running, _worker_proc
         with _worker_lock:
             if not _worker_running or _worker_proc is None:
@@ -1830,22 +2059,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             proc = _worker_proc
         try:
-            import os, signal as _sig
-            os.killpg(os.getpgid(proc.pid), _sig.SIGTERM)
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             self._send_json({"ok": True})
         except ProcessLookupError:
             self._send_json({"ok": True})   # already dead
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)})
 
-    def _api_activity(self):
+    def _api_activity(self) -> None:
         job_id = self.path.split("/api/activity/", 1)[-1].strip("/")
         try:
             self._send_json(get_agent_activity(job_id))
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 500)
 
-    def _api_diff(self):
+    def _api_chain(self) -> None:
+        job_id = self.path.split("/api/chain/", 1)[-1].strip("/")
+        try:
+            self._send_json(get_job_chain(job_id))
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 404)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    def _api_diff(self) -> None:
         job_id = self.path.split("/api/diff/", 1)[-1].strip("/")
         try:
             diff = get_diff(job_id)
@@ -1855,7 +2092,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 500)
 
-    def _serve_job_detail(self):
+    def _serve_job_detail(self) -> None:
         job_id = self.path.split("/job/", 1)[-1].strip("/")
         html = JOB_DETAIL_HTML.replace("__JOB_ID__", job_id)
         body = html.encode()
@@ -1865,7 +2102,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _api_job_detail(self):
+    def _api_job_full(self) -> None:
+        job_id = self.path.split("/api/job-full/", 1)[-1].strip("/")
+        try:
+            self._send_json(get_job_full(job_id))
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 404)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    def _api_job_detail(self) -> None:
         job_id = self.path.split("/api/job/", 1)[-1].strip("/")
         try:
             self._send_json(get_job_detail(job_id))
@@ -1876,7 +2122,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     # ── POST handlers ──
 
-    def _api_submit(self):
+    def _api_submit(self) -> None:
         try:
             body       = self._read_body()
             request    = str(body.get("request", "")).strip()
@@ -1884,19 +2130,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             priority   = int(body.get("priority", 0))
             model_hint = str(body.get("model_hint", "auto")).strip()
             after      = str(body.get("after", "")).strip()
-            if not request: self._send_json({"ok": False, "error": "request is required"}, 400); return
-            if not repo:    self._send_json({"ok": False, "error": "repo path could not be determined"}, 400); return
-            job_id = submit_job(request, repo, priority, model_hint, after or None)
-            self._send_json({"ok": True, "id": job_id})
+            if not request:
+                self._send_json({"ok": False, "error": "request is required"}, 400)
+                return
+            if not repo:
+                self._send_json({"ok": False, "error": "repo path could not be determined"}, 400)
+                return
+            job_id, job_name = submit_job(request, repo, priority, model_hint, after or None)
+            self._send_json({"ok": True, "id": job_id, "name": job_name})
         except ValueError as exc:
             self._send_json({"ok": False, "error": str(exc)}, 400)
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 500)
 
-    def _api_cancel(self):
+    def _api_cancel(self) -> None:
         try:
             job_id = str(self._read_body().get("id", "")).strip()
-            if not job_id: self._send_json({"ok": False, "error": "id required"}, 400); return
+            if not job_id:
+                self._send_json({"ok": False, "error": "id required"}, 400)
+                return
             cancel_job(job_id)
             self._send_json({"ok": True})
         except ValueError as exc:
@@ -1904,10 +2156,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 500)
 
-    def _api_accept(self):
+    def _api_accept(self) -> None:
         try:
             job_id = str(self._read_body().get("id", "")).strip()
-            if not job_id: self._send_json({"ok": False, "error": "id required"}, 400); return
+            if not job_id:
+                self._send_json({"ok": False, "error": "id required"}, 400)
+                return
             msg = accept_job(job_id)
             self._send_json({"ok": True, "message": msg})
         except (ValueError, RuntimeError) as exc:
@@ -1915,10 +2169,43 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 500)
 
-    def _api_accept_chain(self):
+    def _api_review(self) -> None:
+        try:
+            body     = self._read_body()
+            job_id   = str(body.get("job_id", "")).strip()
+            comments = body.get("comments", [])
+            if not job_id:
+                self._send_json({"ok": False, "error": "job_id required"}, 400)
+                return
+            if not isinstance(comments, list) or not comments:
+                self._send_json({"ok": False, "error": "comments must be a non-empty list"}, 400)
+                return
+            review_id, review_name = submit_review_job(job_id, comments)
+            self._send_json({"ok": True, "id": review_id, "name": review_name})
+        except (ValueError, RuntimeError) as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 400)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    def _api_apply_to_tree(self) -> None:
         try:
             job_id = str(self._read_body().get("id", "")).strip()
-            if not job_id: self._send_json({"ok": False, "error": "id required"}, 400); return
+            if not job_id:
+                self._send_json({"ok": False, "error": "id required"}, 400)
+                return
+            msg = review_job(job_id)
+            self._send_json({"ok": True, "message": msg})
+        except (ValueError, RuntimeError) as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 400)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    def _api_accept_chain(self) -> None:
+        try:
+            job_id = str(self._read_body().get("id", "")).strip()
+            if not job_id:
+                self._send_json({"ok": False, "error": "id required"}, 400)
+                return
             result = accept_chain(job_id)
             self._send_json({"ok": True, **result})
         except (ValueError, RuntimeError) as exc:
@@ -1926,10 +2213,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 500)
 
-    def _api_reject(self):
+    def _api_reject(self) -> None:
         try:
             job_id = str(self._read_body().get("id", "")).strip()
-            if not job_id: self._send_json({"ok": False, "error": "id required"}, 400); return
+            if not job_id:
+                self._send_json({"ok": False, "error": "id required"}, 400)
+                return
             reject_job(job_id)
             self._send_json({"ok": True})
         except ValueError as exc:
@@ -1937,10 +2226,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 500)
 
-    def _api_abandon(self):
+    def _api_delete(self) -> None:
         try:
             job_id = str(self._read_body().get("id", "")).strip()
-            if not job_id: self._send_json({"ok": False, "error": "id required"}, 400); return
+            if not job_id:
+                self._send_json({"ok": False, "error": "id required"}, 400)
+                return
+            delete_job(job_id)
+            self._send_json({"ok": True})
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 404)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    def _api_abandon(self) -> None:
+        try:
+            job_id = str(self._read_body().get("id", "")).strip()
+            if not job_id:
+                self._send_json({"ok": False, "error": "id required"}, 400)
+                return
             abandon_job(job_id)
             self._send_json({"ok": True})
         except ValueError as exc:
@@ -1948,13 +2252,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 500)
 
-    def _api_set_status(self):
+    def _api_set_status(self) -> None:
         try:
             body = self._read_body()
             job_id = str(body.get("id", "")).strip()
             new_status = str(body.get("status", "")).strip()
             if not job_id or not new_status:
-                self._send_json({"ok": False, "error": "id and status required"}, 400); return
+                self._send_json({"ok": False, "error": "id and status required"}, 400)
+                return
             set_job_status(job_id, new_status)
             self._send_json({"ok": True})
         except ValueError as exc:
@@ -1962,7 +2267,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 500)
 
-    def _api_set_chain(self):
+    def _api_set_chain(self) -> None:
         try:
             body = self._read_body()
             job_id    = str(body.get("id", "")).strip()
@@ -1970,7 +2275,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if parent_id is not None:
                 parent_id = str(parent_id).strip() or None
             if not job_id:
-                self._send_json({"ok": False, "error": "id required"}, 400); return
+                self._send_json({"ok": False, "error": "id required"}, 400)
+                return
             set_chain(job_id, parent_id)
             self._send_json({"ok": True})
         except ValueError as exc:
@@ -1981,14 +2287,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
-DEFAULT_REPO = os.getcwd()
-PID_FILE     = AGENTIC_HOME / "serve.pid"
+DEFAULT_REPO   = os.getcwd()
+PID_FILE       = AGENTIC_HOME / "serve.pid"
+LOCAL_MODE     = os.environ.get("AGENTIC_LOCAL", "") == "1"
+LOCAL_MODEL    = os.environ.get("AGENTIC_LOCAL_MODEL", "qwen2.5-coder:32b")
 
 class _Server(http.server.ThreadingHTTPServer):
-    def handle_error(self, request, client_address):
+    def handle_error(self, request: Any, client_address: Any) -> None:
         # Swallow disconnects — these are normal when browsers close SSE streams
         # or cancel requests; they are not actionable errors.
-        if issubclass(sys.exc_info()[0], (ConnectionResetError, BrokenPipeError)):
+        exc_type = sys.exc_info()[0]
+        if exc_type is not None and issubclass(exc_type, (ConnectionResetError, BrokenPipeError)):
             return
         super().handle_error(request, client_address)
 

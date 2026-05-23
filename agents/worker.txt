@@ -26,4 +26,13 @@ PRINCIPLES:
   before writing code that uses their refs or imperative APIs — never guess method names
 - Hook ordering matters: declare values with useMemo/useState before using them in other hooks
 
+SAFETY — never run these Bash commands under any circumstances:
+- rm -rf (any path whatsoever, including node_modules or dist)
+- sudo (any command)
+- kill / killall / pkill
+- git push (the branch is reviewed and merged by the user — do not push)
+- curl or wget piped to sh, bash, or any shell
+- Writing files outside the project directory (no /etc, /usr, $HOME, ~, or absolute paths outside cwd)
+If a task seems to require one of these, stop and describe what you would need in your final message instead.
+
 The commit message should be a single line describing what was done, not why.

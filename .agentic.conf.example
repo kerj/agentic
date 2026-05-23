@@ -1,9 +1,20 @@
 # Agentic configuration
-# Copy to .agentic.conf and fill in values
-# This file is gitignored — never commit .agentic.conf
+# Copy to .agentic.conf — this file is gitignored, never commit .agentic.conf
+
+# Local model for `agentic serve --local`
+# See: https://ollama.com/library — look for models tagged 'tools' (required)
+export AGENTIC_LOCAL_MODEL="qwen2.5-coder:32b"
+
+# Context budget before old file reads are compressed to symbol maps.
+# Set based on your model's context window (leave ~20% headroom for responses).
+# qwen2.5-coder:32b  →  32K window  →  20000 (default)
+# qwen3.6:35b        → 256K window  → 180000
+export AGENTIC_CONTEXT_BUDGET="20000"
+
+# How many recent turns to keep verbatim when compressing (older turns get compressed).
+export AGENTIC_KEEP_RECENT_TURNS="15"
 
 # Optional: only needed for `agentic plan` and `agentic doc-gen`
-# The worker agent uses the `claude` CLI which handles its own authentication.
-export ANTHROPIC_API_KEY=""
-export AGENTIC_MODEL="claude-opus-4-7"
-export ANTHROPIC_BASE_URL="https://api.anthropic.com"
+# export ANTHROPIC_API_KEY=""
+# export AGENTIC_MODEL="claude-opus-4-7"
+# export ANTHROPIC_BASE_URL="https://api.anthropic.com"

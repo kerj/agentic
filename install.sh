@@ -12,15 +12,19 @@ echo ""
 # ── Directory structure ────────────────────────────────────────────────────────
 mkdir -p "${AGENTIC_HOME}"/{bin,lib,agents}
 mkdir -p "${HOME}/.agentic/queue"/{pending,running,done,failed,abandoned,cancelled}
-mkdir -p "${HOME}/.agentic/worktrees"
+mkdir -p "${HOME}/.agentic"/{worktrees,diffs,logs}
 echo "✅ Directories created"
 
 # ── Copy files ─────────────────────────────────────────────────────────────────
-cp -r "${REPO_DIR}/bin/"*    "${AGENTIC_HOME}/bin/"
-cp -r "${REPO_DIR}/lib/"*    "${AGENTIC_HOME}/lib/"
-cp -r "${REPO_DIR}/agents/"* "${AGENTIC_HOME}/agents/" 2>/dev/null || true
-chmod +x "${AGENTIC_HOME}/bin/agentic"
-echo "✅ Files installed"
+if [[ "$REPO_DIR" != "$AGENTIC_HOME" ]]; then
+  cp -r "${REPO_DIR}/bin/"*    "${AGENTIC_HOME}/bin/"
+  cp -r "${REPO_DIR}/lib/"*    "${AGENTIC_HOME}/lib/"
+  cp -r "${REPO_DIR}/agents/"* "${AGENTIC_HOME}/agents/" 2>/dev/null || true
+  chmod +x "${AGENTIC_HOME}/bin/agentic"
+  echo "✅ Files installed"
+else
+  echo "✅ Files already in place (running from AGENTIC_HOME)"
+fi
 
 # ── Shell config ───────────────────────────────────────────────────────────────
 if ! grep -q "AGENTIC_HOME" ~/.zshrc 2>/dev/null; then
@@ -34,6 +38,28 @@ EOF
   echo "✅ Added to .zshrc"
 else
   echo "✅ Shell already configured"
+fi
+
+# ── Project venv (pinned Python 3.11.9 via pyenv) ─────────────────────────────
+PYTHON_VERSION="3.11.9"
+PYTHON_BIN="${HOME}/.pyenv/versions/${PYTHON_VERSION}/bin/python3"
+
+if ! command -v pyenv &>/dev/null; then
+  echo "❌ pyenv not found — required to manage the project Python."
+  echo "   Install: https://github.com/pyenv/pyenv#installation"
+  exit 1
+fi
+
+echo "Ensuring Python ${PYTHON_VERSION} is available..."
+pyenv install -s "$PYTHON_VERSION"
+
+if [[ ! -x "${AGENTIC_HOME}/venv/bin/mypy" ]]; then
+  echo "Creating project venv (Python ${PYTHON_VERSION})..."
+  "$PYTHON_BIN" -m venv "${AGENTIC_HOME}/venv"
+  "${AGENTIC_HOME}/venv/bin/pip" install mypy --quiet
+  echo "✅ venv created (Python ${PYTHON_VERSION}, mypy installed)"
+else
+  echo "✅ venv already exists"
 fi
 
 # ── Dependency checks ──────────────────────────────────────────────────────────
