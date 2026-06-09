@@ -30,6 +30,12 @@ _worker_lock    = threading.Lock()
 _worker_running = False
 _worker_proc: "subprocess.Popen[str] | None" = None
 
+# Line buffer + condition so reconnecting SSE clients can catch up.
+# Primary stream appends here; waiters wake on _worker_cond.notify_all().
+_worker_log: list[str] = []
+_worker_rc:  int | None = None
+_worker_cond = threading.Condition(_worker_lock)
+
 # ── HTML template ──────────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -153,6 +159,7 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
 .chain-child::before { content: ''; position: absolute; left: -16px; top: 0; bottom: 50%; border-left: 2px solid #30363d; border-bottom: 2px solid #30363d; width: 14px; border-radius: 0 0 0 4px; }
 .chain-review > .job-card { border-left: 3px solid #388bfd; }
 .badge-review-type { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px; color: #79c0ff; border: 1px solid #1f4391; background: #0d1f42; margin-left: 6px; vertical-align: middle; }
+.badge-profile { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px; color: #7ee787; border: 1px solid #1a4a26; background: #0a1f12; margin-left: 6px; vertical-align: middle; }
 
 /* Status popover menu */
 .status-menu { position: relative; display: inline-block; }
@@ -522,7 +529,7 @@ function buildJobCard(j) {
   <div class="state-dot dot-${escHtml(s)}"></div>
   <div class="job-body" onclick="openDrawer('${escHtml(j.id)}')">
     <div class="job-top">
-      <span class="job-name">${escHtml(j.name || j.id)}</span>${isReviewJob ? '<span class="badge-review-type">review</span>' : ''}
+      <span class="job-name">${escHtml(j.name || j.id)}</span>${isReviewJob ? '<span class="badge-review-type">review</span>' : ''}${j.profile_display || j.profile ? `<span class="badge-profile">${escHtml(j.profile_display || j.profile)}</span>` : ''}
       <span class="state-badge badge-${escHtml(s)}">${escHtml(s)}</span>
     </div>
     <div class="job-id-sub"><a class="job-id" href="/job/${escHtml(j.id)}" onclick="event.stopPropagation()">${escHtml(j.id)}</a></div>
@@ -853,6 +860,9 @@ function runWorker(loop = false) {
   workerEs = new EventSource('/api/worker-stream');
   workerEs.onmessage = e => {
     const msg = JSON.parse(e.data);
+    if (msg.replayed) {
+      appendLog('── reconnected — replaying missed output ──', '');
+    }
     // Track which job was claimed so we can auto-open its drawer on completion
     if (msg.line && msg.line.startsWith('🔧 Claimed:')) {
       const match = msg.line.match(/j_[0-9a-f_]+/);
@@ -893,7 +903,9 @@ function runWorker(loop = false) {
   workerEs.onerror = () => {
     if (workerEs) { workerEs.close(); workerEs = null; }
     btn.disabled = false; btn.textContent = '▶ Run Worker';
-    appendLog('Connection lost', 'error');
+    document.getElementById('run-all-btn').disabled = false;
+    document.getElementById('stop-btn').style.display = 'none';
+    appendLog('Stream disconnected — click ▶ Run Worker to reconnect if job is still running', 'error');
   };
 }
 
@@ -1259,7 +1271,7 @@ function _syncDrawerWithLog(open) {
   }
 }
 
-// Populate model selector — dropdown in local mode, readonly label in cloud mode
+// Populate model selector
 if (IS_LOCAL) {
   fetch('/api/ollama-models').then(r => r.json()).then(models => {
     const sel = document.getElementById('model');
@@ -1268,10 +1280,24 @@ if (IS_LOCAL) {
       ? models.map(m => `<option value="${escHtml(m)}">${escHtml(m)}</option>`).join('')
       : '<option value="">no models found</option>';
   }).catch(() => {});
+} else {
+  fetch('/api/models').then(r => r.json()).then(models => {
+    const sel = document.getElementById('model');
+    if (!sel || sel.tagName !== 'SELECT') return;
+    const current = sel.dataset.current || '';
+    sel.innerHTML = models.length
+      ? models.map(m => `<option value="${escHtml(m)}"${m === current ? ' selected' : ''}>${escHtml(m)}</option>`).join('')
+      : '<option value="">no models found</option>';
+  }).catch(() => {});
 }
 
 fetchRepos();
 fetchJobs();
+// Auto-attach log stream if a worker is already running when the page loads
+// (handles page refresh mid-job without requiring a manual button click)
+fetch('/api/worker-status').then(r => r.json()).then(d => {
+  if (d.running && !workerEs) runWorker();
+}).catch(() => {});
 setInterval(fetchJobs, 3000);
 setInterval(fetchRepos, 30000);
 setInterval(() => {
@@ -1915,6 +1941,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(fetch_models())
         elif self.path == "/api/worker-stream":
             self._api_worker_stream()
+        elif self.path == "/api/worker-status":
+            self._send_json({"running": _worker_running})
         elif self.path.startswith("/api/diff/"):
             self._api_diff()
         elif self.path.startswith("/api/activity/"):
@@ -1971,8 +1999,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         model_field = (
             '<select id="model"><option value="auto">loading…</option></select>'
             if LOCAL_MODE else
-            f'<span id="model" style="font-size:12px;color:#8b949e;padding:6px 4px">'
-            f'☁ {cloud_model}</span>'
+            f'<select id="model" data-current="{cloud_model}"><option value="auto">loading…</option></select>'
         )
         html = (HTML_TEMPLATE
                 .replace("__DEFAULT_REPO_HTML__", DEFAULT_REPO)
@@ -1994,17 +2021,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"error": str(exc)}, 500)
 
     def _api_worker_stream(self) -> None:
-        global _worker_running, _worker_proc
+        global _worker_running, _worker_proc, _worker_log, _worker_rc
+
         with _worker_lock:
-            if _worker_running:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.end_headers()
-                self.wfile.write(f'data: {json.dumps({"error": "Worker already running"})}\n\n'.encode())
-                self.wfile.write(f'data: {json.dumps({"done": True, "rc": 1})}\n\n'.encode())
-                return
-            _worker_running = True
+            already_running = _worker_running
+            if not already_running:
+                _worker_running = True
+                _worker_log = []
+                _worker_rc  = None
 
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -2012,44 +2036,87 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
 
-        agentic_bin = AGENTIC_HOME / "bin" / "agentic"
-        proc = None
-        try:
-            proc = subprocess.Popen(
-                [str(agentic_bin), "worker-once"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                start_new_session=True,   # own process group — killpg kills the whole tree
-            )
-            with _worker_lock:
-                _worker_proc = proc
-            for line in iter(proc.stdout.readline, "") if proc.stdout else []:
-                msg = json.dumps({"line": line.rstrip("\n")})
-                self.wfile.write(f"data: {msg}\n\n".encode())
-                self.wfile.flush()
-            proc.wait()
-            done = json.dumps({"done": True, "rc": proc.returncode})
-            self.wfile.write(f"data: {done}\n\n".encode())
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-        except Exception as exc:
+        def _send(obj: dict) -> bool:
             try:
-                self.wfile.write(f'data: {json.dumps({"error": str(exc)})}\n\n'.encode())
-                self.wfile.write(f'data: {json.dumps({"done": True, "rc": 1})}\n\n'.encode())
+                self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode())
+                self.wfile.flush()
+                return True
+            except (BrokenPipeError, ConnectionResetError):
+                return False
+
+        if already_running:
+            # Reconnect: replay buffered lines then tail until worker finishes.
+            cursor = 0
+            while True:
+                with _worker_cond:
+                    # Drain any new lines since last check
+                    snapshot = _worker_log[cursor:]
+                    done_rc  = _worker_rc
+                for line in snapshot:
+                    if not _send({"line": line, "replayed": cursor == 0}):
+                        return
+                cursor += len(snapshot)
+                if done_rc is not None:
+                    _send({"done": True, "rc": done_rc})
+                    return
+                if not snapshot:
+                    # Wait for the primary thread to append more lines
+                    with _worker_cond:
+                        _worker_cond.wait(timeout=2.0)
+            return
+
+        # Primary connection: spin up the worker in a daemon thread so it
+        # outlives this SSE connection. The thread owns the process lifetime;
+        # this handler just tails the shared buffer like any other reconnect.
+        def _run_worker():
+            global _worker_running, _worker_proc, _worker_rc
+            agentic_bin = AGENTIC_HOME / "bin" / "agentic"
+            proc = None
+            try:
+                proc = subprocess.Popen(
+                    [str(agentic_bin), "worker-once"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    start_new_session=True,
+                )
+                with _worker_cond:
+                    _worker_proc = proc
+                for line in iter(proc.stdout.readline, "") if proc.stdout else []:
+                    with _worker_cond:
+                        _worker_log.append(line.rstrip("\n"))
+                        _worker_cond.notify_all()
+                proc.wait()
             except Exception:
                 pass
-        finally:
-            if proc and proc.poll() is None:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                except Exception:
-                    proc.terminate()
-            with _worker_lock:
-                _worker_running = False
-                _worker_proc = None
+            finally:
+                rc = proc.returncode if proc else 1
+                with _worker_cond:
+                    _worker_rc      = rc
+                    _worker_running = False
+                    _worker_proc    = None
+                    _worker_cond.notify_all()
+
+        t = threading.Thread(target=_run_worker, daemon=True)
+        t.start()
+
+        # Now tail the buffer exactly like a reconnecting client.
+        cursor = 0
+        while True:
+            with _worker_cond:
+                snapshot = _worker_log[cursor:]
+                done_rc  = _worker_rc
+            for line in snapshot:
+                if not _send({"line": line}):
+                    return  # browser disconnected — worker keeps running
+            cursor += len(snapshot)
+            if done_rc is not None:
+                _send({"done": True, "rc": done_rc})
+                return
+            if not snapshot:
+                with _worker_cond:
+                    _worker_cond.wait(timeout=2.0)
 
     def _api_stop_worker(self) -> None:
         global _worker_running, _worker_proc

@@ -4,27 +4,15 @@ WORKFLOW:
 1. Read CLAUDE.md to understand conventions, tech stack, and patterns — do this first
 2. Explore relevant source files to understand what already exists
 3. Implement the requested change — targeted, minimal, following existing patterns
-4. If package.json was modified, run: npm install
-5. Run: npm run build — catches type errors, wrong API usage, missing imports.
-   Fix ALL errors before continuing. No --skipLibCheck.
-6. Run: npm run lint (if the script exists in package.json) — catches React hook rules,
-   unused variables, accessibility issues, and code style problems.
-   Fix errors; warnings are optional but worth reviewing.
-   Also run: npx prettier --check src/ (if .prettierrc or prettier config exists in the project)
-   and fix any formatting issues with: npx prettier --write src/
-7. If the project has tests (check package.json scripts for "test"), run them too
-8. Stage and commit: git add -A && git commit -m "<short descriptive message>"
+4. Build, verify, and commit — see the language-specific section below for exact steps
 
 PRINCIPLES:
 - Follow CLAUDE.md exactly — naming, imports, patterns, file structure
 - Read a file before writing it — never guess at existing content or imports
-- Use what already exists — if a hook, type, or component is already in the project, import it
+- Use what already exists — if a function, type, or module is already in the project, use it
 - Make the minimum change needed — no refactoring, no cleanup unrelated to the request
 - If you're unsure about a project convention, look at an existing similar file first
-- A passing build is the minimum bar — if npm run build fails, keep fixing until it passes
-- For third-party libraries (react-window, react-query, etc.), check the actual type definitions
-  before writing code that uses their refs or imperative APIs — never guess method names
-- Hook ordering matters: declare values with useMemo/useState before using them in other hooks
+- A passing build is the minimum bar — keep fixing until it passes
 
 SAFETY — never run these Bash commands under any circumstances:
 - rm -rf (any path whatsoever, including node_modules or dist)

@@ -111,7 +111,7 @@ Set your model in `~/.agentic/.agentic.conf`:
 
 ```bash
 export AGENTIC_LOCAL_MODEL="qwen-coder"
-export AGENTIC_CONTEXT_BUDGET=100000
+# AGENTIC_CONTEXT_BUDGET=24000   # default — raise if your model has a larger context window
 ```
 
 ### 5. Start
@@ -173,6 +173,8 @@ After **Accept Chain**, you get `agent-work/<date>`. Merge it into your branch w
 
 Jobs can build on each other. Fill in the **Chain after** field with a previous job's ID. Each chained job branches from the previous one's committed work, so the agent sees what was actually built.
 
+When a chained job starts, any commits that landed on the main branch after the parent job branched are automatically merged in. This means assets, CLAUDE.md updates, or other changes committed directly to main are always visible to downstream jobs — no manual sync needed.
+
 Run the full chain with **▶▶ Run All** — it executes pending jobs in dependency order.
 
 ---
@@ -184,7 +186,7 @@ Run the full chain with **▶▶ Run All** — it executes pending jobs in depen
 ```bash
 # Local model
 export AGENTIC_LOCAL_MODEL="qwen-coder"
-export AGENTIC_CONTEXT_BUDGET=100000   # tokens before compression kicks in
+# AGENTIC_CONTEXT_BUDGET=24000   # default — raise only if your model has a larger context window
 
 # Ollama host (default: http://localhost:11434)
 export OLLAMA_HOST="http://localhost:11434"
@@ -202,7 +204,7 @@ export AGENTIC_MODEL="claude-opus-4-7"
 For each job:
 
 1. Reads `CLAUDE.md` to understand project conventions
-2. Builds a symbol map of the project (`.ts`, `.tsx`, `.js`, `.jsx`)
+2. Detects the project language profile (TypeScript, Game Boy C, …) and builds a symbol map accordingly — `.ts`/`.tsx` exports for TypeScript, C function signatures for Game Boy C
 3. Explores relevant source files
 4. Implements the requested change
 5. Calls `Setup()` — installs dependencies, detects yarn/pnpm/npm automatically
@@ -277,12 +279,30 @@ In your project: branches named `agentic/<job-id>`. Accept Chain creates `agent-
 
 ---
 
+## Language profiles
+
+Agentic auto-detects your project's language by inspecting files (Makefile contents, `package.json`, etc.) and selects a profile that controls how the agent explores code, parses build errors, and which tools are available.
+
+| Profile | Detected when | Agent tools |
+|---|---|---|
+| `typescript` | `package.json` present | `Setup`, `Build` |
+| `gameboy-c` | Makefile contains `GBDK` or `sdcc` | `Build`, `TileConvert`, `RomUsage`, `Symbols` |
+
+**Game Boy–specific tools (local mode only):**
+- `TileConvert(path, name)` — runs `png2asset` to convert a PNG to GBDK tile arrays; auto-pads images to 8px boundaries
+- `RomUsage()` — parses the `.map` file and reports Bank 0 / WRAM / HRAM usage with overflow warnings
+- `Symbols(filter)` — reads the `.sym` file and lists linked symbols by bank, useful for debugging linker errors
+
+Profile detection is automatic — no configuration needed. The detected profile is stored in the job and shown in the dashboard.
+
+---
+
 ## CLAUDE.md
 
-The agent reads `CLAUDE.md` at project root before doing anything. Keep it current — it's the source of truth for naming conventions, import patterns, testing framework, and component patterns.
+The agent reads `CLAUDE.md` at project root before doing anything. Keep it current — it's the source of truth for naming conventions, import patterns, testing framework, tile index maps, and component patterns.
 
 ```bash
-agentic doc-gen   # generate from project analysis
+agentic doc-gen   # generate from project analysis (profile-aware: TypeScript or Game Boy C)
 agentic doc       # open in $EDITOR
 ```
 

@@ -1,0 +1,136 @@
+LANGUAGE: Game Boy C (GBDK-2020 / SDCC) — Local Runner
+
+HARDWARE CONSTRAINTS — internalize these before writing any code:
+- CPU: Sharp LR35902 (Z80-like) at 4.19 MHz, 8-bit
+- RAM: 8 KB work RAM (0xC000–0xDFFF) + 127 bytes high RAM (0xFF80–0xFFFE)
+- VRAM: 8 KB (0x8000–0x9FFF) — accessible only during V-blank or with LCD off
+- Screen: 160×144 pixels, 4-shade grey palette (0=white, 3=black)
+- No heap allocator — no malloc/free. All allocations must be static or stack-based
+- Stack is tiny — avoid deep recursion and large local arrays
+- ROM banking: 16 KB fixed (bank 0) + 16 KB switchable banks; annotate banked functions with NONBANKED if they must stay in bank 0
+
+GBDK-2020 API — key functions:
+  // Input
+  joypad()                          — returns bitmask: J_UP J_DOWN J_LEFT J_RIGHT J_A J_B J_START J_SELECT
+  waitpad(mask)                     — wait until any button in mask is pressed
+
+  // Background
+  set_bkg_data(first_tile, nb, data)  — load tile data into VRAM (tile index, count, pointer)
+  set_bkg_tiles(x, y, w, h, map)     — place tiles on background map (tile coords)
+  SHOW_BKG; HIDE_BKG;
+
+  // Sprites
+  set_sprite_data(first, nb, data)    — load sprite tile data INTO THE SAME VRAM AS BACKGROUND
+  set_sprite_tile(sprite, tile)       — assign tile index to sprite slot
+  move_sprite(sprite, x, y)           — position sprite (x,y in screen pixels, offset +8,+16)
+  SHOW_SPRITES; HIDE_SPRITES;
+  set_sprite_prop(sprite, prop)       — S_FLIPX, S_FLIPY, S_PALETTE, S_PRIORITY
+
+  // Console / text
+  gotoxy(x, y)                        — set cursor position for printf (from <gbdk/console.h>)
+  printf(fmt, ...)                    — writes ASCII tile indices to background map (see DISPLAY API below)
+
+  // Timing / sync
+  wait_vbl_done()                     — wait for vertical blank (essential game loop sync)
+  disable_interrupts(); enable_interrupts();
+
+  // Display control
+  LCDC_REG = ...                      — LCD control register
+  BGP_REG = ...                       — background palette (2 bits per shade, 8-bit register)
+  OBP0_REG = ...; OBP1_REG = ...     — sprite palettes
+
+VRAM TILE INDEX MANAGEMENT — CRITICAL, read this before any set_*_data() call:
+- CLAUDE.md tile index map is authoritative — do not read assets/*.h to re-derive it
+- Background tiles and sprite tiles share the SAME VRAM address space ($8000–$8FFF)
+- set_sprite_data(N, count, data) writes into VRAM at the same index N as set_bkg_data(N, ...)
+- Loading sprite data at index 0 OVERWRITES background tiles 0 through count-1
+- Before loading any tile data, read CLAUDE.md to find the project's current tile index map
+- If CLAUDE.md has no tile index map, grep the source for all set_bkg_data() and
+  set_sprite_data() calls to compute the highest occupied index before placing new data
+- Sprite tiles MUST start at an index strictly above (last background tile index + its count)
+- Example: if background uses indices 0–39, sprite tiles must start at 40 or higher
+- When you add new tiles, update CLAUDE.md with the new tile index map entry
+- After any change to tile loading calls, run VramAudit() to verify no index ranges overlap
+
+DISPLAY API — printf vs custom tiles:
+- printf() / gotoxy() write ASCII byte values as tile indices into the background map
+  This ONLY produces correct output if tiles 0–127 in VRAM match the ASCII character set
+  (i.e. the project includes <stdio.h> which auto-loads a built-in font at those indices)
+- If the project loads a CUSTOM font at non-ASCII indices (e.g. A=tile 1, B=tile 2…),
+  printf() will write wrong tile indices and display garbage or sprite fragments
+  Check CLAUDE.md for the font map before using printf() — when in doubt, avoid it
+- For game text that uses custom tile fonts: use set_bkg_tiles() with your font's tile indices
+- CURSOR() does not exist in GBDK — use gotoxy(x, y) from <gbdk/console.h>
+- printf format specifiers supported: %u %d %hu %hd %c %x %hx %s
+  No width/padding (%03u will fail). Always cast args: printf("%u", (UINT16)val)
+
+STATE-AWARE TILEMAP WRITES AND SCREEN REGION OWNERSHIP:
+- set_bkg_tiles() and printf() are PERMANENT — they stay on screen until overwritten
+- Never write to the background tilemap unconditionally from the main game loop
+- Always gate tilemap writes on game_state: if (game_state == STATE_X) { ... }
+- init_*() functions (called on state transitions) own screen layout — they repaint their
+  ENTIRE region on every state entry, erasing anything drawn there by other code
+- handle_*() per-frame code must only update regions that belong to the active state
+- Before drawing to any screen position in per-frame code, ask:
+    a) Does my current state own this row/column?
+    b) Will init_*() repaint this region on the next state transition and erase my draw?
+  If either answer is no, you are drawing in the wrong place
+- CLAUDE.md should have a screen region ownership table — read it before adding any HUD,
+  counter, or debug display. If CLAUDE.md has no region table, read init_*() functions to
+  determine what each state paints and where before writing to the tilemap
+- Example: a frame counter at row 0 during STATE_WALKING corrupts the top wall border because
+  init_walking() owns row 0. The fix: draw it only during states that own row 0 (e.g.
+  STATE_NAMING), or shift the room walls down and reserve row 0 as a permanent HUD strip
+
+TILE SYSTEM:
+- Each tile is 8×8 pixels, 2bpp = 16 bytes per tile
+- Tile data arrays: UINT8 tile_data[] = { ... } (16 bytes per tile)
+- Background map: 32×32 tiles (256×256 pixels), scrollable via SCX_REG/SCY_REG
+- Sprites: 40 hardware slots (OAM), each 8×8 or 8×16
+
+ASSET PIPELINE — graphics must be converted before use:
+- NEVER write tile byte arrays by hand for anything beyond a trivial test pattern
+- Any task involving sprites, backgrounds, fonts, or tile graphics requires converting a PNG first
+- TileConvert(image_path, name) — background tileset + map mode (-map):
+    Generates assets/<name>.c and assets/<name>.h with:
+      name_tiles[N*16]   — raw 8×8 tile data
+      name_map[W_tiles*H_tiles]  — tile index map for placing the graphic
+    Usage: set_bkg_data(first_idx, name_TILE_COUNT, name_tiles);
+           set_bkg_tiles(x, y, name_WIDTH/8, name_HEIGHT/8, name_map);
+- TileConvert(image_path, name, sprite=True) — hardware sprite mode (-spr8x8):
+    Generates assets/<name>.c and assets/<name>.h with:
+      name_tiles[N*16]       — sprite tile data
+      name_metasprites[]     — metasprite descriptors for move_metasprite()
+    Usage: set_sprite_data(first_idx, name_TILE_COUNT, name_tiles);
+    Do NOT use metasprite-format data as background tiles — indices won't align
+- After TileConvert, always Read the generated .h file to confirm array names and sizes
+- PNG must have exactly 4 colors and dimensions that are multiples of 8
+- Add assets/<name>.c to SOURCES in the Makefile (it is NOT under src/, wildcard won't find it)
+- Add #include "assets/<name>.h" to your source file
+
+BUILD AND VERIFY:
+4. Call Build() — runs make and returns pass/fail with any errors.
+   Fix ALL errors before continuing. Read the error file and line, fix the root cause.
+5. Call VramAudit() — resolves all #define constants via cpp and checks set_bkg_data /
+   set_sprite_data index ranges for overlaps. Fix any conflicts before continuing:
+   move sprite loads to start above the highest background tile index.
+6. Call RomUsage() — check Bank 0 and WRAM are not overflowing.
+   If Bank 0 is above 90% full, flag it in your commit message.
+   If Bank 0 overflows, reduce code or data size before committing.
+7. Stage and commit: git add -A && git commit -m "<short descriptive message>"
+
+DEBUGGING LINKER ERRORS:
+- If Build() fails with undefined symbol or unresolved reference, call Symbols() —
+  it shows what linked and where. The missing symbol may be misspelled, not compiled
+  in, or pushed out of Bank 0 by an overflow.
+- If a function existed before but fails to link after adding code, call RomUsage()
+  first — Bank 0 overflow is the most likely cause.
+
+LANGUAGE-SPECIFIC PRINCIPLES:
+- Always call wait_vbl_done() once per game loop iteration — this is the heartbeat
+- Access VRAM only during V-blank or with the LCD disabled (LCDC_REG &= ~0x80)
+- Use UINT8/INT8/UINT16/INT16 (gbdk types) not char/int — sizes are explicit and safe
+- Keep the game loop state machine simple: one enum for game state, switch on it
+- No dynamic allocation — declare all buffers at file scope or as static locals
+- Tile data arrays must be in ROM (global/static const) to avoid using precious RAM
+- Test sprite positions: x=0 or y=0 hides the sprite; visible range is x:8–167, y:16–159

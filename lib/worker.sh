@@ -14,6 +14,20 @@ function run_worker_agent() {
     # Use local-specific system prompt tuned for local model limitations
     local local_prompt="$AGENTIC_HOME/agents/worker_local.txt"
     [[ ! -f "$local_prompt" ]] && local_prompt="$AGENTIC_HOME/agents/worker.txt"
+
+    # Append language-specific section — prefer <profile>-local.txt, fall back to base
+    local _local_profile_section="$AGENTIC_HOME/agents/prompt_sections/${AGENTIC_PROFILE:-typescript}-local.txt"
+    [[ ! -f "$_local_profile_section" ]] && _local_profile_section="$AGENTIC_HOME/agents/prompt_sections/${AGENTIC_PROFILE:-typescript}.txt"
+    [[ ! -f "$_local_profile_section" ]] && _local_profile_section="$AGENTIC_HOME/agents/prompt_sections/typescript-local.txt"
+    if [[ -f "$_local_profile_section" ]]; then
+      local _local_tmp
+      _local_tmp=$(mktemp /tmp/agentic_prompt_XXXXXX)
+      if [[ -n "$_local_tmp" ]]; then
+        { cat "$local_prompt"; printf '\n\n'; cat "$_local_profile_section"; } > "$_local_tmp"
+        local_prompt="$_local_tmp"
+      fi
+    fi
+
     echo "🤖 Running local agent (${model})..."
     echo ""
     if [[ -n "$log_file" ]]; then
@@ -42,7 +56,20 @@ function run_worker_agent() {
   local system_prompt
   system_prompt="$(cat "$AGENTIC_HOME/agents/worker.txt")"
 
-  echo "🤖 Running Claude agent..."
+  # Append language-specific build/verify section — cloud gets base file (no -local suffix)
+  local _profile_section="$AGENTIC_HOME/agents/prompt_sections/${AGENTIC_PROFILE:-typescript}.txt"
+  if [[ ! -f "$_profile_section" ]]; then
+    _profile_section="$AGENTIC_HOME/agents/prompt_sections/typescript.txt"
+  fi
+  if [[ -f "$_profile_section" ]]; then
+    system_prompt="${system_prompt}"$'\n\n'"$(cat "$_profile_section")"
+  fi
+
+  local model="${model_hint:-${AGENTIC_MODEL:-}}"
+  local model_flag=()
+  [[ -n "$model" && "$model" != "auto" ]] && model_flag=(--model "$model")
+
+  echo "🤖 Running Claude agent${model:+ ($model)}..."
   echo ""
 
   if [[ -n "$log_file" ]]; then
@@ -53,6 +80,7 @@ function run_worker_agent() {
       --allowedTools "Read,Edit,Write,Bash,Glob,Grep,LS" \
       --output-format stream-json \
       --verbose \
+      "${model_flag[@]}" \
     | tee "$log_file" \
     | "${AGENTIC_HOME}/venv/bin/python3" "$AGENTIC_HOME/lib/stream_parser.py"
   else
@@ -60,6 +88,7 @@ function run_worker_agent() {
       -p "$request" \
       --system-prompt "$system_prompt" \
       --dangerously-skip-permissions \
-      --allowedTools "Read,Edit,Write,Bash,Glob,Grep,LS"
+      --allowedTools "Read,Edit,Write,Bash,Glob,Grep,LS" \
+      "${model_flag[@]}"
   fi
 }

@@ -35,10 +35,14 @@ AGENTIC_HOME  = Path(os.environ.get("AGENTIC_HOME", Path.home() / ".agentic"))
 MAX_TURNS         = int(os.environ.get("AGENTIC_MAX_TURNS", "60"))
 MAX_REPAIR_ROUNDS = 5
 # Context budget before compression kicks in.
-# qwen-coder (128K window) — leave ~28K headroom for output and tool defs.
-# Override via AGENTIC_CONTEXT_BUDGET in .agentic.conf
-CONTEXT_BUDGET    = int(os.environ.get("AGENTIC_CONTEXT_BUDGET", "100000"))
+# Most local models have a 32K token window — default to 24K to leave headroom
+# for tool definitions and the model's response. Override via AGENTIC_CONTEXT_BUDGET.
+CONTEXT_BUDGET    = int(os.environ.get("AGENTIC_CONTEXT_BUDGET", "24000"))
 KEEP_RECENT_TURNS = int(os.environ.get("AGENTIC_KEEP_RECENT_TURNS", "15"))
+# Per-request HTTP timeout in seconds. Large local models can take a long time
+# to generate a response — set high and just kill the job if you get impatient.
+OLLAMA_TIMEOUT    = int(os.environ.get("AGENTIC_OLLAMA_TIMEOUT", "1800"))
+PROFILE           = os.environ.get("AGENTIC_PROFILE", "typescript")
 
 # ── TypeScript / ESLint error hints ────────────────────────────────────────────
 
@@ -62,13 +66,31 @@ TS_HINTS: dict[str, str] = {
     "import/no-unresolved": "import path cannot be resolved — check the path is correct relative to this file",
 }
 
+# ── Game Boy C / SDCC error hints ──────────────────────────────────────────────
+
+GB_HINTS: dict[str, str] = {
+    "undeclared": "the identifier is not declared — check spelling, include the right header, or declare the variable before use",
+    "implicit": "function called before declaration — add a forward declaration or move the function above its caller",
+    "incompatible": "type mismatch — GBDK uses UINT8/INT8/UINT16/INT16; check the function signature in the header",
+    "too many": "too many arguments to function — check the GBDK header for the correct parameter count",
+    "too few": "too few arguments to function — check the GBDK header for the correct parameter count",
+    "lvalue": "cannot assign to this expression — you may be assigning to a register address incorrectly",
+    "syntax": "syntax error — check for missing semicolons, mismatched braces, or bad macro expansion",
+    "redefined": "symbol redefined — declared twice; remove the duplicate or guard with #ifndef",
+    "malloc": "malloc is not available on Game Boy — use static or stack allocation instead",
+}
+
 def enrich_error(error: dict) -> str:
     """Add a semantic hint to a raw error message."""
     code = error.get("code", "")
-    msg  = error.get("message", "")
-    hint = TS_HINTS.get(code, "")
+    msg  = error.get("message", "").lower()
+    hints = GB_HINTS if PROFILE == "gameboy-c" else TS_HINTS
+    if PROFILE == "gameboy-c":
+        hint = next((v for k, v in hints.items() if k in msg), "")
+    else:
+        hint = hints.get(code, "")
     location = f"{error['file']} line {error['line']}" if error.get("line") else error.get("file", "")
-    base = f"{location}: {code} — {msg}"
+    base = f"{location}: {code} — {error.get('message', '')}"
     return f"{base}\n  Hint: {hint}" if hint else base
 
 # ── Tool definitions ────────────────────────────────────────────────────────────
@@ -192,8 +214,8 @@ def _make_tools(write_enabled: bool = True) -> list[dict]:
                 "name": "Build",
                 "description": (
                     "Run the project build and return pass/fail with any errors. "
-                    "Reads package.json scripts to find the right build command. "
-                    "Use this instead of running npm/yarn/pnpm build via Bash."
+                    "Detects the right build command for this project automatically. "
+                    "Use this instead of running build commands via Bash."
                 ),
                 "parameters": {
                     "type": "object",
@@ -203,6 +225,94 @@ def _make_tools(write_enabled: bool = True) -> list[dict]:
             }
         },
     ]
+
+    if PROFILE == "gameboy-c":
+        tools += [
+            {
+                "type": "function",
+                "function": {
+                    "name": "TileConvert",
+                    "description": (
+                        "Convert a PNG image to a GBDK C tile/sprite array using png2asset. "
+                        "Outputs a .c and .h file in assets/. Use this whenever you need to "
+                        "include graphics in the ROM — never write tile data by hand."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "image_path": {
+                                "type": "string",
+                                "description": "Path to the source PNG file"
+                            },
+                            "name": {
+                                "type": "string",
+                                "description": "C identifier name for the generated array (e.g. 'player_sprite')"
+                            },
+                            "sprite": {
+                                "type": "boolean",
+                                "description": "True for sprite data, False (default) for background tile data"
+                            }
+                        },
+                        "required": ["image_path", "name"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "RomUsage",
+                    "description": (
+                        "Parse the build .map file and return ROM and RAM usage per bank. "
+                        "Use this after Build() to verify the ROM fits within hardware limits "
+                        "(Bank 0: 16KB, each additional bank: 16KB, WRAM: 8KB)."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "Symbols",
+                    "description": (
+                        "Read the build .sym file and return all symbol addresses grouped by bank. "
+                        "Use this to debug linker errors, verify a function was linked, or check "
+                        "which bank a symbol ended up in."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "filter": {
+                                "type": "string",
+                                "description": "Optional substring to filter symbol names (e.g. 'sprite', 'main')"
+                            }
+                        },
+                        "required": []
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "VramAudit",
+                    "description": (
+                        "Detect VRAM tile index conflicts between background and sprite tile loads. "
+                        "Uses cpp to resolve all #define constants, then scans set_bkg_data() and "
+                        "set_sprite_data() calls for overlapping index ranges. "
+                        "Call this after adding or changing any tile data loads to catch conflicts "
+                        "before they corrupt graphics at runtime."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                }
+            },
+        ]
     if write_enabled:
         tools.insert(2, {
             "type": "function",
@@ -342,6 +452,12 @@ def _find_build_cmd() -> str:
     """Return the build shell command for the current project, with 2>&1 appended."""
     import json as _json
     cwd = Path.cwd()
+
+    # Game Boy C: always use make
+    if PROFILE == "gameboy-c":
+        return "make 2>&1"
+
+    # Node.js projects
     pkg_path = cwd / "package.json"
     if not pkg_path.exists():
         return "npx tsc --noEmit 2>&1"
@@ -370,6 +486,409 @@ def tool_build() -> str:
     if r.returncode == 0 and not errors:
         return f"✓ Build passed ({cmd.split()[0]})."
     return _format_build_result(errors, raw, cmd)
+
+def tool_tile_convert(image_path: str, name: str, sprite: bool = False) -> str:
+    """Convert a PNG to GBDK tile/sprite C arrays using png2asset."""
+    gbdk_home = os.environ.get("GBDK_HOME", str(Path.home() / "gbdk"))
+    png2asset = Path(gbdk_home) / "bin" / "png2asset"
+    if not png2asset.exists():
+        return f"✗ png2asset not found at {png2asset} — check GBDK_HOME."
+    if not Path(image_path).exists():
+        return f"✗ Image not found: {image_path}"
+
+    # Auto-pad to 8-pixel boundary — png2asset requires dimensions that are multiples of 8
+    padded_note = ""
+    try:
+        from PIL import Image as _Image
+        img = _Image.open(image_path).convert("RGBA")
+        w, h = img.size
+        new_w = (w + 7) & ~7
+        new_h = (h + 7) & ~7
+        if new_w != w or new_h != h:
+            padded = _Image.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
+            padded.paste(img, (0, 0))
+            tmp_path = image_path + "_padded.png"
+            padded.save(tmp_path)
+            image_path = tmp_path
+            padded_note = f"  (auto-padded {w}×{h} → {new_w}×{new_h} to meet 8px boundary)\n"
+    except ImportError:
+        pass  # Pillow not available — let png2asset fail with its own message
+
+    assets_dir = Path("assets")
+    assets_dir.mkdir(exist_ok=True)
+    out_c = assets_dir / f"{name}.c"
+    out_h = assets_dir / f"{name}.h"
+
+    # -map = background tileset+map mode (8x8 tiles); -spr8x8 = hardware sprite mode
+    # Array name is derived from the output filename by png2asset (-n is not a valid flag)
+    flags = [str(png2asset), image_path, "-o", str(out_c)]
+    if sprite:
+        flags += ["-spr8x8"]
+    else:
+        flags += ["-map"]
+
+    try:
+        r = subprocess.run(flags, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return "✗ png2asset timed out."
+
+    if image_path.endswith("_padded.png"):
+        try:
+            Path(image_path).unlink()
+        except OSError:
+            pass
+
+    if r.returncode != 0:
+        return f"✗ png2asset failed:\n{(r.stdout + r.stderr).strip()}"
+
+    lines = [f"✓ Generated {out_c} and {out_h}", padded_note.strip()] if padded_note else [f"✓ Generated {out_c} and {out_h}"]
+    if out_c.exists():
+        content = out_c.read_text()
+        # Show the array declaration so the agent knows what to #include or extern
+        for line in content.splitlines():
+            if "UINT8" in line or "unsigned char" in line or "extern" in line:
+                lines.append(f"  {line.strip()}")
+    lines.append(f"\nInclude in your source: #include \"{out_h}\"")
+    return "\n".join(lines)
+
+
+def tool_rom_usage() -> str:
+    """Parse the .map file and report ROM/RAM usage per bank."""
+    map_files = sorted(Path("build").glob("*.map")) if Path("build").exists() else []
+    if not map_files:
+        return "✗ No .map file found in build/ — run Build() first."
+
+    map_text = map_files[0].read_text(errors="replace")
+
+    # Parse area lines (ASxxxx format):
+    # "_CODE                  00000200    0000154D =        5453. bytes (REL,CON)"
+    area_re = re.compile(
+        r"^(_\w+)\s+([0-9A-Fa-f]{8})\s+([0-9A-Fa-f]{8})\s+=\s+(\d+)\.",
+        re.MULTILINE
+    )
+
+    rom_bank0  = 0   # _HOME + _CODE (addr 0x0000–0x3FFF)
+    rom_banks: dict[int, int] = {}  # bank N → bytes
+    wram       = 0
+    hram       = 0
+
+    ROM_HEADER_BYTES = 512  # fixed GB cart header + interrupt vectors (0x0000–0x01FF)
+    rom_bank0 = ROM_HEADER_BYTES
+
+    for m in area_re.finditer(map_text):
+        area_name = m.group(1)
+        addr      = int(m.group(2), 16)
+        size      = int(m.group(4))
+        if size == 0:
+            continue
+
+        # _HEADERx sections are placed by GBDK at absolute addresses in the cart header;
+        # their linker addr shows as 0x0000 so skip them — counted in ROM_HEADER_BYTES above.
+        if area_name.startswith("_HEADER"):
+            continue
+
+        if 0x0000 <= addr <= 0x3FFF:
+            rom_bank0 += size
+        elif area_name.startswith("_CODE_"):
+            bank_num = int(area_name.split("_CODE_")[1]) if "_CODE_" in area_name else 1
+            rom_banks[bank_num] = rom_banks.get(bank_num, 0) + size
+        elif 0x4000 <= addr <= 0x7FFF:
+            # switchable bank — determine bank number from address if name doesn't tell us
+            bank_num = int(area_name.split("_CODE_")[1]) if "_CODE_" in area_name else 1
+            rom_banks[bank_num] = rom_banks.get(bank_num, 0) + size
+        elif 0xC000 <= addr <= 0xDFFF or area_name in ("_DATA", "_BSS", "_INITIALIZED", "_BSEG_DATA"):
+            wram += size
+        elif 0xFF80 <= addr <= 0xFFFE or area_name in ("_HRAM", "_BSEG"):
+            hram += size
+
+    bank0_limit = 16 * 1024
+    wram_limit  = 8 * 1024
+    hram_limit  = 127
+
+    lines = ["ROM / RAM usage:"]
+    pct0 = rom_bank0 / bank0_limit * 100
+    lines.append(f"  Bank 0 (fixed): {rom_bank0:,} / {bank0_limit:,} bytes  ({pct0:.1f}%)"
+                 + ("  ⚠️  OVERFLOW" if rom_bank0 > bank0_limit else ""))
+
+    for bank_num in sorted(rom_banks):
+        b = rom_banks[bank_num]
+        pct = b / (16 * 1024) * 100
+        lines.append(f"  Bank {bank_num} (switch): {b:,} / 16,384 bytes  ({pct:.1f}%)"
+                     + ("  ⚠️  OVERFLOW" if b > 16 * 1024 else ""))
+
+    pct_w = wram / wram_limit * 100
+    lines.append(f"  WRAM:           {wram:,} / {wram_limit:,} bytes  ({pct_w:.1f}%)"
+                 + ("  ⚠️  OVERFLOW" if wram > wram_limit else ""))
+
+    if hram:
+        lines.append(f"  HRAM:           {hram:,} / {hram_limit} bytes")
+
+    return "\n".join(lines)
+
+
+def tool_symbols(filter: str = "") -> str:
+    """Read the .sym file and return symbol addresses grouped by bank."""
+    sym_files = sorted(Path("build").glob("*.sym")) if Path("build").exists() else []
+    if not sym_files:
+        return "✗ No .sym file found in build/ — run Build() first."
+
+    lines_raw = sym_files[0].read_text(errors="replace").splitlines()
+    banks: dict[str, list[str]] = {}
+
+    for line in lines_raw:
+        line = line.strip()
+        if not line or line.startswith(";"):
+            continue
+        # Format: "00:4000 symbol_name"
+        m = re.match(r"^([0-9A-Fa-f]{2}):([0-9A-Fa-f]{4})\s+(\S+)$", line)
+        if not m:
+            continue
+        bank, addr, sym = m.group(1), m.group(2), m.group(3)
+        if filter and filter.lower() not in sym.lower():
+            continue
+        banks.setdefault(bank, []).append(f"  0x{addr}  {sym}")
+
+    if not banks:
+        msg = f"No symbols found"
+        if filter:
+            msg += f" matching '{filter}'"
+        return msg + "."
+
+    out = [f"Symbols ({sym_files[0].name}):"]
+    for bank in sorted(banks):
+        label = f"Bank {int(bank, 16)}" if bank != "00" else "Bank 0 (fixed)"
+        out.append(f"\n{label}:")
+        out.extend(banks[bank][:50])  # cap per bank to avoid flooding context
+        if len(banks[bank]) > 50:
+            out.append(f"  ... and {len(banks[bank]) - 50} more")
+    return "\n".join(out)
+
+
+# ── Game Boy C: cpp-based static analysis ──────────────────────────────────────
+
+def _gbdk_include_flags() -> list[str]:
+    gbdk_home = os.environ.get("GBDK_HOME", str(Path.home() / "gbdk"))
+    inc = Path(gbdk_home) / "include"
+    # macOS Apple clang requires -I/path (concatenated) — separate -I and path argv
+    # entries are incorrectly treated as a linker input rather than an include dir.
+    if inc.exists():
+        return [f"-I{inc}", "-D__PORT_sm83", "-D__SDCC"]
+    return ["-nostdinc", "-D__PORT_sm83", "-D__SDCC"]
+
+
+def _cpp_expand(source_file: str) -> str:
+    """
+    Run cpp -E on a source file, returning macro-expanded text.
+    Uses the project cwd so relative includes (assets/*.h) resolve correctly.
+    Returns stdout even on non-zero exit — fatal include errors still yield
+    partial output with call sites intact.
+    """
+    cwd = Path(source_file).parent.parent  # src/main.c → project root
+    if not cwd.exists():
+        cwd = Path.cwd()
+    cmd = ["cpp", "-E", "-w"] + _gbdk_include_flags() + [source_file]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20, cwd=str(cwd))
+        return r.stdout  # use partial output even if includes fail
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return ""
+
+
+def _safe_eval(expr: str) -> Optional[int]:
+    """Evaluate a simple integer arithmetic expression (digits, hex, operators only)."""
+    expr = expr.strip()
+    if not re.match(r'^[0-9a-fA-FxX\s+\-*/|&~^<>()]+$', expr):
+        return None
+    try:
+        result = eval(compile(expr, "<string>", "eval"), {"__builtins__": {}}, {})
+        return int(result) if isinstance(result, (int, float)) else None
+    except Exception:
+        return None
+
+
+def _extract_project_defines(source_files: list[str]) -> dict[str, int]:
+    """
+    Extract and resolve numeric #define constants from project source files.
+    Multi-pass substitution handles forward references and arithmetic chains.
+    Skips function-like macros, inline comments, and non-integer values.
+    """
+    raw: dict[str, str] = {}
+    for fp in source_files:
+        try:
+            content = Path(fp).read_text(errors="replace")
+        except OSError:
+            continue
+        # Object-like macros only — function-like have no whitespace before '('
+        for m in re.finditer(r'^#define\s+([A-Za-z_]\w*)\s+([^\n\\]+)', content, re.MULTILINE):
+            name, raw_val = m.group(1), m.group(2)
+            val = re.sub(r'/\*.*?\*/', '', raw_val).split('//')[0].strip()
+            if val:
+                raw[name] = val
+
+    resolved: dict[str, int] = {}
+    changed = True
+    passes = 0
+    while changed and passes < 8:
+        changed = False
+        for name, val in raw.items():
+            if name in resolved:
+                continue
+            subbed = re.sub(
+                r'\b[A-Z_][A-Z0-9_]*\b',
+                lambda m, r=resolved: str(r[m.group(0)]) if m.group(0) in r else m.group(0),
+                val
+            )
+            result = _safe_eval(subbed)
+            if result is not None:
+                resolved[name] = result
+                changed = True
+        passes += 1
+
+    return resolved
+
+
+def _extract_call_args(text: str, func_name: str) -> list[tuple[str, str]]:
+    """
+    Extract (first_arg, second_arg) from all calls to func_name.
+    Paren-aware: correctly handles nested expressions like (BASE + COUNT).
+    """
+    results = []
+    for m in re.finditer(r'\b' + re.escape(func_name) + r'\s*\(', text):
+        pos = m.end()
+        args: list[str] = []
+        buf: list[str] = []
+        depth = 1
+        while pos < len(text) and depth > 0:
+            c = text[pos]
+            if c == '(':
+                depth += 1
+                buf.append(c)
+            elif c == ')':
+                depth -= 1
+                if depth == 0:
+                    args.append(''.join(buf).strip())
+                else:
+                    buf.append(c)
+            elif c == ',' and depth == 1:
+                args.append(''.join(buf).strip())
+                buf = []
+            else:
+                buf.append(c)
+            pos += 1
+        if len(args) >= 2:
+            results.append((args[0], args[1]))
+    return results
+
+
+def _resolve_expr(expr: str, defines: dict[str, int]) -> Optional[int]:
+    """Resolve a C expression to an integer using the given defines dict."""
+    expr = expr.strip()
+    try:
+        return int(expr, 0)
+    except ValueError:
+        pass
+    if re.match(r'^[A-Za-z_]\w*$', expr):
+        return defines.get(expr)
+    subbed = re.sub(
+        r'\b([A-Za-z_]\w*)\b',
+        lambda m, d=defines: str(d[m.group(0)]) if m.group(0) in d else m.group(0),
+        expr
+    )
+    return _safe_eval(subbed)
+
+
+def tool_vram_audit() -> str:
+    """Detect VRAM tile index conflicts between background and sprite tile loads."""
+    c_files = sorted(Path("src").glob("*.c")) if Path("src").exists() else []
+    if not c_files:
+        c_files = sorted(Path(".").glob("*.c"))
+    if not c_files:
+        return "✗ No .c source files found."
+
+    # Build defines dict from all project source and asset headers so _TILE_COUNT
+    # values are resolvable even if cpp can't find all includes.
+    def_files = (
+        [str(p) for p in Path("src").glob("*.[ch]")] +
+        ([str(p) for p in Path("assets").glob("*.h")] if Path("assets").exists() else [])
+    )
+    defines = _extract_project_defines(def_files)
+
+    bkg_ranges: list[tuple[int, int, str]] = []
+    spr_ranges: list[tuple[int, int, str]] = []
+    unresolved: list[str] = []
+    seen: set[tuple[str, int, int]] = set()
+
+    for src in c_files:
+        expanded = _cpp_expand(str(src))
+        if not expanded:
+            return (f"✗ cpp preprocessing failed for {src}. "
+                    f"Ensure cpp is installed (Xcode Command Line Tools) and GBDK_HOME is set.")
+
+        for first_s, count_s in _extract_call_args(expanded, "set_bkg_data"):
+            first = _resolve_expr(first_s, defines)
+            count = _resolve_expr(count_s, defines)
+            key = ("bkg", first, count)
+            if first is not None and count is not None and count > 0 and key not in seen:
+                seen.add(key)
+                bkg_ranges.append((first, first + count - 1, src.name))
+            elif first is not None and key not in seen:
+                seen.add(("bkg_u", first, -1))
+                unresolved.append(f"set_bkg_data({first_s}, {count_s}, ...) — count unresolved")
+
+        for first_s, count_s in _extract_call_args(expanded, "set_sprite_data"):
+            first = _resolve_expr(first_s, defines)
+            count = _resolve_expr(count_s, defines)
+            key = ("spr", first, count)
+            if first is not None and count is not None and count > 0 and key not in seen:
+                seen.add(key)
+                spr_ranges.append((first, first + count - 1, src.name))
+            elif first is not None and key not in seen:
+                seen.add(("spr_u", first, -1))
+                unresolved.append(f"set_sprite_data({first_s}, {count_s}, ...) — count unresolved")
+
+    if not bkg_ranges and not spr_ranges:
+        return "No set_bkg_data or set_sprite_data calls with resolvable indices found."
+
+    lines = ["VRAM tile index audit:"]
+
+    if bkg_ranges:
+        lines.append("\nBackground (set_bkg_data):")
+        for first, last, loc in sorted(bkg_ranges):
+            lines.append(f"  tiles [{first}–{last}]  ({last - first + 1} tiles)  {loc}")
+
+    if spr_ranges:
+        lines.append("\nSprites (set_sprite_data):")
+        for first, last, loc in sorted(spr_ranges):
+            lines.append(f"  tiles [{first}–{last}]  ({last - first + 1} tiles)  {loc}")
+
+    if unresolved:
+        lines.append("\nUnresolved (dynamic indices — verify manually):")
+        for u in unresolved:
+            lines.append(f"  {u}")
+
+    conflicts = []
+    for b0, b1, _ in bkg_ranges:
+        for s0, s1, _ in spr_ranges:
+            o0, o1 = max(b0, s0), min(b1, s1)
+            if o0 <= o1:
+                conflicts.append(
+                    f"  ⚠️  bkg[{b0}–{b1}] overlaps sprite[{s0}–{s1}] at indices {o0}–{o1}"
+                )
+
+    if conflicts:
+        bkg_max = max(last for _, last, _ in bkg_ranges)
+        lines.append("\nConflicts detected:")
+        lines.extend(conflicts)
+        lines.append(f"\nFix: move all set_sprite_data() calls to start at index {bkg_max + 1} or higher.")
+    elif bkg_ranges and spr_ranges:
+        bkg_max = max(last for _, last, _ in bkg_ranges)
+        spr_min = min(first for first, _, _ in spr_ranges)
+        lines.append(f"\n✓ No conflicts — background ends at {bkg_max}, sprites start at {spr_min}.")
+    else:
+        lines.append("\n✓ No conflicts detected.")
+
+    return "\n".join(lines)
+
 
 def _format_build_result(errors: list, raw: str, cmd: str) -> str:
     if errors:
@@ -407,6 +926,16 @@ def execute_tool(name: str, args: dict,
         if name == "Build":
             result = tool_build()
             return result, result.startswith("✗")
+        if name == "TileConvert":
+            result = tool_tile_convert(**args)
+            return result, result.startswith("✗")
+        if name == "RomUsage":
+            return tool_rom_usage(), False
+        if name == "Symbols":
+            return tool_symbols(**args), False
+        if name == "VramAudit":
+            result = tool_vram_audit()
+            return result, ("⚠️" in result or result.startswith("✗"))
         return f"Unknown tool: {name}", True
     except TypeError as e:
         return f"Bad arguments for {name}: {e}", True
@@ -439,10 +968,19 @@ def run_build() -> tuple[bool, list[dict], str]:
     passed = result.returncode == 0 and len(errors) == 0
     return passed, errors, raw
 
-def parse_errors(output: str) -> list[dict]:
-    """Parse TypeScript compiler and ESLint errors from build output."""
-    errors = []
+def _dedup_errors(errors: list[dict]) -> list[dict]:
+    seen, unique = set(), []
+    for e in errors:
+        key = (e["file"], e.get("line", 0), e["code"])
+        if key not in seen:
+            seen.add(key)
+            unique.append(e)
+    return unique
 
+
+def _parse_errors_ts(output: str) -> list[dict]:
+    """Parse TypeScript compiler and ESLint errors."""
+    errors = []
     # TypeScript: src/App.tsx(21,26): error TS2749: message
     for m in re.finditer(
         r"([^\s(]+)\((\d+),\d+\):\s+error\s+(TS\d+):\s+(.+)", output
@@ -451,7 +989,6 @@ def parse_errors(output: str) -> list[dict]:
             "file": m.group(1), "line": int(m.group(2)),
             "code": m.group(3), "message": m.group(4).strip()
         })
-
     # ESLint: /path/file.tsx:84:5: Error: message (rule/name)
     for m in re.finditer(
         r"([^\s:]+\.(?:tsx?|jsx?|js|ts))\s*:(\d+):\d+:\s+Error:\s+(.+?)\s+\(([^)]+)\)", output
@@ -460,7 +997,6 @@ def parse_errors(output: str) -> list[dict]:
             "file": m.group(1), "line": int(m.group(2)),
             "code": m.group(4), "message": m.group(3).strip()
         })
-
     # esbuild/Vite: /path/file.tsx:42:1: error: message
     for m in re.finditer(
         r"([^\s:]+\.(?:tsx?|jsx?)):(\d+):\d+:\s+error:\s+(.+)", output
@@ -469,15 +1005,45 @@ def parse_errors(output: str) -> list[dict]:
             "file": m.group(1), "line": int(m.group(2)),
             "code": "ESBUILD", "message": m.group(3).strip()
         })
+    return _dedup_errors(errors)
 
-    # Deduplicate by (file, line, code)
-    seen, unique = set(), []
-    for e in errors:
-        key = (e["file"], e.get("line", 0), e["code"])
-        if key not in seen:
-            seen.add(key)
-            unique.append(e)
-    return unique
+
+def _parse_errors_c(output: str) -> list[dict]:
+    """Parse SDCC and GCC errors from make output."""
+    errors = []
+    # SDCC: src/main.c:42: error 20: Undefined identifier 'foo'
+    # SDCC: src/main.c:42: error: message  (no numeric code variant)
+    for m in re.finditer(
+        r"([^\s:]+\.(?:c|h)):(\d+):\s+error(?:\s+\d+)?:\s+(.+)", output
+    ):
+        errors.append({
+            "file": m.group(1), "line": int(m.group(2)),
+            "code": "SDCC", "message": m.group(3).strip()
+        })
+    # GCC-style (lcc passes these through): src/main.c:42:5: error: message
+    for m in re.finditer(
+        r"([^\s:]+\.(?:c|h)):(\d+):\d+:\s+error:\s+(.+)", output
+    ):
+        errors.append({
+            "file": m.group(1), "line": int(m.group(2)),
+            "code": "GCC", "message": m.group(3).strip()
+        })
+    # Linker errors: ?ASlink-Error-Undefined Global
+    for m in re.finditer(
+        r"\?ASlink-Error-(.+)", output
+    ):
+        errors.append({
+            "file": "linker", "line": 0,
+            "code": "LINK", "message": m.group(1).strip()
+        })
+    return _dedup_errors(errors)
+
+
+def parse_errors(output: str) -> list[dict]:
+    """Parse build errors — dispatches to the right parser based on PROFILE."""
+    if PROFILE == "gameboy-c":
+        return _parse_errors_c(output)
+    return _parse_errors_ts(output)
 
 def get_changed_line_count() -> int:
     """Count lines changed since last commit."""
@@ -613,14 +1179,28 @@ def call_ollama(messages: list, model: str,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=600) as resp:
-            data = json.loads(resp.read())
-        return data["choices"][0]["message"], data.get("usage", {})
-    except urllib.error.URLError as e:
-        print(f"❌ Ollama connection failed: {e}", file=sys.stderr)
-        print(f"   ollama serve && ollama pull {model}", file=sys.stderr)
-        sys.exit(1)
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=OLLAMA_TIMEOUT) as resp:
+                data = json.loads(resp.read())
+            return data["choices"][0]["message"], data.get("usage", {})
+        except urllib.error.URLError as e:
+            if attempt == 0:
+                # Likely context overflow — compress and retry once
+                print(f"⚠️  Ollama connection dropped (attempt 1): {e}", file=sys.stderr)
+                print("   Compressing context and retrying…", file=sys.stderr)
+                compressed = compress_old_reads(messages)
+                payload["messages"] = compressed
+                req = urllib.request.Request(
+                    f"{OLLAMA_HOST}/v1/chat/completions",
+                    data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+            else:
+                print(f"❌ Ollama connection failed after retry: {e}", file=sys.stderr)
+                print(f"   ollama serve && ollama pull {model}", file=sys.stderr)
+                sys.exit(1)
 
 # ── Agent loop ─────────────────────────────────────────────────────────────────
 
@@ -861,6 +1441,12 @@ def repair_loop(request: str, messages: list, model: str,
 
 def build_repo_map() -> str:
     """Build a compact symbol index of the project for upfront context."""
+    if PROFILE == "gameboy-c":
+        return _build_repo_map_c()
+    return _build_repo_map_ts()
+
+
+def _build_repo_map_ts() -> str:
     try:
         result = subprocess.run(
             r"""find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) \
@@ -872,9 +1458,8 @@ def build_repo_map() -> str:
         files = [f for f in result.stdout.strip().splitlines() if f]
         if not files:
             return ""
-
         lines = []
-        for fp in files[:60]:          # cap at 60 files
+        for fp in files[:60]:
             content = Path(fp).read_text(errors="replace")
             exports = []
             for m in re.finditer(
@@ -886,6 +1471,42 @@ def build_repo_map() -> str:
                 exports.append(m.group(1))
             if exports:
                 lines.append(f"{fp[2:]}: {', '.join(exports[:8])}")
+        return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def _build_repo_map_c() -> str:
+    try:
+        result = subprocess.run(
+            r"""find . -type f \( -name "*.c" -o -name "*.h" \) \
+                -not -path "*/.git/*" -not -path "*/.claude/*" \
+                -not -path "*/build/*" | sort | head -100""",
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        files = [f for f in result.stdout.strip().splitlines() if f]
+        if not files:
+            return ""
+        fn_re = re.compile(
+            r"^(?!#|//|\s*/?\*)(?:[a-zA-Z_][a-zA-Z0-9_\s*]+?)\s+"
+            r"([a-zA-Z_]\w*)\s*\([^)]*\)\s*(?:NONBANKED|BANKED)?\s*[{;]",
+            re.MULTILINE
+        )
+        lines = []
+        for fp in files[:60]:
+            content = Path(fp).read_text(errors="replace")
+            fns = [m.group(1) for m in fn_re.finditer(content)
+                   if m.group(1) not in ("if", "while", "for", "switch", "return")]
+            if fns:
+                lines.append(f"{fp[2:]}: {', '.join(dict.fromkeys(fns[:8]))}")
+
+        # Append resolved project-level numeric constants (tile indices, counts, states)
+        src_files = [f for f in files if "assets" not in f and "build" not in f]
+        defines = _extract_project_defines(src_files[:20])
+        if defines:
+            const_str = ", ".join(f"{k}={v}" for k, v in sorted(defines.items())[:30])
+            lines.append(f"\nProject constants: {const_str}")
+
         return "\n".join(lines)
     except Exception:
         return ""

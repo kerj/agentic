@@ -10,10 +10,19 @@ import pathlib
 import random
 import re
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Literal, NotRequired, TypedDict, cast
+
+# Lang profile — optional import so job_queue can be used standalone
+try:
+    sys.path.insert(0, str(pathlib.Path(__file__).parent))
+    from lang_profile import detect_profile as _detect_profile, load_profile as _load_profile
+except Exception:
+    def _detect_profile(repo: str) -> str: return "typescript"  # type: ignore[misc]
+    def _load_profile(name: str) -> dict[str, Any]: return {}    # type: ignore[misc]
 
 # ── Domain types ───────────────────────────────────────────────────────────────
 
@@ -51,6 +60,8 @@ class Job(TypedDict):
     summary: str | None
     job_type: NotRequired[str]               # "review" for review jobs
     reviews: NotRequired[list[ReviewEntry]]  # SHA entries appended by each review job
+    profile: NotRequired[str]               # language profile name, e.g. "typescript"
+    profile_display: NotRequired[str]       # human label, e.g. "TypeScript / React"
     _state: NotRequired[str]                 # injected by find_job, not on disk
     session: NotRequired[SessionData | None] # injected by get_job_detail
 
@@ -205,6 +216,8 @@ def submit_job(request: str, repo: str, priority: int, model_hint: str, after: s
         "model_hint": model_hint, "priority": priority,
         "base_branch": base_branch,
         "parent_request_id": after or None,
+        "profile": (_pname := _detect_profile(repo)),
+        "profile_display": _load_profile(_pname).get("display", _pname),
         "submitted_at": now_iso, "submitted_by": submitted_by,
         "state_history": [{"state": "pending", "at": now_iso}],
         "summary": None,
@@ -664,6 +677,16 @@ def get_diff(job_id: str) -> str:
     return diff
 
 
+def _activity_profile(job_id: str) -> dict[str, Any]:
+    """Return the activity sub-section of the job's language profile."""
+    try:
+        job, _ = find_job(job_id)
+        profile = _load_profile(job.get("profile") or "typescript")
+        return profile.get("activity", {})
+    except Exception:
+        return {}
+
+
 def get_agent_activity(job_id: str) -> AgentActivity:
     """Parse agent JSONL log into rich activity data."""
     # Check persistent cache first — survives worktree cleanup after accept/reject
@@ -752,15 +775,20 @@ def get_agent_activity(job_id: str) -> AgentActivity:
             output_tokens += usage.get("output_tokens", 0)
 
     # Detect key command outcomes from Bash and dedicated Build tool calls
+    ap            = _activity_profile(job_id)
+    build_cmds    = ap.get("build_commands", ["npm run build", "yarn build", "pnpm build", "vite build", "tsc"])
+    lint_cmds     = ap.get("lint_commands",  ["npm run lint", "yarn lint", "eslint", "prettier"])
+    err_pattern   = ap.get("error_file_pattern", r"([^\s(]+\.[tj]sx?)\(\d+,\d+\):\s+error")
+
     build_result = lint_result = None
     for tc in tool_calls:
         if tc["name"] == "Build":
             build_result = "passed" if tc["success"] else "failed"
         elif tc["name"] == "Bash":
             cmd = (tc["input"].get("command") or "").strip()
-            if any(x in cmd for x in ("npm run build", "yarn build", "pnpm build", "vite build", "tsc")):
+            if any(x in cmd for x in build_cmds):
                 build_result = "passed" if tc["success"] else "failed"
-            elif any(x in cmd for x in ("npm run lint", "yarn lint", "eslint", "prettier")):
+            elif any(x in cmd for x in lint_cmds):
                 lint_result = "passed" if tc["success"] else "failed"
 
     build_error_files: set[str] = set()
@@ -770,8 +798,8 @@ def get_agent_activity(job_id: str) -> AgentActivity:
         if tc["name"] not in ("Build", "Bash"):
             continue
         cmd = (tc["input"].get("command") or "").strip()
-        if tc["name"] == "Build" or any(x in cmd for x in ("npm run build", "yarn build", "pnpm build", "vite build", "tsc")):
-            for m in re.finditer(r"([^\s(]+\.[tj]sx?)\(\d+,\d+\):\s+error", tc.get("output", "")):
+        if tc["name"] == "Build" or any(x in cmd for x in build_cmds):
+            for m in re.finditer(err_pattern, tc.get("output", "")):
                 build_error_files.add(m.group(1))
 
     return cast(AgentActivityData, {

@@ -8,6 +8,7 @@ AGENTIC_HOME="${AGENTIC_HOME:-$HOME/.agentic}"
 source "$AGENTIC_HOME/lib/config.sh"
 source "$AGENTIC_HOME/lib/utils.sh"
 source "$AGENTIC_HOME/lib/init.sh"
+source "$AGENTIC_HOME/lib/claude-api.sh"
 source "$AGENTIC_HOME/lib/doc.sh"
 source "$AGENTIC_HOME/lib/apply.sh"
 source "$AGENTIC_HOME/lib/plan.sh"
@@ -215,6 +216,10 @@ case "${1:-}" in
     local _wparent_id
     _wparent_id=$(jq -r '.parent_request_id // empty' "$_wjob_path")
 
+    # Export profile so utils.sh, apply.sh, and other sourced scripts can read it
+    export AGENTIC_PROFILE
+    AGENTIC_PROFILE=$(jq -r '.profile // "typescript"' "$_wjob_path")
+
     # Review jobs commit onto the root (non-review) job's branch — resolve it by
     # walking up parent_request_id until we find a non-review job.
     # Reviews-of-reviews all land on agentic/<root-job-id>, same as direct reviews.
@@ -281,6 +286,20 @@ case "${1:-}" in
         queue_complete "$_wjob_path" "failed" "worktree creation failed"
         _queue_notify "agentic: failed" "Job $_wid — worktree creation failed"
         exit 1
+      fi
+    fi
+
+    # When chaining, merge the repo's main branch so commits made to main after the
+    # parent job branched (e.g. assets, CLAUDE.md updates) are visible in this worktree.
+    if [[ -n "$_wparent_id" && -n "$_wnew_branch" ]]; then
+      local _wmain
+      _wmain=$(jq -r '.base_branch // empty' "$_wjob_path")
+      [[ -z "$_wmain" ]] && _wmain=$(git -C "$_wtarget" symbolic-ref --short HEAD 2>/dev/null || echo "master")
+      if [[ "$_wbase_branch" != "$_wmain" ]] && \
+         git -C "$_wtarget" show-ref --verify --quiet "refs/heads/${_wmain}" 2>/dev/null; then
+        if git -C "$_wworktree" merge --no-edit --no-ff "$_wmain" -m "Merge ${_wmain} into chain" 2>/dev/null; then
+          echo "🔀 Merged ${_wmain} into chain (new commits since parent branched)"
+        fi
       fi
     fi
 
