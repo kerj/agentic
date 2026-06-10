@@ -1325,33 +1325,55 @@ def compress_content(content: str, file_path: str) -> str:
         return content
     return "\n".join(lines[:10]) + f"\n... ({len(lines)} lines) [use Read for full content]"
 
+def _read_targets(messages: list) -> dict[str, str]:
+    """Map each tool_call_id to the file_path of its Read call, for pairing a
+    'tool' result message back to the file it read."""
+    targets: dict[str, str] = {}
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls", []):
+            if tc.get("function", {}).get("name") == "Read":
+                try:
+                    fp = json.loads(tc["function"].get("arguments", "{}")).get("file_path", "")
+                    if fp:
+                        targets[tc["id"]] = fp
+                except Exception:
+                    pass
+    return targets
+
 def compress_old_reads(messages: list, keep_recent: int = KEEP_RECENT_TURNS) -> list:
     """
-    For Read tool results older than keep_recent messages, replace full file
-    content with a compressed symbol map. Keeps the model's working memory
-    focused without losing type information.
+    Shrink the model's working memory without losing what it needs:
+    1. Collapse OLDER duplicate Reads of the same file to a one-line stub — the
+       'read a section, read it again' pattern accumulates many full copies of
+       the same file; only the most recent copy is kept verbatim.
+    2. Replace the remaining Read results older than keep_recent with a compressed
+       symbol map.
+    Reads within the recent window (the model's active context) are untouched.
     """
-    cutoff = max(0, len(messages) - keep_recent)
-    pending: dict[str, str] = {}   # tool_call_id -> file_path
-    compressed = []
+    cutoff  = max(0, len(messages) - keep_recent)
+    targets = _read_targets(messages)
 
+    # Pass 1 — find, for each file, the index of its LAST 'tool' read result, so
+    # earlier reads of the same file can be superseded.
+    last_read_idx: dict[str, int] = {}
     for i, msg in enumerate(messages):
-        role = msg.get("role", "")
-        if role == "assistant":
-            for tc in msg.get("tool_calls", []):
-                fn = tc.get("function", {})
-                if fn.get("name") == "Read":
-                    try:
-                        fp = json.loads(fn.get("arguments", "{}")).get("file_path", "")
-                        pending[tc["id"]] = fp
-                    except Exception:
-                        pass
-        if (role == "tool" and i < cutoff):
-            uid = msg.get("tool_call_id", "")
-            fp  = pending.get(uid, "")
+        if msg.get("role") == "tool":
+            fp = targets.get(msg.get("tool_call_id", ""))
             if fp:
-                raw = msg.get("content", "")
-                msg = {**msg, "content": compress_content(raw, fp)}
+                last_read_idx[fp] = i
+
+    compressed = []
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "tool":
+            fp = targets.get(msg.get("tool_call_id", ""))
+            if fp:
+                if i < last_read_idx.get(fp, i) and i < cutoff:
+                    # An older duplicate read of a file that's read again later.
+                    msg = {**msg, "content": f"[superseded by a later Read of {fp}]"}
+                elif i < cutoff:
+                    msg = {**msg, "content": compress_content(msg.get("content", ""), fp)}
         compressed.append(msg)
 
     return compressed
@@ -1365,13 +1387,24 @@ def maybe_compress(messages: list, real_prompt_tokens: int = 0) -> list:
     push past the real window between checks.
     """
     used = max(estimate_tokens(messages), real_prompt_tokens)
-    if used > CONTEXT_BUDGET - COMPRESS_MARGIN:
+    if used <= CONTEXT_BUDGET - COMPRESS_MARGIN:
+        return messages
+
+    before = estimate_tokens(messages)
+    compressed = compress_old_reads(messages)
+    after = estimate_tokens(compressed)
+
+    # Only announce when compression actually freed space. Everything over budget
+    # may be within the recent window (nothing old to compress) — in that case
+    # stay silent and proceed rather than spamming a no-op marker every turn.
+    saved = before - after
+    if saved > 200:
+        amt = f"~{saved // 1000}k" if saved >= 1000 else f"~{saved}"
         emit({"type": "assistant", "message": {"content": [{
             "type": "text",
-            "text": "[Context compressed: old file reads replaced with symbol maps]"
+            "text": f"[Context compressed: freed {amt} tokens from old file reads]"
         }]}})
-        return compress_old_reads(messages)
-    return messages
+    return compressed
 
 # ── JSONL event emitter ────────────────────────────────────────────────────────
 
