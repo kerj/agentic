@@ -73,7 +73,7 @@ _switch_to_anthropic() {
 
   cat > "$CONF" << EOF
 # ── Anthropic ──────────────────────────────────────────────────────────────
-export AGENTIC_MODEL="claude-opus-4-20250514"
+export AGENTIC_MODEL="claude-opus-4-8"
 export ANTHROPIC_BASE_URL="https://api.anthropic.com"
 export ANTHROPIC_API_KEY="$existing_key"
 unset ANTHROPIC_AUTH_TOKEN
@@ -83,7 +83,7 @@ export OLLAMA_KEEP_ALIVE="30m"
 EOF
 
   chmod 600 "$CONF"
-  echo "✅ Switched to Anthropic (claude-opus-4-20250514)"
+  echo "✅ Switched to Anthropic (claude-opus-4-8)"
   echo "   Run: source \$AGENTIC_HOME/.agentic.conf"
 }
 
