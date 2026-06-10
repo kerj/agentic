@@ -1605,7 +1605,7 @@ function renderPage(job, activity, chain, diff) {
 
     // ── Anomaly banner: prominent "something's fishy" indicator ──
     if (act.is_flagged && (act.risk_flags||[]).length) {
-      const labels = {network:'🌐 network', exfil:'🌐 network', destructive:'💥 destructive', sensitive_read:'🔑 secret read', oob_write:'📤 out-of-project write'};
+      const labels = {network:'🌐 network', exfil:'🌐 network', destructive:'💥 destructive', sensitive_read:'🔑 secret read', oob:'📤 out-of-project access', oob_write:'📤 out-of-project write'};
       const seen = [...new Set(act.risk_flags.map(f => labels[f.risk_class] || f.risk_class))];
       html += `<div style="margin-bottom:16px;padding:12px 14px;background:#3d1416;border:1px solid #f85149;border-radius:6px">
         <div style="font-size:13px;font-weight:700;color:#ff7b72;display:flex;align-items:center;gap:8px">

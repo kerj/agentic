@@ -6,7 +6,7 @@ model to judge itself:
      it (stubbed bodies, suppression tokens on the error line, deleted tests),
      so the repair loop can revert them instead of converging on deletion.
   2. Security (injection): classify a tool call's command/path into a risk_class
-     (network/exfil/sensitive_read/oob_write/destructive) so the dashboard can
+     (network/exfil/sensitive_read/oob/destructive) so the dashboard can
      flag a hijacked agent for the human who gates the merge.
 
 Single source of truth for the risk-token sets, imported by both ollama_worker
@@ -70,21 +70,24 @@ def command_risk(command: str) -> Optional[str]:
 def path_risk(file_path: str, sandbox_root: Optional[str] = None) -> Optional[str]:
     """Classify a file path touched by a tool call.
 
-    'oob_write' if it resolves outside sandbox_root (when given); else
-    'sensitive_read' if it matches a known-secret pattern; else None.
+    A known-secret name (.ssh, .agentic.conf, credentials, ...) is the most
+    informative signal and wins regardless of location → 'sensitive_read'.
+    Otherwise, if a sandbox_root is given and the path resolves OUTSIDE it,
+    that's an out-of-bounds access → 'oob'. A path inside the worktree (the
+    agent's normal case) is None — not flagged.
     """
     if not file_path:
         return None
+    if _SENSITIVE_PATH_RE.search(file_path):
+        return "sensitive_read"
     if sandbox_root:
         try:
             target = os.path.realpath(file_path)
             root = os.path.realpath(sandbox_root)
             if os.path.commonpath([root, target]) != root:
-                return "oob_write"
+                return "oob"
         except (ValueError, OSError):
-            return "oob_write"
-    if _SENSITIVE_PATH_RE.search(file_path):
-        return "sensitive_read"
+            return "oob"
     return None
 
 

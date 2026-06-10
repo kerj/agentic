@@ -842,6 +842,13 @@ def get_agent_activity(job_id: str) -> AgentActivity:
     # out-of-tree write) so the dashboard can flag it for the human who gates the
     # merge. Layers 1-2 in the worker already BLOCK these live; this is the
     # catch-the-rest backstop and the "something's fishy" indicator for the user.
+    # The agent reads/writes via ABSOLUTE worktree paths by design, so "absolute
+    # path" is not suspicious — only a path that resolves OUTSIDE the worktree, or
+    # matches a known-secret name, is. path_risk does the realpath/commonpath
+    # containment when we can resolve the worktree; if it's been cleaned up
+    # (post-accept), we fall back to the secret-name check only (no false flags).
+    wt = WORKTREES_DIR / job_id
+    sandbox = str(wt) if wt.exists() else None
     risk_flags: list[dict[str, str]] = []
     for tc in tool_calls:
         rc = None
@@ -850,9 +857,7 @@ def get_agent_activity(job_id: str) -> AgentActivity:
             detail = (tc["input"].get("command") or "")[:200]
         elif tc["name"] in ("Write", "Edit", "Read"):
             fp = tc["input"].get("file_path") or ""
-            rc = _path_risk(fp)
-            if rc is None and (fp.startswith("/") or ".." in fp):
-                rc = "oob_write" if tc["name"] in ("Write", "Edit") else "sensitive_read"
+            rc = _path_risk(fp, sandbox)
             detail = fp[:200]
         else:
             detail = ""
