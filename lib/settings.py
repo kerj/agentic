@@ -6,10 +6,13 @@ Two files under AGENTIC_HOME:
                           serve to the browser.
   secrets.json   (0600) — API key / provider auth, NEVER sent to the browser.
 
-Resolution order per knob: built-in default → settings.json → explicit env var
-(env wins, so an exported AGENTIC_* still overrides — backward compatible with
-the old .conf/.zshrc flow). With both files absent the defaults are a runnable
-local-mode config, so a fresh install lands on a working UI to configure from.
+Resolution order per knob: built-in default → env var → settings.json. The UI
+(settings.json) is authoritative — a knob you set in the panel overrides any
+leftover AGENTIC_* env var, so "configure in the UI" actually takes effect. The
+env var is only a fallback that seeds a value for a key the UI hasn't set yet
+(keeps a fresh / pre-migration setup working). With both files absent the
+defaults are a runnable local-mode config, so a fresh install lands on a working
+UI to configure from.
 
 Pure stdlib. Imported by ollama_worker (reads knobs fresh per job) and serve
 (GET/POST endpoints). The schema is the single source of truth — the UI gets its
@@ -198,13 +201,17 @@ def load() -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, spec in SCHEMA.items():
         val = spec["default"]
-        if key in stored:
-            c = _coerce(spec, stored[key])
-            if c is not _INVALID:
-                val = _clamp(spec, c)
+        # env is a FALLBACK (seeds a value for a key not yet set in the UI)...
         env = os.environ.get(spec["env"])
         if env is not None and env != "":
             c = _coerce(spec, env)
+            if c is not _INVALID:
+                val = _clamp(spec, c)
+        # ...and settings.json (the UI) is AUTHORITATIVE — a knob set in the panel
+        # overrides any leftover legacy AGENTIC_* env var, so "configure in the UI"
+        # actually takes effect.
+        if key in stored:
+            c = _coerce(spec, stored[key])
             if c is not _INVALID:
                 val = _clamp(spec, c)
         out[key] = val

@@ -88,8 +88,8 @@ export ANTHROPIC_API_KEY="$AGENTIC_API_KEY"
 # Unset AUTH_TOKEN for Anthropic API (prevents conflicts)
 unset ANTHROPIC_AUTH_TOKEN
 
-export OLLAMA_MAX_LOADED_MODELS=$OLLAMA_MAX_LOADED_MODELS
-export OLLAMA_KEEP_ALIVE="$OLLAMA_KEEP_ALIVE"
+# Behavior knobs (ollama options, context budget, etc.) live in settings.json
+# and are configured from the UI — not exported here.
 CONFIG
   else
     # Ollama/Local config
@@ -105,8 +105,8 @@ export ANTHROPIC_AUTH_TOKEN="$AGENTIC_AUTH_TOKEN"
 # Unset API_KEY for Ollama (not needed)
 unset ANTHROPIC_API_KEY
 
-export OLLAMA_MAX_LOADED_MODELS=$OLLAMA_MAX_LOADED_MODELS
-export OLLAMA_KEEP_ALIVE="$OLLAMA_KEEP_ALIVE"
+# Behavior knobs (ollama options, context budget, etc.) live in settings.json
+# and are configured from the UI — not exported here.
 CONFIG
   fi
   
@@ -121,11 +121,9 @@ function load_agentic_config() {
   if [[ -f "$AGENTIC_CONF" ]]; then
     source "$AGENTIC_CONF"
   else
-    # Export defaults (Ollama)
+    # Export auth defaults only (Ollama). Behavior knobs come from settings.json.
     export ANTHROPIC_AUTH_TOKEN="$AGENTIC_AUTH_TOKEN"
     export ANTHROPIC_BASE_URL="$AGENTIC_BASE_URL"
-    export OLLAMA_MAX_LOADED_MODELS
-    export OLLAMA_KEEP_ALIVE
   fi
 }
 
