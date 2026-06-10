@@ -88,6 +88,23 @@ for raw_line in sys.stdin:
                     print(f"     {l}", flush=True)
         _last_tool = None
 
+    # ── Live progress (running tokens + context size) ─────────────────────────
+    # Emitted on a sentinel line (leading SOH) so the dashboard can route it to a
+    # live header counter instead of the log body. A human reading the terminal
+    # just sees a compact one-liner.
+    elif t == "progress":
+        tok = ev.get("tokens", {})
+        ctx = ev.get("ctx", {})
+        payload = json.dumps({
+            "input":  tok.get("input", 0),
+            "output": tok.get("output", 0),
+            "ctx_used":   ctx.get("used", 0),
+            "ctx_budget": ctx.get("budget", 0),
+        })
+        # Leading newline guarantees the sentinel is its own line — assistant text
+        # is printed with end="" so without it the sentinel glues onto prior text.
+        print(f"\n\x01PROGRESS {payload}", flush=True)
+
     # ── Final usage summary ───────────────────────────────────────────────────
     elif t == "result":
         usage = ev.get("usage", {})

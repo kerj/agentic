@@ -398,6 +398,7 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
   <div id="log-header">
     <div class="dot pulse" id="log-dot" style="background:#f0883e"></div>
     <span id="log-title">Worker output</span>
+    <span id="log-tokens" style="margin-left:auto;font-weight:400;font-size:12px;color:#8b949e;font-variant-numeric:tabular-nums;display:none"></span>
     <button id="log-collapse" title="Collapse">⌄</button>
     <button id="log-close" onclick="closeLog()">×</button>
   </div>
@@ -862,10 +863,22 @@ function runWorker(loop = false) {
   _syncDrawerWithLog(true);
   document.getElementById('log-dot').style.background = '#f0883e';
   document.getElementById('log-title').textContent = 'Worker running…';
+  { const tk = document.getElementById('log-tokens'); if (tk) { tk.textContent = ''; tk.style.display = 'none'; } }
 
   workerEs = new EventSource('/api/worker-stream');
   workerEs.onmessage = e => {
     const msg = JSON.parse(e.data);
+    // Live token counter — updates the header in place, never the log body.
+    if (msg.progress) {
+      const p = msg.progress;
+      const k = n => n >= 1000 ? (n/1000).toFixed(1).replace(/\.0$/,'') + 'k' : String(n);
+      const el = document.getElementById('log-tokens');
+      let txt = '🔢 ' + (p.input||0).toLocaleString() + ' in / ' + (p.output||0).toLocaleString() + ' out';
+      if (p.ctx_budget) txt += ' · ctx ' + k(p.ctx_used||0) + '/' + k(p.ctx_budget);
+      el.textContent = txt;
+      el.style.display = '';
+      return;
+    }
     if (msg.replayed) {
       appendLog('── reconnected — replaying missed output ──', '');
     }
@@ -2141,6 +2154,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 snapshot = _worker_log[cursor:]
                 done_rc  = _worker_rc
             for line in snapshot:
+                # Live progress sentinel (from stream_parser) → structured event
+                # for the header counter, NOT a log line.
+                if line.startswith("\x01PROGRESS "):
+                    try:
+                        prog = json.loads(line[len("\x01PROGRESS "):])
+                    except Exception:
+                        prog = None
+                    if prog is not None and not _send({"progress": prog}):
+                        return
+                    continue
                 if not _send({"line": line}):
                     return  # browser disconnected — worker keeps running
             cursor += len(snapshot)

@@ -1378,6 +1378,21 @@ def maybe_compress(messages: list, real_prompt_tokens: int = 0) -> list:
 def emit(event: dict) -> None:
     print(json.dumps(event), flush=True)
 
+# Job-wide running token totals. run_agent_loop is invoked multiple times per job
+# (main loop + each repair round) and its local total_in/out reset each call, so
+# the LIVE counter accumulates here instead — it only ever climbs across the job.
+_session_in = 0
+_session_out = 0
+
+def emit_progress(ctx_tokens: int) -> None:
+    """Emit a live progress event each turn so the dashboard can show running
+    token usage and the current context size vs the compression budget."""
+    emit({
+        "type": "progress",
+        "tokens": {"input": _session_in, "output": _session_out},
+        "ctx": {"used": ctx_tokens, "budget": CONTEXT_BUDGET},
+    })
+
 # ── Ollama API ─────────────────────────────────────────────────────────────────
 
 def call_ollama(messages: list, model: str,
@@ -1430,6 +1445,7 @@ def run_agent_loop(messages: list, model: str, tools: list,
     last_read_path = None  # detect re-reading the same file without acting on it
     same_read_count = 0
 
+    global _session_in, _session_out
     last_prompt_tokens = 0  # ground-truth window size from Ollama's last response
     for _ in range(max_turns):
         messages = maybe_compress(messages, last_prompt_tokens)
@@ -1437,6 +1453,11 @@ def run_agent_loop(messages: list, model: str, tools: list,
         last_prompt_tokens = usage.get("prompt_tokens", 0)
         total_in  += last_prompt_tokens
         total_out += usage.get("completion_tokens", 0)
+        # Live progress for the dashboard: job-wide running totals + current
+        # context size (the live window vs the compression budget).
+        _session_in  += last_prompt_tokens
+        _session_out += usage.get("completion_tokens", 0)
+        emit_progress(last_prompt_tokens)
 
         if msg.get("content"):
             emit({"type": "assistant", "message": {
