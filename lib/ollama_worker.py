@@ -27,6 +27,10 @@ import urllib.error
 from pathlib import Path
 from typing import Optional
 
+from diff_guard import (
+    NET_BINS, DESTRUCTIVE_BINS, command_risk, scan_diff, repair_cheat_reason,
+)
+
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 OLLAMA_HOST   = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -63,15 +67,11 @@ PROFILE           = os.environ.get("AGENTIC_PROFILE", "typescript")
 # AGENTIC_TARGET_REPO, which is the separate original repo. Captured at import.
 SANDBOX_ROOT = os.path.realpath(os.environ.get("AGENTIC_SANDBOX_ROOT", os.getcwd()))
 
-# Commands that can move data off the box (the exfil channel). Code tasks need
-# no outbound network; dependency installs go through tool_setup, not Bash.
-_NET_BINS = frozenset({
-    "curl", "wget", "nc", "ncat", "netcat", "socat", "telnet",
-    "ssh", "scp", "sftp", "rsync", "ftp", "tftp",
-})
-# Destructive primitives. The old denylist was 4 raw substrings; this matches on
-# normalized command tokens so "rm  -rf" / "rm -fr" / "/bin/rm" cannot slip past.
-_DESTRUCTIVE_BINS = frozenset({"rm", "shred", "dd", "mkfs", "killall", "pkill", "rmdir"})
+# Network/destructive command sets live in diff_guard (single source of truth,
+# shared with the dashboard's post-hoc risk classifier). Aliased here for the
+# live Bash gate below.
+_NET_BINS = NET_BINS
+_DESTRUCTIVE_BINS = DESTRUCTIVE_BINS
 
 
 def _within_sandbox(file_path: str) -> bool:
@@ -1210,8 +1210,37 @@ def save_checkpoint() -> str:
     return "stash" if "Saved" in r.stdout else ""
 
 def restore_checkpoint(ref: str) -> None:
-    if ref:
-        subprocess.run("git stash pop", shell=True, capture_output=True)
+    """Pop the checkpoint stash, merging prior agent work back with whatever is
+    currently in the worktree. On a merge conflict (round edits overlap prior
+    work), keep the worktree version (the more recent fix) and drop the stash so
+    we never leave a conflicted tree or a leaked stash."""
+    if not ref:
+        return
+    r = subprocess.run("git stash pop", shell=True, capture_output=True, text=True)
+    if r.returncode != 0 and "conflict" in (r.stdout + r.stderr).lower():
+        # Resolve in favor of the current worktree, then clear the now-applied stash.
+        subprocess.run("git checkout --theirs -- . 2>/dev/null || git checkout -- .",
+                       shell=True, capture_output=True)
+        subprocess.run("git reset -q", shell=True, capture_output=True)
+        subprocess.run("git stash drop", shell=True, capture_output=True)
+
+def diff_since_commit() -> str:
+    """Unified diff of the working tree vs HEAD — what the agent has changed so
+    far this job (used by the cheat check; the repair checkpoint stash is popped
+    back before each verify, so the round's edits are present in the worktree)."""
+    r = subprocess.run(
+        "git -c core.quotepath=false diff --unified=3 HEAD",
+        shell=True, capture_output=True, text=True
+    )
+    return r.stdout or ""
+
+def _discard_round_edits() -> None:
+    """Throw away the current repair round's working-tree edits (the round ran on
+    top of a clean HEAD because save_checkpoint stashed prior work away), so the
+    following restore_checkpoint pop cleanly reinstates prior work without the
+    bad edits. Tracked changes are reset; round-created files are removed."""
+    subprocess.run("git checkout -- .", shell=True, capture_output=True)
+    subprocess.run("git clean -fdq", shell=True, capture_output=True)
 
 # ── Context compression ────────────────────────────────────────────────────────
 
@@ -1621,36 +1650,53 @@ def repair_loop(request: str, messages: list, model: str,
                 messages, model, TOOLS_REPAIR, max_turns=8, locked_files=None
             )
 
-        # Verify
+        # Verify. The checkpoint stash holds the agent's PRIOR work, so right now
+        # the worktree is (clean HEAD + this round's edits) — `git diff HEAD`
+        # isolates exactly what this round changed, which the cheat check needs.
         passed, new_errors, _ = run_build()
         new_count = len(new_errors)
+        round_diff = diff_since_commit()
+        error_locs = {(e["file"], int(e.get("line", 0))) for e in real_errors}
+        cheat = repair_cheat_reason(scan_diff(round_diff, error_locs)) if passed else None
 
-        if passed:
+        if passed and not cheat:
             emit({"type": "assistant", "message": {"content": [{
                 "type": "text", "text": "✅ Build passing after repair."
             }]}})
-            if checkpoint:
-                subprocess.run("git stash drop", shell=True, capture_output=True)
+            # Keep the round's edits AND restore the prior work (merge), then drop
+            # nothing — pop already removed the stash. (Previously this `drop`ped
+            # the stash, silently discarding all pre-repair agent work.)
+            restore_checkpoint(checkpoint)
             return True, messages, total_in, total_out
 
-        if new_count > prev_count:
-            # Regression — revert and escalate
+        if cheat:
+            # Build went green by silencing/stubbing the error rather than fixing
+            # it. Treat as a regression: discard the round's edits, restore prior
+            # work, and escalate to a different strategy.
+            emit({"type": "assistant", "message": {"content": [{
+                "type": "text",
+                "text": f"⚠️  Repair cheated — {cheat}. Reverting and trying a different approach."
+            }]}})
+            _discard_round_edits()
+            restore_checkpoint(checkpoint)
+            strategy = min(strategy + 1, len(REPAIR_STRATEGIES) - 1)
+        elif new_count > prev_count:
+            # Regression — discard the round's bad edits, restore prior work, escalate
             emit({"type": "assistant", "message": {"content": [{
                 "type": "text",
                 "text": f"⚠️  Repair introduced new errors ({prev_count} → {new_count}). Reverting."
             }]}})
+            _discard_round_edits()
             restore_checkpoint(checkpoint)
             strategy = min(strategy + 1, len(REPAIR_STRATEGIES) - 1)
         elif new_count == prev_count:
-            # No progress — escalate
+            # No progress — keep the round's edits, merge prior work back, escalate
+            restore_checkpoint(checkpoint)
             strategy = min(strategy + 1, len(REPAIR_STRATEGIES) - 1)
-            if checkpoint:
-                subprocess.run("git stash drop", shell=True, capture_output=True)
         else:
-            # Progress — continue with same strategy, drop checkpoint
+            # Progress — keep the round's edits, merge prior work back, same strategy
+            restore_checkpoint(checkpoint)
             strategy = max(0, strategy - 1)
-            if checkpoint:
-                subprocess.run("git stash drop", shell=True, capture_output=True)
 
         errors = new_errors
 
@@ -1732,6 +1778,16 @@ def _build_repo_map_c() -> str:
 
 
 def run(request: str, model: str, system_prompt: str) -> int:
+    # Baseline-pin: probe the untouched tree first so the final gate asks "did
+    # the agent make the build WORSE", not "is it green". A repo that was already
+    # broken at base shouldn't be blamed on the agent, and a green baseline lets
+    # us trust that a post-edit failure is the agent's doing.
+    base_passed, base_errors, _ = run_build()
+    emit({"type": "assistant", "message": {"content": [{
+        "type": "text",
+        "text": (f"── Baseline build: {'passing' if base_passed else f'already failing ({len(base_errors)} error(s))'} ──")
+    }]}})
+
     # Inject repo map as first user turn so model starts with project overview
     repo_map = build_repo_map()
     worktree = os.getcwd()  # bash commands and file ops run here
@@ -1773,12 +1829,34 @@ def run(request: str, model: str, system_prompt: str) -> int:
             "type": "text", "text": "✅ Build passed."
         }]}})
     else:
-        emit({"type": "assistant", "message": {"content": [{
-            "type": "text",
-            "text": f"❌ Build failed ({len(errors)} error(s)). Entering surgical repair loop."
-        }]}})
-        passed, messages, in2, out2 = repair_loop(request, messages, model, errors)
-        in1 += in2; out1 += out2
+        # Only hold the agent responsible for errors it INTRODUCED. If the repo
+        # was already failing at baseline, pre-existing errors aren't the agent's
+        # job to fix — repair only the net-new ones so a broken base doesn't trap
+        # the loop or fail an otherwise-correct change.
+        if not base_passed:
+            base_keys = {(e["file"], e.get("line", 0), e.get("code", "")) for e in base_errors}
+            new_errors = [e for e in errors if (e["file"], e.get("line", 0), e.get("code", "")) not in base_keys]
+            if not new_errors:
+                emit({"type": "assistant", "message": {"content": [{
+                    "type": "text",
+                    "text": (f"⚠️  Build still failing, but all {len(errors)} error(s) pre-existed at baseline — "
+                             f"the agent introduced none. Treating as no regression.")
+                }]}})
+                passed = True
+            else:
+                emit({"type": "assistant", "message": {"content": [{
+                    "type": "text",
+                    "text": f"❌ Agent introduced {len(new_errors)} new error(s). Entering surgical repair loop."
+                }]}})
+                passed, messages, in2, out2 = repair_loop(request, messages, model, new_errors)
+                in1 += in2; out1 += out2
+        else:
+            emit({"type": "assistant", "message": {"content": [{
+                "type": "text",
+                "text": f"❌ Build failed ({len(errors)} error(s)). Entering surgical repair loop."
+            }]}})
+            passed, messages, in2, out2 = repair_loop(request, messages, model, errors)
+            in1 += in2; out1 += out2
 
     # Phase 3: Ensure commit
     status = subprocess.run(

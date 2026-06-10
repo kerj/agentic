@@ -24,12 +24,21 @@ except Exception:
     def _detect_profile(repo: str) -> str: return "typescript"  # type: ignore[misc]
     def _load_profile(name: str) -> dict[str, Any]: return {}    # type: ignore[misc]
 
+# Risk classifier shared with the worker's live Bash gate — optional so the
+# queue still works if the module is absent.
+try:
+    from diff_guard import command_risk as _command_risk, path_risk as _path_risk
+except Exception:
+    def _command_risk(command: str) -> str | None: return None    # type: ignore[misc]
+    def _path_risk(file_path: str, sandbox_root: str | None = None) -> str | None: return None  # type: ignore[misc]
+
 # ── Domain types ───────────────────────────────────────────────────────────────
 
 class StateHistoryEntry(TypedDict):
     state: str
     at: str
     manual: NotRequired[bool]
+    risk_acknowledged: NotRequired[bool]  # set when a flagged job is merged after review
 
 class SessionData(TypedDict, total=False):
     """Parsed Claude session artifacts — only present after get_job_detail()."""
@@ -70,6 +79,7 @@ class ToolCall(TypedDict):
     input: dict[str, Any]   # shape varies per tool
     output: str
     success: bool
+    risk_class: NotRequired[str | None]  # network|destructive|sensitive_read|oob_write, set post-hoc
 
 class AgentActivityUnavailable(TypedDict):
     available: Literal[False]
@@ -90,6 +100,8 @@ class AgentActivityData(TypedDict):
     input_tokens: int
     output_tokens: int
     total_tokens: int
+    risk_flags: list[dict[str, str]]  # [{risk_class, tool, detail}] — suspicious actions for review
+    is_flagged: bool                  # true if any tool call looked suspicious ("something's fishy")
 
 AgentActivity = AgentActivityUnavailable | AgentActivityError | AgentActivityData
 
@@ -320,11 +332,31 @@ def cancel_job(job_id: str) -> None:
     f.unlink()
 
 
-def accept_job(job_id: str) -> str:
-    """Merge agentic/<id> into base_branch in target_repo, then remove worktree."""
+def accept_job(job_id: str, acknowledge_risk: bool = False) -> str:
+    """Merge agentic/<id> into base_branch in target_repo, then remove worktree.
+
+    If the job's activity contains flagged actions (network/exfil/sensitive read/
+    out-of-tree write — a possible prompt-injection hijack), refuse to merge until
+    the reviewer explicitly acknowledges, so a tainted diff can't be rubber-stamped.
+    """
     job, f = find_job(job_id, states=["done"])
     target      = job["target_repo"]
     wt          = WORKTREES_DIR / job_id
+
+    # Anomaly gate — block silent acceptance of a flagged (possibly hijacked) job.
+    if not acknowledge_risk:
+        try:
+            activity = get_agent_activity(job_id)
+        except Exception:
+            activity = {}  # never let the gate's own failure block a clean merge
+        flags = activity.get("risk_flags") if isinstance(activity, dict) else None
+        if flags:
+            classes = sorted({fl["risk_class"] for fl in flags})
+            raise RuntimeError(
+                f"This job took {len(flags)} notable action(s) ({', '.join(classes)}) that may "
+                f"indicate a prompt-injection hijack. Review the flagged actions, then accept "
+                f"again with acknowledgement to merge."
+            )
 
     # All review jobs (including reviews-of-reviews) commit onto the root non-review job's branch
     is_review   = job.get("job_type") == "review"
@@ -372,7 +404,10 @@ def accept_job(job_id: str) -> str:
 
     now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     job.pop("_state", None)
-    job.setdefault("state_history", []).append({"state": "merged", "at": now})
+    merged_entry: dict[str, Any] = {"state": "merged", "at": now}
+    if acknowledge_risk:
+        merged_entry["risk_acknowledged"] = True  # audit trail for a flagged merge
+    job.setdefault("state_history", []).append(merged_entry)
     (QUEUE_DIR / "merged" / f.name).write_text(json.dumps(job, indent=2))
     f.unlink()
 
@@ -802,6 +837,29 @@ def get_agent_activity(job_id: str) -> AgentActivity:
             for m in re.finditer(err_pattern, tc.get("output", "")):
                 build_error_files.add(m.group(1))
 
+    # Post-hoc anomaly classification: tag any tool call whose command or path
+    # looks like a hijacked agent (network egress, secret read, destructive cmd,
+    # out-of-tree write) so the dashboard can flag it for the human who gates the
+    # merge. Layers 1-2 in the worker already BLOCK these live; this is the
+    # catch-the-rest backstop and the "something's fishy" indicator for the user.
+    risk_flags: list[dict[str, str]] = []
+    for tc in tool_calls:
+        rc = None
+        if tc["name"] == "Bash":
+            rc = _command_risk((tc["input"].get("command") or ""))
+            detail = (tc["input"].get("command") or "")[:200]
+        elif tc["name"] in ("Write", "Edit", "Read"):
+            fp = tc["input"].get("file_path") or ""
+            rc = _path_risk(fp)
+            if rc is None and (fp.startswith("/") or ".." in fp):
+                rc = "oob_write" if tc["name"] in ("Write", "Edit") else "sensitive_read"
+            detail = fp[:200]
+        else:
+            detail = ""
+        tc["risk_class"] = rc
+        if rc:
+            risk_flags.append({"risk_class": rc, "tool": tc["name"], "detail": detail})
+
     return cast(AgentActivityData, {
         "available":         True,
         "files_modified":    sorted(files_modified),
@@ -814,6 +872,8 @@ def get_agent_activity(job_id: str) -> AgentActivity:
         "input_tokens":      input_tokens,
         "output_tokens":     output_tokens,
         "total_tokens":      input_tokens + output_tokens,
+        "risk_flags":        risk_flags,
+        "is_flagged":        bool(risk_flags),
     })
 
 

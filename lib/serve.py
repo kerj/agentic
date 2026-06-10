@@ -805,12 +805,18 @@ async function acceptChain(id) {
   } else toast('Error: ' + (d.error || 'unknown'), 'error');
 }
 
-async function acceptJob(id) {
-  if (!confirm('Merge agentic/' + id + ' into its base branch?')) return;
-  const r = await fetch('/api/accept', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+async function acceptJob(id, acknowledge) {
+  if (!acknowledge && !confirm('Merge agentic/' + id + ' into its base branch?')) return;
+  const r = await fetch('/api/accept', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id, acknowledge: !!acknowledge})});
   const d = await r.json();
-  if (d.ok) { toast('Accepted ' + id + ' → ' + (d.message || ''), 'success'); fetchJobs(); }
-  else toast('Accept failed: ' + (d.error || 'unknown'), 'error');
+  if (d.ok) { toast('Accepted ' + id + ' → ' + (d.message || ''), 'success'); fetchJobs(); return; }
+  if ((d.error || '').includes('notable action')) {
+    if (confirm('⚠️ ' + d.error + '\\n\\nOpen the job to review the flagged actions. Merge anyway?')) {
+      return acceptJob(id, true);
+    }
+    return;
+  }
+  toast('Accept failed: ' + (d.error || 'unknown'), 'error');
 }
 
 async function rejectJob(id) {
@@ -1516,12 +1522,20 @@ function relTime(iso) {
   return Math.floor(d/86400) + 'd ago';
 }
 
-async function acceptJob(id) {
-  if (!confirm('Merge agentic/' + id + ' into the target repo\'s current branch?')) return;
-  const r = await fetch('/api/accept', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});
+async function acceptJob(id, acknowledge) {
+  if (!acknowledge && !confirm('Merge agentic/' + id + ' into the target repo\'s current branch?')) return;
+  const r = await fetch('/api/accept', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id, acknowledge: !!acknowledge})});
   const d = await r.json();
-  if (d.ok) { toast('Accepted ' + id, 'success'); setTimeout(() => { _notifyParent(); }, 1200); }
-  else toast('Accept failed: ' + (d.error || 'unknown'), 'error');
+  if (d.ok) { toast('Accepted ' + id, 'success'); setTimeout(() => { _notifyParent(); }, 1200); return; }
+  // Flagged job: accept_job refused pending acknowledgement. Surface the reason
+  // and let the reviewer explicitly acknowledge after inspecting the banner above.
+  if ((d.error || '').includes('notable action')) {
+    if (confirm('⚠️ ' + d.error + '\\n\\nYou have reviewed the flagged actions in the Agent Activity panel and want to merge anyway?')) {
+      return acceptJob(id, true);
+    }
+    return;
+  }
+  toast('Accept failed: ' + (d.error || 'unknown'), 'error');
 }
 
 async function rejectJob(id) {
@@ -1588,6 +1602,22 @@ function renderPage(job, activity, chain, diff) {
   if (activity && activity.available) {
     const act = activity;
     html += `<div class="card" id="activity-card"><h2>Agent Activity</h2>`;
+
+    // ── Anomaly banner: prominent "something's fishy" indicator ──
+    if (act.is_flagged && (act.risk_flags||[]).length) {
+      const labels = {network:'🌐 network', exfil:'🌐 network', destructive:'💥 destructive', sensitive_read:'🔑 secret read', oob_write:'📤 out-of-project write'};
+      const seen = [...new Set(act.risk_flags.map(f => labels[f.risk_class] || f.risk_class))];
+      html += `<div style="margin-bottom:16px;padding:12px 14px;background:#3d1416;border:1px solid #f85149;border-radius:6px">
+        <div style="font-size:13px;font-weight:700;color:#ff7b72;display:flex;align-items:center;gap:8px">
+          ⚠️ ${act.risk_flags.length} notable action(s) flagged — review before merging</div>
+        <div style="font-size:11px;color:#f0a0a0;margin-top:6px">This agent took actions that can indicate a prompt-injection hijack: ${seen.join(', ')}. Inspect them below; merging requires acknowledgement.</div>
+        <div style="margin-top:8px">`;
+      act.risk_flags.forEach(f => {
+        html += `<div style="font-size:11px;color:#e6edf3;padding:4px 8px;background:#010409;border-radius:4px;margin-top:4px;font-family:monospace">
+          <span style="color:#ff7b72">[${escHtml(f.risk_class)}]</span> ${escHtml(f.tool)}: ${escHtml((f.detail||'').slice(0,160))}</div>`;
+      });
+      html += `</div></div>`;
+    }
 
     // Stats row
     html += `<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px;padding:12px;background:#010409;border-radius:6px;border:1px solid #21262d">`;
@@ -1692,10 +1722,13 @@ function renderPage(job, activity, chain, diff) {
       cmds.forEach(tc => {
         const cmd = (tc.input.command||'').trim().slice(0, 150);
         const ok  = tc.success;
+        const risk = tc.risk_class;
+        const riskBadge = risk ? `<span style="font-size:10px;font-weight:700;color:#fff;background:#da3633;padding:1px 6px;border-radius:8px;white-space:nowrap">⚠ ${escHtml(risk)}</span>` : '';
         html += `<div style="margin-bottom:6px">
-          <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:#010409;border-radius:4px;border-left:3px solid ${ok?'#3fb950':'#f85149'}">
+          <div style="display:flex;align-items:center;gap:8px;padding:6px 10px;background:#010409;border-radius:4px;border-left:3px solid ${risk?'#da3633':(ok?'#3fb950':'#f85149')}">
             <span style="font-size:12px">${ok?'✓':'✗'}</span>
-            <code style="font-size:12px;color:#e6edf3;word-break:break-all">$ ${escHtml(cmd)}</code>
+            <code style="font-size:12px;color:#e6edf3;word-break:break-all;flex:1">$ ${escHtml(cmd)}</code>
+            ${riskBadge}
           </div>
           ${!ok && tc.output ? `<details style="margin-top:4px"><summary style="font-size:11px;color:#f85149;cursor:pointer;padding-left:10px">Show error output</summary><pre style="margin-top:4px;max-height:200px;overflow-y:auto;font-size:11px">${escHtml(tc.output.slice(0,2000))}</pre></details>` : ''}
         </div>`;
@@ -2225,11 +2258,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _api_accept(self) -> None:
         try:
-            job_id = str(self._read_body().get("id", "")).strip()
+            body   = self._read_body()
+            job_id = str(body.get("id", "")).strip()
             if not job_id:
                 self._send_json({"ok": False, "error": "id required"}, 400)
                 return
-            msg = accept_job(job_id)
+            msg = accept_job(job_id, acknowledge_risk=bool(body.get("acknowledge")))
             self._send_json({"ok": True, "message": msg})
         except (ValueError, RuntimeError) as exc:
             self._send_json({"ok": False, "error": str(exc)}, 400)
