@@ -1334,10 +1334,10 @@ let _settingsData = null;
 
 const SETTINGS_GROUPS = [
   ['mode',    'Mode & project'],
-  ['context', 'Context & loop'],
-  ['model',   'Model & Ollama'],
-  ['caps',    'Tool output caps'],
-  ['timeout', 'Job timeout'],
+  ['context', 'Local model · context & loop'],
+  ['model',   'Local model · model & Ollama'],
+  ['caps',    'Local model · tool output caps'],
+  ['timeout', 'Local model · job timeout'],
 ];
 
 function openSettings() {
@@ -1356,9 +1356,13 @@ function renderSettings(d) {
   const byKey = {};
   d.schema.forEach(s => byKey[s.key] = s);
   let html = '';
-  SETTINGS_GROUPS.forEach(([gid, gname]) => {
+  SETTINGS_GROUPS.forEach(([gid, gname], i) => {
     const rows = d.schema.filter(s => s.group === gid);
     if (!rows.length) return;
+    // A one-line note before the first local-only section clarifies scope.
+    if (gid === 'context') {
+      html += `<div style="margin:6px 0 14px;padding:8px 10px;background:#010409;border:1px solid #21262d;border-radius:6px;font-size:11px;color:#6e7681">The settings below apply to <b style="color:#8b949e">local mode</b> (Ollama) jobs. Cloud mode uses the Claude API and the key above.</div>`;
+    }
     html += `<div style="margin-bottom:18px"><div style="font-size:11px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px">${escHtml(gname)}</div>`;
     rows.forEach(s => { html += settingControl(s, d); });
     html += `</div>`;
@@ -1414,9 +1418,18 @@ function saveSettings() {
   document.getElementById('settings-status').textContent = 'Saving…';
   fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({settings: updates})})
     .then(r => r.json()).then(d => {
-      if (d.ok) { _settingsData.schema.forEach(s => { if (d.settings[s.key]!==undefined) s.value = d.settings[s.key]; });
-                  document.getElementById('settings-status').textContent = '✓ Saved — applies to the next job'; }
-      else document.getElementById('settings-status').textContent = 'Error: ' + (d.error||'unknown');
+      if (!d.ok) { document.getElementById('settings-status').textContent = 'Error: ' + (d.error||'unknown'); return; }
+      _settingsData.schema.forEach(s => { if (d.settings[s.key]!==undefined) s.value = d.settings[s.key]; });
+      // Mode is baked into the page (IS_LOCAL gates the badge, model list, submit
+      // field, which model API to call). If it changed, reload so the whole UI
+      // reflects the new mode instead of looking unchanged until a manual reload.
+      const nowLocal = d.settings.mode === 'local';
+      if (nowLocal !== IS_LOCAL) {
+        document.getElementById('settings-status').textContent = '✓ Switched to ' + d.settings.mode + ' mode — reloading…';
+        setTimeout(() => location.reload(), 700);
+      } else {
+        document.getElementById('settings-status').textContent = '✓ Saved — applies to the next job';
+      }
     }).catch(() => document.getElementById('settings-status').textContent = 'Save failed');
 }
 
