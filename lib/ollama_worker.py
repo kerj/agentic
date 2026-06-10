@@ -34,27 +34,24 @@ from diff_guard import (
 # ── Configuration ──────────────────────────────────────────────────────────────
 
 OLLAMA_HOST   = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-MODEL         = os.environ.get("AGENTIC_LOCAL_MODEL", "qwen2.5-coder:32b")
 AGENTIC_HOME  = Path(os.environ.get("AGENTIC_HOME", Path.home() / ".agentic"))
-MAX_TURNS         = int(os.environ.get("AGENTIC_MAX_TURNS", "60"))
 MAX_REPAIR_ROUNDS = 5
-# Context budget before compression kicks in.
-# Most local models have a 32K token window — default to 24K to leave headroom
-# for tool definitions and the model's response. Override via AGENTIC_CONTEXT_BUDGET.
-CONTEXT_BUDGET    = int(os.environ.get("AGENTIC_CONTEXT_BUDGET", "24000"))
-KEEP_RECENT_TURNS = int(os.environ.get("AGENTIC_KEEP_RECENT_TURNS", "15"))
-# Compress a bit before the budget so a fresh tool result can't push past the
-# real window between checks. estimate_tokens is a lower bound, so leave margin.
-COMPRESS_MARGIN   = int(os.environ.get("AGENTIC_COMPRESS_MARGIN", "4000"))
-# A single tool result must never flood the window. Files above READ_MAX_LINES
-# are head-truncated with a marker telling the model to Read a line range.
-READ_MAX_LINES    = int(os.environ.get("AGENTIC_READ_MAX_LINES", "400"))
-BASH_MAX_CHARS    = int(os.environ.get("AGENTIC_BASH_MAX_CHARS", "4000"))
-GREP_MAX_CHARS    = int(os.environ.get("AGENTIC_GREP_MAX_CHARS", "4000"))
-# Per-request HTTP timeout in seconds. Large local models can take a long time
-# to generate a response — set high and just kill the job if you get impatient.
-OLLAMA_TIMEOUT    = int(os.environ.get("AGENTIC_OLLAMA_TIMEOUT", "1800"))
 PROFILE           = os.environ.get("AGENTIC_PROFILE", "typescript")
+
+# Behavior knobs come from settings.py (default → settings.json → env override),
+# resolved fresh here at worker startup — and the worker is a fresh subprocess per
+# job, so a change saved in the UI applies to the next job with no restart.
+import settings as _settings
+_cfg = _settings.load()
+MODEL             = _cfg["local_model"]
+MAX_TURNS         = _cfg["max_turns"]
+CONTEXT_BUDGET    = _cfg["context_budget"]
+KEEP_RECENT_TURNS = _cfg["keep_recent_turns"]
+COMPRESS_MARGIN   = _cfg["compress_margin"]
+READ_MAX_LINES    = _cfg["read_max_lines"]
+BASH_MAX_CHARS    = _cfg["bash_max_chars"]
+GREP_MAX_CHARS    = _cfg["grep_max_chars"]
+OLLAMA_TIMEOUT    = _cfg["ollama_timeout"]
 
 # ── Sandbox / injection containment ─────────────────────────────────────────────
 # The worker is autonomous and reads untrusted repo content, so a prompt

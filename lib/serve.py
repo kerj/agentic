@@ -23,6 +23,7 @@ from job_queue import (
     get_diff, get_agent_activity, fetch_models, get_ollama_models,
     get_job_chain, get_job_detail, get_job_full, get_repos,
 )
+import settings as _settings
 
 # ── Worker state (global, guarded by _worker_lock) ────────────────────────────
 
@@ -339,8 +340,24 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
   <button id="run-btn" onclick="runWorker(false)">▶ Run Worker</button>
   <button id="run-all-btn" onclick="runWorker(true)" style="background:#1f4391;color:#88b4ff;padding:6px 14px;border-radius:6px;border:none;cursor:pointer;font-size:13px;font-weight:500;margin-left:4px;">▶▶ Run All</button>
   <button id="stop-btn" onclick="stopWorker()" style="display:none;background:#6d2120;color:#f47067;padding:6px 14px;border-radius:6px;border:1px solid #6d2120;cursor:pointer;font-size:13px;font-weight:500;margin-left:4px;">■ Stop</button>
+  <button id="settings-btn" onclick="openSettings()" title="Settings" style="display:none;background:none;border:1px solid #21262d;color:#8b949e;padding:6px 10px;border-radius:6px;cursor:pointer;font-size:14px;margin-left:4px;">⚙</button>
   <span id="age">loading…</span>
 </header>
+
+<div id="settings-overlay" onclick="if(event.target===this)closeSettings()" style="display:none;position:fixed;inset:0;background:rgba(1,4,9,.7);z-index:200;align-items:flex-start;justify-content:center;overflow-y:auto;padding:40px 16px">
+  <div style="background:#0d1117;border:1px solid #21262d;border-radius:10px;width:100%;max-width:560px;box-shadow:0 16px 48px rgba(0,0,0,.5)">
+    <div style="display:flex;align-items:center;gap:8px;padding:14px 18px;border-bottom:1px solid #21262d">
+      <span style="font-size:15px;font-weight:600;color:#e6edf3">⚙ Local model settings</span>
+      <span id="settings-applies" style="margin-left:auto;font-size:11px;color:#6e7681">applies to the next job — no restart</span>
+      <button onclick="closeSettings()" style="background:none;border:none;color:#8b949e;cursor:pointer;font-size:18px;line-height:1">×</button>
+    </div>
+    <div id="settings-body" style="padding:16px 18px;max-height:70vh;overflow-y:auto"></div>
+    <div style="display:flex;align-items:center;gap:10px;padding:12px 18px;border-top:1px solid #21262d">
+      <span id="settings-status" style="font-size:12px;color:#8b949e"></span>
+      <button onclick="saveSettings()" style="margin-left:auto;background:#1f6feb;color:#fff;border:none;padding:7px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500">Save</button>
+    </div>
+  </div>
+</div>
 
 <div class="container">
   <div class="card">
@@ -1310,6 +1327,104 @@ if (IS_LOCAL) {
   }).catch(() => {});
 }
 
+// ── Settings panel (local mode only) ──
+if (IS_LOCAL) document.getElementById('settings-btn').style.display = '';
+let _settingsData = null;
+
+const SETTINGS_GROUPS = [
+  ['context', 'Context & loop'],
+  ['model',   'Model & Ollama'],
+  ['caps',    'Tool output caps'],
+  ['timeout', 'Job timeout'],
+];
+
+function openSettings() {
+  document.getElementById('settings-overlay').style.display = 'flex';
+  document.getElementById('settings-body').innerHTML = '<div style="color:#8b949e;font-size:13px">Loading…</div>';
+  document.getElementById('settings-status').textContent = '';
+  fetch('/api/settings').then(r => r.json()).then(d => {
+    if (!d.ok) { document.getElementById('settings-body').textContent = 'Error: ' + (d.error||'unknown'); return; }
+    _settingsData = d;
+    renderSettings(d);
+  }).catch(e => { document.getElementById('settings-body').textContent = 'Failed to load settings'; });
+}
+function closeSettings() { document.getElementById('settings-overlay').style.display = 'none'; }
+
+function renderSettings(d) {
+  const byKey = {};
+  d.schema.forEach(s => byKey[s.key] = s);
+  let html = '';
+  SETTINGS_GROUPS.forEach(([gid, gname]) => {
+    const rows = d.schema.filter(s => s.group === gid);
+    if (!rows.length) return;
+    html += `<div style="margin-bottom:18px"><div style="font-size:11px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px">${escHtml(gname)}</div>`;
+    rows.forEach(s => { html += settingControl(s, d); });
+    html += `</div>`;
+  });
+  // API key (secret) — shown as status, write-only
+  html += `<div style="margin-bottom:6px"><div style="font-size:11px;font-weight:600;color:#8b949e;text-transform:uppercase;letter-spacing:.05em;margin-bottom:10px">Anthropic API key (cloud mode)</div>
+    <div style="display:flex;align-items:center;gap:8px">
+      <input id="set-secret-key" type="password" placeholder="${d.secrets.anthropic_api_key ? '●●●●●●●● set — type to replace' : 'not set'}" style="flex:1;background:#010409;border:1px solid #21262d;color:#e6edf3;padding:6px 10px;border-radius:6px;font-size:12px">
+      <button onclick="saveSecret()" style="background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px">Set</button>
+    </div>
+    <div style="font-size:11px;color:#6e7681;margin-top:4px">Stored locally (0600), never shown again.</div></div>`;
+  document.getElementById('settings-body').innerHTML = html;
+}
+
+function settingControl(s, d) {
+  const help = `<div style="font-size:11px;color:#6e7681;margin-top:2px">${escHtml(s.help||'')}</div>`;
+  const label = `<label style="font-size:13px;color:#e6edf3;font-weight:500">${escHtml(s.label)}</label>`;
+  if (s.control === 'slider') {
+    // Cap the context-budget slider at the model's real window.
+    let max = s.max;
+    let note = '';
+    if (s.key === 'context_budget' && d.num_ctx) { max = d.num_ctx; note = ` <span style="color:#6e7681;font-weight:400">(model window: ${(d.num_ctx/1000).toFixed(0)}k)</span>`; }
+    return `<div style="margin-bottom:14px">
+      <div style="display:flex;align-items:baseline;gap:8px">${label}<span id="val-${s.key}" style="margin-left:auto;font-size:12px;color:#88b4ff;font-variant-numeric:tabular-nums">${s.value}</span>${note}</div>
+      <input type="range" id="set-${s.key}" min="${s.min}" max="${max}" step="${s.step}" value="${Math.min(s.value,max)}"
+             oninput="document.getElementById('val-${s.key}').textContent=this.value" style="width:100%;margin-top:6px">
+      ${help}</div>`;
+  }
+  if (s.control === 'select') {
+    const opts = (d.ollama_models||[]).map(m => `<option value="${escHtml(m)}"${m===s.value?' selected':''}>${escHtml(m)}</option>`).join('')
+      || `<option value="${escHtml(s.value)}" selected>${escHtml(s.value)}</option>`;
+    return `<div style="margin-bottom:14px">${label}<select id="set-${s.key}" style="width:100%;margin-top:6px;background:#010409;border:1px solid #21262d;color:#e6edf3;padding:6px 10px;border-radius:6px;font-size:13px">${opts}</select>${help}</div>`;
+  }
+  // number / text
+  const t = s.type === 'int' ? 'number' : 'text';
+  const bounds = s.type === 'int' && s.min!==undefined ? `min="${s.min}" max="${s.max}" step="${s.step||1}"` : '';
+  return `<div style="margin-bottom:14px;display:flex;align-items:center;gap:10px">
+    <div style="flex:1">${label}${help}</div>
+    <input type="${t}" id="set-${s.key}" value="${escHtml(String(s.value))}" ${bounds} style="width:110px;background:#010409;border:1px solid #21262d;color:#e6edf3;padding:6px 10px;border-radius:6px;font-size:13px;text-align:right"></div>`;
+}
+
+function saveSettings() {
+  if (!_settingsData) return;
+  const updates = {};
+  _settingsData.schema.forEach(s => {
+    const el = document.getElementById('set-' + s.key);
+    if (!el) return;
+    updates[s.key] = s.type === 'int' ? parseInt(el.value, 10) : el.value;
+  });
+  document.getElementById('settings-status').textContent = 'Saving…';
+  fetch('/api/settings', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({settings: updates})})
+    .then(r => r.json()).then(d => {
+      if (d.ok) { _settingsData.schema.forEach(s => { if (d.settings[s.key]!==undefined) s.value = d.settings[s.key]; });
+                  document.getElementById('settings-status').textContent = '✓ Saved — applies to the next job'; }
+      else document.getElementById('settings-status').textContent = 'Error: ' + (d.error||'unknown');
+    }).catch(() => document.getElementById('settings-status').textContent = 'Save failed');
+}
+
+function saveSecret() {
+  const v = document.getElementById('set-secret-key').value;
+  if (!v) return;
+  fetch('/api/secrets', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'ANTHROPIC_API_KEY', value:v})})
+    .then(r => r.json()).then(d => {
+      document.getElementById('settings-status').textContent = d.ok ? '✓ API key saved' : 'Error: ' + (d.error||'unknown');
+      if (d.ok) document.getElementById('set-secret-key').value = '';
+    }).catch(() => document.getElementById('settings-status').textContent = 'Failed to save key');
+}
+
 fetchRepos();
 fetchJobs();
 // Auto-attach log stream if a worker is already running when the page loads
@@ -1999,6 +2114,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(get_ollama_models() if LOCAL_MODE else [])
         elif self.path == "/api/models":
             self._send_json(fetch_models())
+        elif self.path == "/api/settings":
+            self._api_get_settings()
         elif self.path == "/api/worker-stream":
             self._api_worker_stream()
         elif self.path == "/api/worker-status":
@@ -2043,6 +2160,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._api_set_status()
         elif self.path == "/api/set-chain":
             self._api_set_chain()
+        elif self.path == "/api/settings":
+            self._api_save_settings()
+        elif self.path == "/api/secrets":
+            self._api_save_secret()
         else:
             self.send_error(404)
 
@@ -2304,6 +2425,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json({"ok": True, "message": msg})
         except (ValueError, RuntimeError) as exc:
             self._send_json({"ok": False, "error": str(exc)}, 400)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    def _api_get_settings(self) -> None:
+        """Schema + current values for the settings panel. Secrets are returned
+        as status booleans only — the key itself never crosses to the browser."""
+        try:
+            self._send_json({
+                "ok": True,
+                "schema": _settings.schema_for_ui(),
+                "num_ctx": _settings.model_num_ctx(),
+                "ollama_models": get_ollama_models() if LOCAL_MODE else [],
+                "secrets": _settings.secrets_status(),
+                "local_mode": LOCAL_MODE,
+            })
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    def _api_save_settings(self) -> None:
+        """Validate + persist knob updates (settings.save ignores unknown/secret
+        keys and clamps values). Applies to the next job — no restart."""
+        try:
+            body = self._read_body()
+            updates = body.get("settings", body)  # accept {settings:{...}} or bare {...}
+            if not isinstance(updates, dict):
+                self._send_json({"ok": False, "error": "settings must be an object"}, 400)
+                return
+            resolved = _settings.save(updates)
+            self._send_json({"ok": True, "settings": resolved})
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    def _api_save_secret(self) -> None:
+        """Set a secret write-only (e.g. the API key). Never echoed back."""
+        try:
+            body = self._read_body()
+            name  = str(body.get("name", "")).strip()
+            value = str(body.get("value", ""))
+            allowed = {"ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL"}
+            if name not in allowed:
+                self._send_json({"ok": False, "error": "unknown secret"}, 400)
+                return
+            _settings.set_secret(name, value)
+            self._send_json({"ok": True, "secrets": _settings.secrets_status()})
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 500)
 

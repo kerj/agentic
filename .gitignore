@@ -1,4 +1,6 @@
 .agentic.conf
+settings.json
+secrets.json
 .ds_store
 queue/
 worktrees/
