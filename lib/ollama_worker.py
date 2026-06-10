@@ -39,6 +39,14 @@ MAX_REPAIR_ROUNDS = 5
 # for tool definitions and the model's response. Override via AGENTIC_CONTEXT_BUDGET.
 CONTEXT_BUDGET    = int(os.environ.get("AGENTIC_CONTEXT_BUDGET", "24000"))
 KEEP_RECENT_TURNS = int(os.environ.get("AGENTIC_KEEP_RECENT_TURNS", "15"))
+# Compress a bit before the budget so a fresh tool result can't push past the
+# real window between checks. estimate_tokens is a lower bound, so leave margin.
+COMPRESS_MARGIN   = int(os.environ.get("AGENTIC_COMPRESS_MARGIN", "4000"))
+# A single tool result must never flood the window. Files above READ_MAX_LINES
+# are head-truncated with a marker telling the model to Read a line range.
+READ_MAX_LINES    = int(os.environ.get("AGENTIC_READ_MAX_LINES", "400"))
+BASH_MAX_CHARS    = int(os.environ.get("AGENTIC_BASH_MAX_CHARS", "4000"))
+GREP_MAX_CHARS    = int(os.environ.get("AGENTIC_GREP_MAX_CHARS", "4000"))
 # Per-request HTTP timeout in seconds. Large local models can take a long time
 # to generate a response — set high and just kill the job if you get impatient.
 OLLAMA_TIMEOUT    = int(os.environ.get("AGENTIC_OLLAMA_TIMEOUT", "1800"))
@@ -101,11 +109,17 @@ def _make_tools(write_enabled: bool = True) -> list[dict]:
             "type": "function",
             "function": {
                 "name": "Read",
-                "description": "Read the complete contents of a file. Always read a file before editing it.",
+                "description": ("Read a file's contents. Always read a file before editing it. "
+                                "Large files are truncated with a marker; if you see "
+                                "'... [N more lines ...]', call Read again with offset to "
+                                "continue, or offset+limit to read a specific range "
+                                "(e.g. around an error line)."),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "file_path": {"type": "string", "description": "Path to the file"}
+                        "file_path": {"type": "string", "description": "Path to the file"},
+                        "offset": {"type": "integer", "description": "1-based line to start at (optional)"},
+                        "limit": {"type": "integer", "description": "Max lines to return from offset (optional)"}
                     },
                     "required": ["file_path"]
                 }
@@ -336,14 +350,57 @@ TOOLS_REPAIR = _make_tools(write_enabled=False)   # Edit-only in repair mode
 
 # ── Tool implementations ────────────────────────────────────────────────────────
 
-def tool_read(file_path: str) -> str:
+# ── Output caps ────────────────────────────────────────────────────────────────
+# A small local model has a scarce window; one big tool result can shove its
+# working memory out. Cap here in code (deterministic) and ALWAYS leave a visible
+# marker so the model learns the output was cut and how to fetch the rest.
+
+def _cap_chars(text: str, limit: int, refine_hint: str) -> str:
+    """Keep head + tail around a budget, with a marker naming how much was dropped."""
+    if len(text) <= limit:
+        return text
+    head = limit * 3 // 4
+    tail = limit - head
+    dropped = len(text) - limit
+    return (
+        text[:head]
+        + f"\n\n... [{dropped} chars omitted — {refine_hint}] ...\n\n"
+        + text[-tail:]
+    )
+
+def tool_read(file_path: str, offset: int = 0, limit: int = 0) -> str:
     p = Path(file_path)
     if not p.exists():
         return f"Error: file not found: {file_path}"
     try:
-        return p.read_text(errors="replace")
+        lines = p.read_text(errors="replace").splitlines()
     except Exception as e:
         return f"Error reading {file_path}: {e}"
+    total = len(lines)
+
+    # Output is NOT line-numbered: the model copies text verbatim into Edit's
+    # old_string, and a "<n>\t" prefix would never match the real file. Line
+    # positions are surfaced only in the truncation markers, where they guide a
+    # follow-up range read without contaminating copyable content.
+
+    # Explicit line-range read (offset is 1-based; 0 means "from the start").
+    if offset or limit:
+        start = max(offset - 1, 0) if offset else 0
+        end = start + limit if limit else total
+        window = lines[start:end]
+        shown_to = start + len(window)
+        header = f"[lines {start + 1}-{shown_to} of {total}]\n"
+        suffix = "" if shown_to >= total else f"\n... [{total - shown_to} more lines — Read with offset={shown_to + 1}]"
+        return header + "\n".join(window) + suffix
+
+    # Whole-file read: keep small files verbatim; head-truncate large ones with a marker.
+    if total <= READ_MAX_LINES:
+        return "\n".join(lines)
+    return (
+        "\n".join(lines[:READ_MAX_LINES])
+        + f"\n... [{total - READ_MAX_LINES} more lines of {total} — Read with offset={READ_MAX_LINES + 1} "
+          f"to continue, or offset=<line> limit=<n> for a specific range]"
+    )
 
 def tool_edit(file_path: str, old_string: str, new_string: str) -> str:
     p = Path(file_path)
@@ -371,7 +428,15 @@ def tool_bash(command: str, description: str = "", timeout: int = 300000) -> str
             command, shell=True, capture_output=True, text=True,
             timeout=min(timeout / 1000, 600)
         )
-        out = result.stdout + result.stderr
+        # Label streams so the model can tell exit-0 warnings from real failures,
+        # and cap with a tail-preserving marker (errors/exit codes land at the end).
+        parts = []
+        if result.stdout:
+            parts.append(result.stdout if result.returncode == 0 else "STDOUT:\n" + result.stdout)
+        if result.stderr:
+            parts.append(("STDERR:\n" if result.returncode == 0 else "STDERR:\n") + result.stderr)
+        out = "\n".join(parts).strip()
+        out = _cap_chars(out, BASH_MAX_CHARS, "run a narrower command or read the relevant file")
         if result.returncode != 0:
             return f"Exit {result.returncode}\n{out}"
         return out or "(no output)"
@@ -382,14 +447,23 @@ def tool_bash(command: str, description: str = "", timeout: int = 300000) -> str
 
 def tool_glob(pattern: str, path: str = ".") -> str:
     matches = sorted(str(p) for p in Path(path).glob(pattern) if ".git" not in str(p))
-    return "\n".join(matches[:200]) if matches else f"No files matching {pattern}"
+    if not matches:
+        return f"No files matching {pattern}"
+    shown = matches[:200]
+    suffix = "" if len(matches) <= 200 else f"\n... [{len(matches) - 200} more matches — narrow the pattern]"
+    return "\n".join(shown) + suffix
 
 def tool_grep(pattern: str, path: str = ".", include: str = "") -> str:
     cmd = ["grep", "-rn", "--include", include or "*", pattern, path]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         out = result.stdout.strip()
-        return out[:4000] if out else f"No matches for '{pattern}'"
+        if not out:
+            return f"No matches for '{pattern}'"
+        # Was silently truncated before — now mark it so the model refines instead
+        # of assuming it saw every hit.
+        return _cap_chars(out, GREP_MAX_CHARS,
+                          f"narrow with include=\"*.ext\" or a more specific pattern")
     except Exception as e:
         return f"Error: {e}"
 
@@ -398,11 +472,13 @@ def tool_ls(path: str = ".") -> str:
     if not p.exists():
         return f"Error: path not found: {path}"
     entries = sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name))
-    lines = [
-        f"{'  ' if e.is_file() else '📁 '}{e.name}"
-        for e in entries[:100]
+    visible = [
+        e for e in entries
         if not (e.name.startswith(".") and e.name not in (".gitignore", ".prettierrc", ".eslintrc"))
     ]
+    lines = [f"{'  ' if e.is_file() else '📁 '}{e.name}" for e in visible[:100]]
+    if len(visible) > 100:
+        lines.append(f"... [{len(visible) - 100} more entries — use Glob with a pattern]")
     return "\n".join(lines) or "(empty)"
 
 def _detect_package_manager() -> tuple[str, str, str]:
@@ -1105,12 +1181,44 @@ def compress_css_to_selectors(content: str) -> str:
         return content if len(content) < 300 else content[:300] + "..."
     return "CSS selectors:\n" + "\n".join(selectors[:50]) + "\n\n[Compressed — use Read for full content]"
 
+# Function-definition matcher shared with _build_repo_map_c: a return type, a
+# name, a parameter list, optional GBDK banking attribute, then '{' or ';'.
+_C_FN_RE = re.compile(
+    r"^(?!#|//|\s*/?\*)(?:[a-zA-Z_][a-zA-Z0-9_\s*]+?)\s+"
+    r"[a-zA-Z_]\w*\s*\([^)]*\)\s*(?:NONBANKED|BANKED)?\s*[{;]",
+    re.MULTILINE
+)
+
+def compress_c_to_symbols(content: str) -> str:
+    """Reduce a C/H file to #defines + function signatures + banking attributes.
+
+    The old fallback kept only the first 10 lines — for C that is just #includes,
+    the least useful thing to retain. Banking attributes and #defines are exactly
+    what linker/VRAM-error diagnosis needs, so preserve those instead.
+    """
+    out = []
+    defines = re.findall(r"^#define\s+[A-Za-z_]\w*\s+[^\n\\]+", content, re.MULTILINE)
+    if defines:
+        out.extend(d.strip() for d in defines[:40])
+        out.append("")
+    sigs = [m.group(0).rstrip().rstrip("{").rstrip() for m in _C_FN_RE.finditer(content)]
+    # Drop control-flow false positives (if/while/for/switch read as "type name(...)").
+    sigs = [s for s in sigs if not re.search(r"\b(if|while|for|switch|return)\s*\($", s)]
+    if sigs:
+        out.extend(sigs[:60])
+    if not out:
+        lines = content.splitlines()
+        return content if len(lines) <= 15 else "\n".join(lines[:10]) + f"\n... ({len(lines)} lines)"
+    return "\n".join(out).strip() + "\n\n[Compressed — use Read for full content]"
+
 def compress_content(content: str, file_path: str) -> str:
     suffix = Path(file_path).suffix
     if suffix in (".ts", ".tsx", ".js", ".jsx"):
         return compress_ts_to_symbols(content)
     if suffix == ".css":
         return compress_css_to_selectors(content)
+    if suffix in (".c", ".h"):
+        return compress_c_to_symbols(content)
     lines = content.splitlines()
     if len(lines) <= 15:
         return content
@@ -1147,8 +1255,16 @@ def compress_old_reads(messages: list, keep_recent: int = KEEP_RECENT_TURNS) -> 
 
     return compressed
 
-def maybe_compress(messages: list) -> list:
-    if estimate_tokens(messages) > CONTEXT_BUDGET:
+def maybe_compress(messages: list, real_prompt_tokens: int = 0) -> list:
+    """Compress old reads before the model's window fills.
+
+    estimate_tokens (chars/4) is only a lower bound, so when Ollama has told us
+    the actual prompt_tokens for the last request we trust that instead, and we
+    trigger COMPRESS_MARGIN below the budget so a single fresh tool result can't
+    push past the real window between checks.
+    """
+    used = max(estimate_tokens(messages), real_prompt_tokens)
+    if used > CONTEXT_BUDGET - COMPRESS_MARGIN:
         emit({"type": "assistant", "message": {"content": [{
             "type": "text",
             "text": "[Context compressed: old file reads replaced with symbol maps]"
@@ -1210,11 +1326,15 @@ def run_agent_loop(messages: list, model: str, tools: list,
     """Run tool-use loop until no more tool calls. Returns (messages, in_tok, out_tok)."""
     total_in = total_out = 0
     consecutive_bash = 0  # reset when a Read/Edit/Write happens
+    last_read_path = None  # detect re-reading the same file without acting on it
+    same_read_count = 0
 
+    last_prompt_tokens = 0  # ground-truth window size from Ollama's last response
     for _ in range(max_turns):
-        messages = maybe_compress(messages)
+        messages = maybe_compress(messages, last_prompt_tokens)
         msg, usage = call_ollama(messages, model, tools)
-        total_in  += usage.get("prompt_tokens", 0)
+        last_prompt_tokens = usage.get("prompt_tokens", 0)
+        total_in  += last_prompt_tokens
         total_out += usage.get("completion_tokens", 0)
 
         if msg.get("content"):
@@ -1254,6 +1374,19 @@ def run_agent_loop(messages: list, model: str, tools: list,
             elif name in ("Read", "Edit", "Write"):
                 consecutive_bash = 0
 
+            # Track re-reads of the same file with no Edit/Write in between: a
+            # read→grep→read loop that the Bash-only counter above misses entirely.
+            if name in ("Edit", "Write"):
+                same_read_count = 0
+                last_read_path = None
+            elif name == "Read":
+                rp = args.get("file_path")
+                if rp == last_read_path:
+                    same_read_count += 1
+                else:
+                    last_read_path = rp
+                    same_read_count = 1
+
             if consecutive_bash >= 5:
                 result = (
                     "SPIRAL DETECTED: You have run 5 Bash commands in a row without "
@@ -1269,9 +1402,23 @@ def run_agent_loop(messages: list, model: str, tools: list,
                 consecutive_bash = 0
                 continue
 
-            # Detect loop: same call repeated
+            if same_read_count >= 4:
+                result = (
+                    f"SPIRAL DETECTED: You have Read {last_read_path} {same_read_count} times "
+                    "in a row without editing it. Re-reading will not change the content. "
+                    "Use Edit to make the change you planned, or Read a DIFFERENT file. "
+                    "If you need a specific section, Read with offset/limit instead of the whole file again."
+                )
+                emit({"type": "tool_result", "tool_use_id": tc["id"],
+                      "content": result, "is_error": True})
+                messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+                same_read_count = 0
+                continue
+
+            # Detect loop: same call repeated (widened window — small models often
+            # interleave one unrelated call to slip past a narrow check).
             recent = [
-                m for m in messages[-6:] if m.get("role") == "assistant"
+                m for m in messages[-15:] if m.get("role") == "assistant"
                 for t in m.get("tool_calls", [])
                 if t["function"]["name"] == name
                 and t["function"].get("arguments") == tc["function"].get("arguments")
