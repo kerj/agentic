@@ -43,6 +43,20 @@ LEGACY_CONF   = AGENTIC_HOME / ".agentic.conf"
 # control: slider | number | text | select
 
 SCHEMA: dict[str, dict[str, Any]] = {
+    # ── Run mode + target ──
+    "mode": {
+        "default": "local", "env": "AGENTIC_MODE", "type": "str",
+        "options": ["local", "cloud"],
+        "group": "mode", "control": "select", "label": "Execution mode",
+        "help": "Run jobs locally (Ollama on the host) or via the Claude API (cloud). "
+                "Replaces the old --local flag — set it here, takes effect on the next job.",
+    },
+    "default_repo": {
+        "default": "", "env": "AGENTIC_DEFAULT_REPO", "type": "str",
+        "group": "mode", "control": "text", "label": "Default project path",
+        "help": "Project path new jobs default to. Empty = the directory the server "
+                "started in. In Docker, this is the bind-mount path (e.g. /Users/you/proj).",
+    },
     # ── Context + loop core ──
     "context_budget": {
         "default": 24000, "env": "AGENTIC_CONTEXT_BUDGET", "type": "int",
@@ -130,9 +144,12 @@ def _coerce(spec: dict[str, Any], value: Any) -> Any:
 
 
 def _clamp(spec: dict[str, Any], value: Any) -> Any:
-    """Clamp an int knob to its declared bounds; pass strings through."""
+    """Clamp an int knob to its bounds; constrain a select knob to its options;
+    pass other strings through."""
     if spec["type"] == "int" and "min" in spec and "max" in spec:
         return max(spec["min"], min(spec["max"], value))
+    if spec.get("options") and value not in spec["options"]:
+        return spec["default"]
     return value
 
 
@@ -234,6 +251,8 @@ def save(updates: dict[str, Any]) -> dict[str, Any]:
         c = _coerce(spec, raw)
         if c is _INVALID:
             continue  # reject junk — keep the prior value
+        if spec.get("options") and c not in spec["options"]:
+            continue  # reject an out-of-options value — keep the prior value
         stored[key] = _clamp(spec, c)
     _write_settings(stored)
     return load()

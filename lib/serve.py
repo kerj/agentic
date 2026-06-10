@@ -1328,10 +1328,12 @@ if (IS_LOCAL) {
 }
 
 // ── Settings panel (local mode only) ──
-if (IS_LOCAL) document.getElementById('settings-btn').style.display = '';
+// Settings is always reachable — the panel itself holds the local/cloud switch.
+document.getElementById('settings-btn').style.display = '';
 let _settingsData = null;
 
 const SETTINGS_GROUPS = [
+  ['mode',    'Mode & project'],
   ['context', 'Context & loop'],
   ['model',   'Model & Ollama'],
   ['caps',    'Tool output caps'],
@@ -1386,7 +1388,10 @@ function settingControl(s, d) {
       ${help}</div>`;
   }
   if (s.control === 'select') {
-    const opts = (d.ollama_models||[]).map(m => `<option value="${escHtml(m)}"${m===s.value?' selected':''}>${escHtml(m)}</option>`).join('')
+    // Fixed-option knobs (e.g. mode) use s.options; the model dropdown falls
+    // back to the installed Ollama models.
+    const choices = (s.options && s.options.length) ? s.options : (d.ollama_models || []);
+    const opts = choices.map(m => `<option value="${escHtml(m)}"${m===s.value?' selected':''}>${escHtml(m)}</option>`).join('')
       || `<option value="${escHtml(s.value)}" selected>${escHtml(s.value)}</option>`;
     return `<div style="margin-bottom:14px">${label}<select id="set-${s.key}" style="width:100%;margin-top:6px;background:#010409;border:1px solid #21262d;color:#e6edf3;padding:6px 10px;border-radius:6px;font-size:13px">${opts}</select>${help}</div>`;
   }
@@ -2109,9 +2114,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/api/jobs":
             self._api_jobs()
         elif self.path == "/api/repos":
-            self._send_json(get_repos(DEFAULT_REPO))
+            self._send_json(get_repos(default_repo()))
         elif self.path == "/api/ollama-models":
-            self._send_json(get_ollama_models() if LOCAL_MODE else [])
+            self._send_json(get_ollama_models() if is_local() else [])
         elif self.path == "/api/models":
             self._send_json(fetch_models())
         elif self.path == "/api/settings":
@@ -2170,23 +2175,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
     # ── GET handlers ──
 
     def _serve_dashboard(self) -> None:
+        _local = is_local()
+        _repo  = default_repo()
         local_badge = (
             f'<span style="font-size:11px;background:#2a1f00;color:#d29922;'
             f'border:1px solid #5a3e1b;border-radius:10px;padding:2px 8px;margin-left:4px">'
-            f'🏠 {LOCAL_MODEL}</span>'
-            if LOCAL_MODE else ""
+            f'🏠 {local_model()}</span>'
+            if _local else ""
         )
         cloud_model = os.environ.get("AGENTIC_MODEL", "auto")
         model_field = (
             '<select id="model"><option value="auto">loading…</option></select>'
-            if LOCAL_MODE else
+            if _local else
             f'<select id="model" data-current="{cloud_model}"><option value="auto">loading…</option></select>'
         )
         html = (HTML_TEMPLATE
-                .replace("__DEFAULT_REPO_HTML__", DEFAULT_REPO)
-                .replace("__DEFAULT_REPO_JS__",   json.dumps(DEFAULT_REPO))
+                .replace("__DEFAULT_REPO_HTML__", _repo)
+                .replace("__DEFAULT_REPO_JS__",   json.dumps(_repo))
                 .replace("__LOCAL_BADGE__",        local_badge)
-                .replace("__IS_LOCAL__",           "true" if LOCAL_MODE else "false")
+                .replace("__IS_LOCAL__",           "true" if _local else "false")
                 .replace("__MODEL_FIELD__",        model_field))
         body = html.encode()
         self.send_response(200)
@@ -2252,6 +2259,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         def _run_worker():
             global _worker_running, _worker_proc, _worker_rc
             agentic_bin = AGENTIC_HOME / "bin" / "agentic"
+            # Re-resolve mode/model from settings.json AT SPAWN TIME (not server
+            # start) so flipping mode in the UI takes effect on the very next job
+            # with no restart. worker.sh reads AGENTIC_LOCAL to choose ollama vs
+            # the claude CLI; AGENTIC_LOCAL_MODEL selects the local model.
+            _cfg = _settings.load()
+            _env = {
+                **os.environ,
+                "AGENTIC_LOCAL":       "1" if _cfg.get("mode") == "local" else "",
+                "AGENTIC_LOCAL_MODEL": _cfg.get("local_model", "qwen2.5-coder:32b"),
+            }
             proc = None
             try:
                 proc = subprocess.Popen(
@@ -2261,6 +2278,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     text=True,
                     bufsize=1,
                     start_new_session=True,
+                    env=_env,
                 )
                 with _worker_cond:
                     _worker_proc = proc
@@ -2384,7 +2402,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             body       = self._read_body()
             request    = str(body.get("request", "")).strip()
-            repo       = str(body.get("repo", "")).strip() or DEFAULT_REPO
+            repo       = str(body.get("repo", "")).strip() or default_repo()
             priority   = int(body.get("priority", 0))
             model_hint = str(body.get("model_hint", "auto")).strip()
             after      = str(body.get("after", "")).strip()
@@ -2436,9 +2454,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "ok": True,
                 "schema": _settings.schema_for_ui(),
                 "num_ctx": _settings.model_num_ctx(),
-                "ollama_models": get_ollama_models() if LOCAL_MODE else [],
+                "ollama_models": get_ollama_models() if is_local() else [],
                 "secrets": _settings.secrets_status(),
-                "local_mode": LOCAL_MODE,
+                "local_mode": is_local(),
             })
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 500)
@@ -2590,10 +2608,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 # ── Entry point ────────────────────────────────────────────────────────────────
 
-DEFAULT_REPO   = os.getcwd()
 PID_FILE       = AGENTIC_HOME / "serve.pid"
-LOCAL_MODE     = os.environ.get("AGENTIC_LOCAL", "") == "1"
-LOCAL_MODEL    = os.environ.get("AGENTIC_LOCAL_MODEL", "qwen2.5-coder:32b")
+
+# Run mode + target come from settings.json (the UI), not env vars — so you can
+# launch the server once and choose local/cloud and the project in the browser.
+# Resolved live each call so flipping mode in the panel takes effect without a
+# restart (the worker spawn re-resolves too — see _run_worker).
+def _mode() -> str:
+    return _settings.load().get("mode", "local")
+
+def is_local() -> bool:
+    return _mode() == "local"
+
+def local_model() -> str:
+    return _settings.load().get("local_model", "qwen2.5-coder:32b")
+
+def default_repo() -> str:
+    return _settings.load().get("default_repo") or os.getcwd()
 
 class _Server(http.server.ThreadingHTTPServer):
     def handle_error(self, request: Any, client_address: Any) -> None:
@@ -2613,7 +2644,11 @@ if __name__ == "__main__":
     atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
-    server = _Server(("127.0.0.1", port), Handler)
+    # Bind localhost by default (bare-metal: don't expose on the network). The
+    # container entrypoint sets AGENTIC_BIND=0.0.0.0 so the Docker port mapping
+    # can reach it.
+    bind = os.environ.get("AGENTIC_BIND", "127.0.0.1")
+    server = _Server((bind, port), Handler)
     print(f"agentic dashboard → http://localhost:{port}")
     print("agentic serve stop  — to stop")
     try:
