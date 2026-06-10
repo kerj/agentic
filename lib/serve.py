@@ -1700,11 +1700,11 @@ function renderPage(job, activity, chain, diff) {
             }).join('');
             return `<tr class="sd-hunk-row"><td colspan="5">${escHtml(h.header)}</td></tr>${dataRows}`;
           }).join('');
-          diffHtml = `<div style="overflow-x:auto;max-height:420px;overflow-y:auto"><table class="sd-table">${tbl}</table></div>`;
+          diffHtml = `<div data-scroll-key="diff:${escHtml(f)}" style="overflow-x:auto;max-height:420px;overflow-y:auto"><table class="sd-table">${tbl}</table></div>`;
         } else if (fileObj) {
           diffHtml = '<div style="padding:8px;font-size:11px;color:#6e7681">No changes in this file.</div>';
         }
-        html += `<details style="border:1px solid #21262d;border-radius:6px;margin-bottom:6px;overflow:hidden">
+        html += `<details data-key="diff:${escHtml(f)}" style="border:1px solid #21262d;border-radius:6px;margin-bottom:6px;overflow:hidden">
           <summary style="display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;padding:6px 10px;background:#161b22">
             <span style="color:#3fb950;font-size:13px">±</span>
             <span style="font-family:monospace;font-size:12px;color:#e6edf3">${escHtml(f)}</span>
@@ -1743,7 +1743,7 @@ function renderPage(job, activity, chain, diff) {
             <code style="font-size:12px;color:#e6edf3;word-break:break-all;flex:1">$ ${escHtml(cmd)}</code>
             ${riskBadge}
           </div>
-          ${!ok && tc.output ? `<details style="margin-top:4px"><summary style="font-size:11px;color:#f85149;cursor:pointer;padding-left:10px">Show error output</summary><pre style="margin-top:4px;max-height:200px;overflow-y:auto;font-size:11px">${escHtml(tc.output.slice(0,2000))}</pre></details>` : ''}
+          ${!ok && tc.output ? `<details data-key="cmd-err:${escHtml(cmd)}" style="margin-top:4px"><summary style="font-size:11px;color:#f85149;cursor:pointer;padding-left:10px">Show error output</summary><pre style="margin-top:4px;max-height:200px;overflow-y:auto;font-size:11px">${escHtml(tc.output.slice(0,2000))}</pre></details>` : ''}
         </div>`;
       });
       html += `</div>`;
@@ -1751,11 +1751,11 @@ function renderPage(job, activity, chain, diff) {
 
     // Agent reasoning
     if (act.assistant_text && act.assistant_text.trim().length > 50) {
-      html += `<details>
+      html += `<details data-key="agent-reasoning">
         <summary style="font-size:12px;color:#8b949e;cursor:pointer;user-select:none;padding:6px 0">
           Agent reasoning (${act.assistant_text.length.toLocaleString()} chars)
         </summary>
-        <pre style="margin-top:8px;max-height:400px;overflow-y:auto;font-size:12px;white-space:pre-wrap">${escHtml(act.assistant_text.slice(0,8000))}</pre>
+        <pre data-scroll-key="agent-reasoning" style="margin-top:8px;max-height:400px;overflow-y:auto;font-size:12px;white-space:pre-wrap">${escHtml(act.assistant_text.slice(0,8000))}</pre>
       </details>`;
     }
 
@@ -1828,7 +1828,7 @@ function renderPage(job, activity, chain, diff) {
         </div>
         ${task.description ? `<div class="task-desc">${escHtml(task.description)}</div>` : ''}
         ${task.modification_type ? `<div class="task-modtype">${escHtml(task.modification_type)}</div>` : ''}
-        ${outputText ? `<details><summary>View output (${lineCount} lines)</summary><pre>${escHtml(outputText)}</pre></details>` : ''}
+        ${outputText ? `<details data-key="task-out:${escHtml(String(task.id))}"><summary>View output (${lineCount} lines)</summary><pre>${escHtml(outputText)}</pre></details>` : ''}
       </div>`;
     });
     html += `</div>`;
@@ -1894,7 +1894,15 @@ function saveUIState() {
   const container = document.getElementById('main-content');
   const openDetails = Array.from(container.querySelectorAll('details[open]'))
     .map(el => el.dataset.key || el.querySelector('summary')?.textContent?.trim() || '');
-  return { openDetails, scrollTop: container.scrollTop };
+  // Inner scroll containers (reasoning <pre>, diff tables, output) keep their own
+  // scroll. Save each by a stable key; record whether it was pinned to the bottom
+  // so a streaming log stays at the bottom instead of jumping to a stale offset.
+  const scrolls = {};
+  container.querySelectorAll('[data-scroll-key]').forEach(el => {
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 30;
+    scrolls[el.dataset.scrollKey] = { top: el.scrollTop, atBottom };
+  });
+  return { openDetails, scrollTop: container.scrollTop, scrolls };
 }
 
 function restoreUIState(state) {
@@ -1904,6 +1912,12 @@ function restoreUIState(state) {
   container.querySelectorAll('details').forEach(el => {
     const key = el.dataset.key || el.querySelector('summary')?.textContent?.trim() || '';
     if (state.openDetails.includes(key)) el.open = true;
+  });
+  const scrolls = state.scrolls || {};
+  container.querySelectorAll('[data-scroll-key]').forEach(el => {
+    const s = scrolls[el.dataset.scrollKey];
+    if (!s) return;
+    el.scrollTop = s.atBottom ? el.scrollHeight : s.top;
   });
 }
 
