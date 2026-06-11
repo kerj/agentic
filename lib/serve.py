@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from job_queue import (
@@ -355,6 +356,24 @@ a.job-id:hover { color: #388bfd; text-decoration: underline; }
     <div style="display:flex;align-items:center;gap:10px;padding:12px 18px;border-top:1px solid #21262d">
       <span id="settings-status" style="font-size:12px;color:#8b949e"></span>
       <button onclick="saveSettings()" style="margin-left:auto;background:#1f6feb;color:#fff;border:none;padding:7px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500">Save</button>
+    </div>
+  </div>
+</div>
+
+<div id="dirpicker-overlay" onclick="if(event.target===this)closeDirPicker()" style="display:none;position:fixed;inset:0;background:rgba(1,4,9,.75);z-index:300;align-items:flex-start;justify-content:center;overflow-y:auto;padding:48px 16px">
+  <div style="background:#0d1117;border:1px solid #21262d;border-radius:10px;width:100%;max-width:560px;box-shadow:0 16px 48px rgba(0,0,0,.6)">
+    <div style="display:flex;align-items:center;gap:8px;padding:14px 18px;border-bottom:1px solid #21262d">
+      <span style="font-size:15px;font-weight:600;color:#e6edf3">📁 Choose project directory</span>
+      <button onclick="closeDirPicker()" style="margin-left:auto;background:none;border:none;color:#8b949e;cursor:pointer;font-size:18px;line-height:1">×</button>
+    </div>
+    <div style="padding:10px 18px;border-bottom:1px solid #21262d">
+      <div id="dirpicker-path" style="font-size:12px;color:#88b4ff;font-family:ui-monospace,monospace;word-break:break-all">/</div>
+    </div>
+    <div id="dirpicker-list" style="padding:8px 10px;max-height:50vh;overflow-y:auto"></div>
+    <div style="display:flex;align-items:center;gap:10px;padding:12px 18px;border-top:1px solid #21262d">
+      <span id="dirpicker-hint" style="font-size:11px;color:#6e7681"></span>
+      <button onclick="closeDirPicker()" style="margin-left:auto;background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:7px 14px;border-radius:6px;cursor:pointer;font-size:13px">Cancel</button>
+      <button id="dirpicker-use" onclick="useCurrentDir()" style="background:#238636;color:#fff;border:none;padding:7px 16px;border-radius:6px;cursor:pointer;font-size:13px;font-weight:500">Use this folder</button>
     </div>
   </div>
 </div>
@@ -1391,6 +1410,17 @@ function settingControl(s, d) {
              oninput="document.getElementById('val-${s.key}').textContent=this.value" style="width:100%;margin-top:6px">
       ${help}</div>`;
   }
+  if (s.control === 'dirpicker') {
+    // Text input (keeps id set-${s.key} so saveSettings reads it generically)
+    // plus a Browse button that opens the confined folder browser.
+    return `<div style="margin-bottom:14px">${label}
+      <div style="display:flex;gap:8px;margin-top:6px">
+        <input type="text" id="set-${s.key}" value="${escHtml(String(s.value))}" placeholder="(server working dir)"
+               style="flex:1;background:#010409;border:1px solid #21262d;color:#e6edf3;padding:6px 10px;border-radius:6px;font-size:13px">
+        <button type="button" onclick="openDirPicker('set-${s.key}')"
+                style="background:#21262d;border:1px solid #30363d;color:#e6edf3;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:12px;white-space:nowrap">Browse…</button>
+      </div>${help}</div>`;
+  }
   if (s.control === 'select') {
     // Fixed-option knobs (e.g. mode) use s.options; the model dropdown falls
     // back to the installed Ollama models.
@@ -1442,6 +1472,68 @@ function saveSecret() {
       if (d.ok) document.getElementById('set-secret-key').value = '';
     }).catch(() => document.getElementById('settings-status').textContent = 'Failed to save key');
 }
+
+// ── Directory picker (confined folder browser, sets a target input) ──────────
+let _dirpickerTarget = null;   // id of the input to write the chosen path into
+let _dirpickerCurrent = '';    // path currently shown
+
+function openDirPicker(targetInputId) {
+  _dirpickerTarget = targetInputId;
+  document.getElementById('dirpicker-overlay').style.display = 'flex';
+  // Start at the current value if set, else at the browse root (empty path).
+  const cur = (document.getElementById(targetInputId) || {}).value || '';
+  browseTo(cur);
+}
+function closeDirPicker() {
+  document.getElementById('dirpicker-overlay').style.display = 'none';
+  _dirpickerTarget = null;
+}
+function browseTo(path) {
+  const list = document.getElementById('dirpicker-list');
+  list.innerHTML = '<div style="color:#8b949e;font-size:13px;padding:8px">Loading…</div>';
+  fetch('/api/browse?path=' + encodeURIComponent(path || ''))
+    .then(r => r.json()).then(d => {
+      if (!d.ok) { list.innerHTML = '<div style="color:#f85149;font-size:13px;padding:8px">' + escHtml(d.error||'error') + '</div>'; return; }
+      _dirpickerCurrent = d.path;
+      document.getElementById('dirpicker-path').textContent = d.path;
+      // "Use this folder" is enabled only when the current dir is itself a repo.
+      const useBtn = document.getElementById('dirpicker-use');
+      useBtn.disabled = !d.is_repo;
+      useBtn.style.opacity = d.is_repo ? '1' : '.45';
+      useBtn.style.cursor  = d.is_repo ? 'pointer' : 'not-allowed';
+      document.getElementById('dirpicker-hint').textContent = d.is_repo
+        ? 'This folder is a git repo — you can use it.'
+        : 'Open a folder marked ● to pick a git repo.';
+      let html = '';
+      if (d.parent) {
+        html += `<div onclick="browseTo('${escAttr(d.parent)}')" style="padding:7px 10px;cursor:pointer;border-radius:6px;color:#8b949e;font-size:13px" onmouseover="this.style.background='#161b22'" onmouseout="this.style.background='none'">⬆ ..</div>`;
+      }
+      if (!d.entries.length) {
+        html += '<div style="color:#6e7681;font-size:12px;padding:8px">No subfolders.</div>';
+      }
+      d.entries.forEach(e => {
+        const dot = e.is_repo ? '<span style="color:#3fb950">●</span> ' : '<span style="color:#30363d">▸</span> ';
+        const tag = e.is_repo ? ' <span style="color:#6e7681;font-size:11px">git repo</span>' : '';
+        html += `<div style="display:flex;align-items:center;gap:6px;padding:7px 10px;border-radius:6px" onmouseover="this.style.background='#161b22'" onmouseout="this.style.background='none'">
+          <span onclick="browseTo('${escAttr(e.path)}')" style="flex:1;cursor:pointer;color:#e6edf3;font-size:13px">${dot}${escHtml(e.name)}${tag}</span>
+          ${e.is_repo ? `<button onclick="pickDir('${escAttr(e.path)}')" style="background:#238636;color:#fff;border:none;padding:3px 10px;border-radius:5px;cursor:pointer;font-size:11px">Use</button>` : ''}
+        </div>`;
+      });
+      list.innerHTML = html;
+    }).catch(() => { list.innerHTML = '<div style="color:#f85149;font-size:13px;padding:8px">Failed to browse</div>'; });
+}
+function pickDir(path) {
+  if (_dirpickerTarget) {
+    const el = document.getElementById(_dirpickerTarget);
+    if (el) el.value = path;
+  }
+  closeDirPicker();
+}
+function useCurrentDir() {
+  if (_dirpickerCurrent) pickDir(_dirpickerCurrent);
+}
+// Attribute-safe escaping for inline onclick handlers (single-quote context).
+function escAttr(s) { return String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;'); }
 
 fetchRepos();
 fetchJobs();
@@ -2134,6 +2226,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_json(fetch_models())
         elif self.path == "/api/settings":
             self._api_get_settings()
+        elif self.path == "/api/browse" or self.path.startswith("/api/browse?"):
+            self._api_browse()
         elif self.path == "/api/worker-stream":
             self._api_worker_stream()
         elif self.path == "/api/worker-status":
@@ -2271,7 +2365,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # this handler just tails the shared buffer like any other reconnect.
         def _run_worker():
             global _worker_running, _worker_proc, _worker_rc
-            agentic_bin = AGENTIC_HOME / "bin" / "agentic"
+            # bin/agentic is APP SOURCE — resolve via AGENTIC_APP (defaults to
+            # AGENTIC_HOME for native; Docker sets it to the baked /opt/agentic).
+            agentic_bin = Path(os.environ.get("AGENTIC_APP", str(AGENTIC_HOME))) / "bin" / "agentic"
             # Re-resolve mode/model from settings.json AT SPAWN TIME (not server
             # start) so flipping mode in the UI takes effect on the very next job
             # with no restart. worker.sh reads AGENTIC_LOCAL to choose ollama vs
@@ -2280,7 +2376,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             _env = {
                 **os.environ,
                 "AGENTIC_LOCAL":       "1" if _cfg.get("mode") == "local" else "",
-                "AGENTIC_LOCAL_MODEL": _cfg.get("local_model", "qwen2.5-coder:32b"),
+                "AGENTIC_LOCAL_MODEL": _cfg.get("local_model", "qwen-coder:latest"),
             }
             proc = None
             try:
@@ -2470,6 +2566,60 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "ollama_models": get_ollama_models() if is_local() else [],
                 "secrets": _settings.secrets_status(),
                 "local_mode": is_local(),
+                "browse_root": browse_root(),
+            })
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    def _api_browse(self) -> None:
+        """Read-only directory browser for the project picker. Lists the immediate
+        subdirectories of ?path= and marks which are git repos. CONFINED to
+        browse_root(): a resolved path outside the root (e.g. via .. or a symlink)
+        is rejected and snapped back to the root. Never reads file contents."""
+        from urllib.parse import urlparse, parse_qs, unquote
+        try:
+            qs = parse_qs(urlparse(self.path).query)
+            raw = unquote((qs.get("path") or [""])[0]).strip()
+            root = Path(browse_root())
+
+            # Resolve the requested path; default to the root. strict=False so a
+            # not-yet-existing path doesn't throw — we validate existence below.
+            target = Path(raw).resolve() if raw else root
+            # Confinement: target must be the root or inside it. resolve() has
+            # already collapsed any '..' and followed symlinks, so this catches
+            # both traversal and symlink escape.
+            try:
+                inside = target == root or root in target.parents
+            except Exception:
+                inside = False
+            if not inside or not target.is_dir():
+                target = root
+
+            entries = []
+            try:
+                for child in sorted(target.iterdir(), key=lambda p: p.name.lower()):
+                    # Skip hidden dirs (keep .git out of the picker), non-dirs,
+                    # and anything unreadable.
+                    if not child.is_dir() or child.name.startswith("."):
+                        continue
+                    try:
+                        is_repo = (child / ".git").exists()
+                    except Exception:
+                        is_repo = False
+                    entries.append({"name": child.name,
+                                    "path": str(child),
+                                    "is_repo": is_repo})
+            except PermissionError:
+                pass
+
+            parent = str(target.parent) if (target != root and root in target.parents) else None
+            self._send_json({
+                "ok": True,
+                "root": str(root),
+                "path": str(target),
+                "parent": parent,
+                "is_repo": (target / ".git").exists(),
+                "entries": entries,
             })
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 500)
@@ -2634,10 +2784,21 @@ def is_local() -> bool:
     return _mode() == "local"
 
 def local_model() -> str:
-    return _settings.load().get("local_model", "qwen2.5-coder:32b")
+    return _settings.load().get("local_model", "qwen-coder:latest")
 
 def default_repo() -> str:
     return _settings.load().get("default_repo") or os.getcwd()
+
+def browse_root() -> str:
+    """Root the directory picker may browse. In Docker this is the broad host
+    dir bind-mounted at its identity path (compose sets BROWSE_ROOT, default the
+    host home). On a native install it defaults to the user's home dir. The
+    /api/browse endpoint confines all listing to this root — no traversal out."""
+    root = os.environ.get("BROWSE_ROOT", "").strip() or str(Path.home())
+    try:
+        return str(Path(root).resolve())
+    except Exception:
+        return str(Path.home())
 
 class _Server(http.server.ThreadingHTTPServer):
     def handle_error(self, request: Any, client_address: Any) -> None:

@@ -10,15 +10,15 @@ function run_worker_agent() {
 
   # ── Local mode: Ollama ──────────────────────────────────────────────────────
   if [[ "${AGENTIC_LOCAL:-}" == "1" ]]; then
-    local model="${model_hint:-${AGENTIC_LOCAL_MODEL:-qwen2.5-coder:32b}}"
+    local model="${model_hint:-${AGENTIC_LOCAL_MODEL:-qwen-coder:latest}}"
     # Use local-specific system prompt tuned for local model limitations
-    local local_prompt="$AGENTIC_HOME/agents/worker_local.txt"
-    [[ ! -f "$local_prompt" ]] && local_prompt="$AGENTIC_HOME/agents/worker.txt"
+    local local_prompt="$AGENTIC_APP/agents/worker_local.txt"
+    [[ ! -f "$local_prompt" ]] && local_prompt="$AGENTIC_APP/agents/worker.txt"
 
     # Append language-specific section — prefer <profile>-local.txt, fall back to base
-    local _local_profile_section="$AGENTIC_HOME/agents/prompt_sections/${AGENTIC_PROFILE:-typescript}-local.txt"
-    [[ ! -f "$_local_profile_section" ]] && _local_profile_section="$AGENTIC_HOME/agents/prompt_sections/${AGENTIC_PROFILE:-typescript}.txt"
-    [[ ! -f "$_local_profile_section" ]] && _local_profile_section="$AGENTIC_HOME/agents/prompt_sections/typescript-local.txt"
+    local _local_profile_section="$AGENTIC_APP/agents/prompt_sections/${AGENTIC_PROFILE:-typescript}-local.txt"
+    [[ ! -f "$_local_profile_section" ]] && _local_profile_section="$AGENTIC_APP/agents/prompt_sections/${AGENTIC_PROFILE:-typescript}.txt"
+    [[ ! -f "$_local_profile_section" ]] && _local_profile_section="$AGENTIC_APP/agents/prompt_sections/typescript-local.txt"
     if [[ -f "$_local_profile_section" ]]; then
       local _local_tmp
       _local_tmp=$(mktemp /tmp/agentic_prompt_XXXXXX)
@@ -34,14 +34,14 @@ function run_worker_agent() {
       AGENTIC_HOME="$AGENTIC_HOME" \
       AGENTIC_LOCAL_MODEL="$model" \
       AGENTIC_WORKER_PROMPT="$local_prompt" \
-        "${AGENTIC_HOME}/venv/bin/python3" "$AGENTIC_HOME/lib/ollama_worker.py" "$request" \
+        "${AGENTIC_PYTHON}" "$AGENTIC_APP/lib/ollama_worker.py" "$request" \
       | tee "$log_file" \
-      | "${AGENTIC_HOME}/venv/bin/python3" "$AGENTIC_HOME/lib/stream_parser.py"
+      | "${AGENTIC_PYTHON}" "$AGENTIC_APP/lib/stream_parser.py"
     else
       AGENTIC_HOME="$AGENTIC_HOME" \
       AGENTIC_LOCAL_MODEL="$model" \
       AGENTIC_WORKER_PROMPT="$local_prompt" \
-        "${AGENTIC_HOME}/venv/bin/python3" "$AGENTIC_HOME/lib/ollama_worker.py" "$request"
+        "${AGENTIC_PYTHON}" "$AGENTIC_APP/lib/ollama_worker.py" "$request"
     fi
     return $?
   fi
@@ -54,12 +54,12 @@ function run_worker_agent() {
   fi
 
   local system_prompt
-  system_prompt="$(cat "$AGENTIC_HOME/agents/worker.txt")"
+  system_prompt="$(cat "$AGENTIC_APP/agents/worker.txt")"
 
   # Append language-specific build/verify section — cloud gets base file (no -local suffix)
-  local _profile_section="$AGENTIC_HOME/agents/prompt_sections/${AGENTIC_PROFILE:-typescript}.txt"
+  local _profile_section="$AGENTIC_APP/agents/prompt_sections/${AGENTIC_PROFILE:-typescript}.txt"
   if [[ ! -f "$_profile_section" ]]; then
-    _profile_section="$AGENTIC_HOME/agents/prompt_sections/typescript.txt"
+    _profile_section="$AGENTIC_APP/agents/prompt_sections/typescript.txt"
   fi
   if [[ -f "$_profile_section" ]]; then
     system_prompt="${system_prompt}"$'\n\n'"$(cat "$_profile_section")"
@@ -82,7 +82,7 @@ function run_worker_agent() {
       --verbose \
       "${model_flag[@]}" \
     | tee "$log_file" \
-    | "${AGENTIC_HOME}/venv/bin/python3" "$AGENTIC_HOME/lib/stream_parser.py"
+    | "${AGENTIC_PYTHON}" "$AGENTIC_APP/lib/stream_parser.py"
   else
     claude \
       -p "$request" \

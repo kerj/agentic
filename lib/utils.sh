@@ -62,9 +62,9 @@ _apply_get_task_ids() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 _build_repo_map() {
-  local _profile_path="${AGENTIC_HOME}/profiles/${AGENTIC_PROFILE:-typescript}.json"
+  local _profile_path="${AGENTIC_APP:-$AGENTIC_HOME}/profiles/${AGENTIC_PROFILE:-typescript}.json"
   AGENTIC_PROFILE_PATH="$_profile_path" \
-  "${AGENTIC_HOME}/venv/bin/python3" - <<'PYEOF'
+  "${AGENTIC_PYTHON:-$AGENTIC_HOME/venv/bin/python3}" - <<'PYEOF'
 import os, re, json, sys
 
 # Load profile — fall back to TypeScript defaults if anything goes wrong

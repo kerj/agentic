@@ -13,13 +13,14 @@ After the main agent loop, runs a build verification and surgical repair cycle:
 
 Usage:
   AGENTIC_HOME=~/.agentic python3 ollama_worker.py "Add dark mode toggle"
-  AGENTIC_LOCAL_MODEL=qwen2.5-coder:14b python3 ollama_worker.py "..."
+  AGENTIC_LOCAL_MODEL=qwen-coder:latest python3 ollama_worker.py "..."
 """
 
 import sys
 import os
 import json
 import re
+import shutil
 import subprocess
 import glob as glob_module
 import urllib.request
@@ -35,6 +36,9 @@ from diff_guard import (
 
 OLLAMA_HOST   = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 AGENTIC_HOME  = Path(os.environ.get("AGENTIC_HOME", Path.home() / ".agentic"))
+# agents/ prompt files are APP SOURCE — read from AGENTIC_APP (defaults to
+# AGENTIC_HOME for native; Docker sets it to the baked /opt/agentic).
+AGENTIC_APP   = Path(os.environ.get("AGENTIC_APP", str(AGENTIC_HOME)))
 MAX_REPAIR_ROUNDS = 5
 PROFILE           = os.environ.get("AGENTIC_PROFILE", "typescript")
 
@@ -593,6 +597,132 @@ def tool_setup(packages: list | None = None) -> str:
     if extras:
         msg += f" Added: {', '.join(extras)}."
     return msg
+
+def _read_node_pin() -> Optional[str]:
+    """Return the Node version a project pins, or None. Checks (in order):
+    .nvmrc, .node-version, then package.json engines.node. Opt-in by design —
+    no pin means use the container's default Node."""
+    cwd = Path.cwd()
+    for fname in (".nvmrc", ".node-version"):
+        f = cwd / fname
+        if f.exists():
+            v = f.read_text().strip().lstrip("v")
+            if v:
+                return v
+    pkg = cwd / "package.json"
+    if pkg.exists():
+        try:
+            eng = json.loads(pkg.read_text()).get("engines", {}).get("node", "")
+            # engines often uses ranges (">=18", "^20"); take the first number run.
+            m = re.search(r"(\d+(?:\.\d+){0,2})", eng or "")
+            if m:
+                return m.group(1)
+        except Exception:
+            pass
+    return None
+
+def ensure_node_version() -> Optional[str]:
+    """If the project pins a Node version AND fnm is available, install+activate
+    it for this worker's subprocesses by putting its bin on PATH. Default path
+    (no pin, or no fnm — e.g. native installs) is a no-op: the ambient/default
+    Node is used. Returns a status string if it switched, else None."""
+    pin = _read_node_pin()
+    if not pin:
+        return None  # opt-in: no pin → default Node
+    if not shutil.which("fnm"):
+        return None  # native/no-fnm → can't switch; use ambient Node
+    try:
+        # Install the pinned version if missing (idempotent), then resolve its bin.
+        subprocess.run(["fnm", "install", pin], capture_output=True, text=True, timeout=600)
+        r = subprocess.run(["fnm", "exec", f"--using={pin}", "which", "node"],
+                           capture_output=True, text=True, timeout=60)
+        node_path = r.stdout.strip()
+        if r.returncode != 0 or not node_path:
+            return f"⚠️  Project pins Node {pin} but fnm could not provide it; using default Node."
+        bindir = str(Path(node_path).parent)
+        # Prepend the pinned version's bin so node/npm/tsc resolve to it.
+        os.environ["PATH"] = bindir + os.pathsep + os.environ.get("PATH", "")
+        return f"⬢ Using Node {pin} for this project (fnm)."
+    except Exception as exc:
+        return f"⚠️  Node {pin} activation failed ({exc}); using default Node."
+
+def ensure_dependencies() -> Optional[str]:
+    """Install project deps if missing, BEFORE the baseline build.
+
+    A git worktree is a fresh checkout with NO node_modules (it's gitignored, not
+    copied). Without this, the baseline build fails spuriously with 'tsc: not
+    found' — which makes the 'no regression vs baseline' gate compare two broken
+    builds and silently lose its ability to catch real regressions.
+
+    Idempotent: only runs an install when package.json exists AND deps are
+    actually missing, so repos that already have node_modules pay nothing.
+    Returns a short status string if it ran (for logging), else None.
+    """
+    cwd = Path.cwd()
+    if not (cwd / "package.json").exists():
+        return None  # not a Node project — nothing to install
+    # Deps present if node_modules has a populated .bin (tsc/vite live there).
+    if (cwd / "node_modules" / ".bin").exists():
+        return None  # already installed — skip (fast path)
+
+    pm, _, _ = _detect_package_manager()
+    # FROZEN install: never modify the lockfile. We install deps only to make the
+    # baseline build real — the lockfile must NOT change, or its platform-specific
+    # churn (e.g. linux libc entries vs the repo's macOS lockfile) gets swept into
+    # the job's squash commit, polluting the diff and breaking 'Review in IDE'.
+    # `npm ci` / `--frozen-lockfile` install exactly what the lockfile pins and
+    # leave it untouched. Fall back to a regular install only if no lockfile (or
+    # it's out of sync) makes the frozen command fail.
+    if pm == "npm":
+        frozen, fallback = "npm ci", "npm install --no-save"
+    elif pm == "yarn":
+        frozen, fallback = "yarn install --frozen-lockfile", "yarn install"
+    else:  # pnpm
+        frozen, fallback = "pnpm install --frozen-lockfile", "pnpm install --no-save"
+
+    # Belt-and-suspenders: ensure a WRITABLE npm cache even if HOME is somehow
+    # unset/unwritable (e.g. a misconfigured container). Prefer the env, else put
+    # it under AGENTIC_HOME (always writable — it's the state mount).
+    env = dict(os.environ)
+    if not env.get("npm_config_cache"):
+        cache_base = env.get("HOME") or os.environ.get("AGENTIC_HOME", str(Path.home()))
+        env["npm_config_cache"] = str(Path(cache_base) / ".npm")
+
+    def _run(cmd: str):
+        try:
+            return subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                                  timeout=600, env=env)
+        except subprocess.TimeoutExpired:
+            return None
+
+    result = _run(frozen)
+    used = frozen
+    if result is None:
+        return f"⚠️  Dependency install timed out ({frozen}) — baseline build may be unreliable."
+    if result.returncode != 0:
+        # Frozen failed (no lockfile / out of sync). Fall back so the build still
+        # works; this MAY touch the lockfile, but we restore it below.
+        result = _run(fallback)
+        used = fallback
+        if result is None:
+            return f"⚠️  Dependency install timed out ({fallback}) — baseline build may be unreliable."
+    if result.returncode != 0:
+        tail = (result.stdout + result.stderr).strip()[-500:]
+        return f"⚠️  Dependency install failed ({used}); baseline build may be unreliable:\n{tail}"
+
+    # Belt-and-suspenders: if anything still left the lockfile dirty (e.g. the
+    # fallback ran), restore it so it never enters the job's diff. Only touches
+    # tracked lockfiles that git sees as modified.
+    restored = []
+    for lock in ("package-lock.json", "yarn.lock", "pnpm-lock.yaml"):
+        if (cwd / lock).exists():
+            chk = subprocess.run(["git", "diff", "--quiet", "--", lock],
+                                 capture_output=True)
+            if chk.returncode != 0:  # lockfile is dirty
+                subprocess.run(["git", "checkout", "--", lock], capture_output=True)
+                restored.append(lock)
+    note = f" (restored {', '.join(restored)})" if restored else ""
+    return f"📦 Installed dependencies ({used}) before baseline build{note}."
 
 def _find_build_cmd() -> str:
     """Return the build shell command for the current project, with 2>&1 appended."""
@@ -1829,6 +1959,24 @@ def _build_repo_map_c() -> str:
 
 
 def run(request: str, model: str, system_prompt: str) -> int:
+    # Select the project's Node version (if it pins one and fnm is present)
+    # BEFORE installing deps/building, so install+build run under the right Node.
+    # No pin / no fnm → default Node (opt-in by design).
+    _node_status = ensure_node_version()
+    if _node_status:
+        emit({"type": "assistant", "message": {"content": [{
+            "type": "text", "text": _node_status
+        }]}})
+
+    # Install deps BEFORE the baseline probe. A fresh worktree has no
+    # node_modules, so without this the baseline build fails with 'tsc: not
+    # found' and the regression gate compares two broken builds (toothless).
+    _dep_status = ensure_dependencies()
+    if _dep_status:
+        emit({"type": "assistant", "message": {"content": [{
+            "type": "text", "text": _dep_status
+        }]}})
+
     # Baseline-pin: probe the untouched tree first so the final gate asks "did
     # the agent make the build WORSE", not "is it green". A repo that was already
     # broken at base shouldn't be blamed on the agent, and a green baseline lets
@@ -1935,9 +2083,9 @@ if __name__ == "__main__":
 
     request     = sys.argv[1]
     prompt_path = os.environ.get("AGENTIC_WORKER_PROMPT", "")
-    prompt_file = Path(prompt_path) if prompt_path else AGENTIC_HOME / "agents" / "worker_local.txt"
+    prompt_file = Path(prompt_path) if prompt_path else AGENTIC_APP / "agents" / "worker_local.txt"
     if not prompt_file.exists():
-        prompt_file = AGENTIC_HOME / "agents" / "worker.txt"
+        prompt_file = AGENTIC_APP / "agents" / "worker.txt"
     system_prompt = prompt_file.read_text() if prompt_file.exists() else ""
 
     sys.exit(run(request, MODEL, system_prompt))

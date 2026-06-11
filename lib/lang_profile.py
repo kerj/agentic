@@ -5,7 +5,10 @@ import pathlib
 from typing import Any
 
 AGENTIC_HOME  = pathlib.Path(os.environ.get("AGENTIC_HOME", pathlib.Path.home() / ".agentic"))
-PROFILES_DIR  = AGENTIC_HOME / "profiles"
+# profiles/ is APP SOURCE — read from AGENTIC_APP (defaults to AGENTIC_HOME for
+# native installs; Docker sets it to the baked /opt/agentic).
+AGENTIC_APP   = pathlib.Path(os.environ.get("AGENTIC_APP", str(AGENTIC_HOME)))
+PROFILES_DIR  = AGENTIC_APP / "profiles"
 DEFAULT_NAME  = "typescript"
 
 _cache: dict[str, dict[str, Any]] = {}

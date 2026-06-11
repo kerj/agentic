@@ -32,6 +32,10 @@ if ! grep -q "AGENTIC_HOME" ~/.zshrc 2>/dev/null; then
 
 # agentic
 export AGENTIC_HOME="$HOME/.agentic"
+# Native install: app source and state both live in ~/.agentic, so AGENTIC_APP
+# (source) equals AGENTIC_HOME (state). Docker overrides AGENTIC_APP to the
+# baked image path; here they are intentionally the same.
+export AGENTIC_APP="$AGENTIC_HOME"
 export PATH="$AGENTIC_HOME/bin:$PATH"
 [[ -f "$AGENTIC_HOME/.agentic.conf" ]] && source "$AGENTIC_HOME/.agentic.conf"
 EOF

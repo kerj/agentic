@@ -190,8 +190,8 @@ function agentic-doc-gen() {
 
   # Detect language profile for this project
   local _doc_profile
-  _doc_profile=$("${AGENTIC_HOME}/venv/bin/python3" -c "
-import sys; sys.path.insert(0, '${AGENTIC_HOME}/lib')
+  _doc_profile=$("${AGENTIC_PYTHON:-$AGENTIC_HOME/venv/bin/python3}" -c "
+import sys; sys.path.insert(0, '${AGENTIC_APP:-$AGENTIC_HOME}/lib')
 from lang_profile import detect_profile
 print(detect_profile('.'))
 " 2>/dev/null || echo "typescript")
@@ -208,8 +208,8 @@ print(detect_profile('.'))
   # 11. GENERATE CLAUDE.MD
   # ============================================================
   local documenter_prompt
-  if [[ -f "$AGENTIC_HOME/agents/documenter.txt" ]]; then
-    documenter_prompt="$(cat $AGENTIC_HOME/agents/documenter.txt)"
+  if [[ -f "${AGENTIC_APP:-$AGENTIC_HOME}/agents/documenter.txt" ]]; then
+    documenter_prompt="$(cat "${AGENTIC_APP:-$AGENTIC_HOME}/agents/documenter.txt")"
   else
     documenter_prompt="You are a technical documentation expert. Generate a CLAUDE.md file for an AI coding assistant based on the project analysis provided. Every convention must include real code examples extracted from the project files shown. Start with '# Project Documentation for Claude'."
   fi

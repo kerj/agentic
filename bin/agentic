@@ -5,15 +5,27 @@ set -euo pipefail
 
 AGENTIC_HOME="${AGENTIC_HOME:-$HOME/.agentic}"
 
-source "$AGENTIC_HOME/lib/config.sh"
-source "$AGENTIC_HOME/lib/utils.sh"
-source "$AGENTIC_HOME/lib/init.sh"
-source "$AGENTIC_HOME/lib/claude-api.sh"
-source "$AGENTIC_HOME/lib/doc.sh"
-source "$AGENTIC_HOME/lib/apply.sh"
-source "$AGENTIC_HOME/lib/plan.sh"
-source "$AGENTIC_HOME/lib/worker.sh"
-source "$AGENTIC_HOME/lib/queue.sh"
+# APP SOURCE vs STATE split.
+#   AGENTIC_HOME — STATE only (queue/worktrees/diffs/logs/settings/secrets).
+#   AGENTIC_APP  — the app SOURCE tree (bin/lib/agents/profiles/venv).
+# Native install: both live in ~/.agentic, so AGENTIC_APP defaults to
+# AGENTIC_HOME and nothing changes. Docker sets AGENTIC_APP=/opt/agentic (baked,
+# read-only) so the container never needs to write source into the state mount.
+# AGENTIC_PYTHON is the interpreter (the baked venv in Docker, the local venv
+# natively). Exported so every sourced lib and child process inherits them.
+export AGENTIC_HOME
+export AGENTIC_APP="${AGENTIC_APP:-$AGENTIC_HOME}"
+export AGENTIC_PYTHON="${AGENTIC_PYTHON:-$AGENTIC_APP/venv/bin/python3}"
+
+source "$AGENTIC_APP/lib/config.sh"
+source "$AGENTIC_APP/lib/utils.sh"
+source "$AGENTIC_APP/lib/init.sh"
+source "$AGENTIC_APP/lib/claude-api.sh"
+source "$AGENTIC_APP/lib/doc.sh"
+source "$AGENTIC_APP/lib/apply.sh"
+source "$AGENTIC_APP/lib/plan.sh"
+source "$AGENTIC_APP/lib/worker.sh"
+source "$AGENTIC_APP/lib/queue.sh"
 
 # Walk parent_request_id chain to find the root non-review job's ID.
 # All review jobs (and reviews of reviews) commit onto agentic/<root-id>.
@@ -415,21 +427,21 @@ case "${1:-}" in
       start|[0-9]*)
         local _sport_arg=""
         [[ "${2:-}" =~ ^[0-9]+$ ]] && _sport_arg="${2}"
-        exec "${AGENTIC_HOME}/venv/bin/python3" "$AGENTIC_HOME/lib/serve.py" ${_sport_arg:+"$_sport_arg"}
+        exec "${AGENTIC_PYTHON}" "$AGENTIC_APP/lib/serve.py" ${_sport_arg:+"$_sport_arg"}
         ;;
       --local|--local=*)
         # agentic serve --local [MODEL]
         # Priority: --local=model > AGENTIC_LOCAL_MODEL env var > default
-        local _lmodel="${AGENTIC_LOCAL_MODEL:-qwen2.5-coder:32b}"
+        local _lmodel="${AGENTIC_LOCAL_MODEL:-qwen-coder:latest}"
         [[ "${2}" == --local=* ]] && _lmodel="${2#--local=}"
         [[ -n "${3:-}" ]] && _lmodel="$3"
         export AGENTIC_LOCAL=1
         export AGENTIC_LOCAL_MODEL="$_lmodel"
         echo "🏠 Local mode: $_lmodel"
-        exec "${AGENTIC_HOME}/venv/bin/python3" "$AGENTIC_HOME/lib/serve.py"
+        exec "${AGENTIC_PYTHON}" "$AGENTIC_APP/lib/serve.py"
         ;;
       *)
-        exec "${AGENTIC_HOME}/venv/bin/python3" "$AGENTIC_HOME/lib/serve.py"
+        exec "${AGENTIC_PYTHON}" "$AGENTIC_APP/lib/serve.py"
         ;;
     esac
     ;;
