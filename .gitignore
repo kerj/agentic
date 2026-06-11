@@ -11,3 +11,6 @@ __pycache__/
 *.pyc
 venv/
 .claude/
+
+# Docker env (host paths + uid/gid) — only .env.example is tracked
+docker/.env

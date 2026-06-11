@@ -1,0 +1,80 @@
+# agentic — Docker-primary install (v1: local mode, TypeScript projects).
+#
+# Generate docker/.env with the wizard first:  ./docker/setup.sh
+# Then:  docker compose --env-file docker/.env -f docker/docker-compose.yml up
+# Land on http://localhost:${HOST_PORT:-4080} and configure in the browser.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# SAFETY MODEL (why the previous source-loss incident can't recur):
+#
+#  • APP SOURCE is baked in the image at /opt/agentic (AGENTIC_APP) and is
+#    NEVER mounted. STATE lives at AGENTIC_HOME, a SEPARATE, state-only dir
+#    (default ~/.agentic-data — NOT your ~/.agentic source checkout).
+#  • Only TWO host paths are mounted, both narrow and IDENTITY-mapped:
+#       ① AGENTIC_HOME  — state only (queue/worktrees/diffs/logs/settings/secrets)
+#       ② PROJECT_DIR   — the repo(s) you work on (== BROWSE_ROOT)
+#    There is NO whole-home mount. The wizard refuses overlapping or home-spanning
+#    paths, and the container entrypoint ABORTS if AGENTIC_HOME looks like a
+#    source checkout or overlaps PROJECT_DIR.
+#
+# IDENTITY MOUNTS: git worktree bakes ABSOLUTE realpath() strings into gitdir
+# files; accept/remove read them back. So both mounted paths MUST appear at the
+# SAME absolute path inside the container as on the host. Do not remap targets.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Ollama is NOT in this stack — it runs natively on the host (GPU), reached at
+# host.docker.internal:11434. Start it with OLLAMA_HOST=0.0.0.0 so the container
+# can connect.
+
+services:
+  agentic:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: agentic:local
+    container_name: agentic
+
+    ports:
+      - "${HOST_PORT:-4080}:4080"
+
+    environment:
+      # APP SOURCE — baked in the image, read-only, never mounted.
+      AGENTIC_APP: "/opt/agentic"
+      AGENTIC_PYTHON: "/opt/agentic/venv/bin/python3"
+      # STATE — the mounted, state-only dir (identity path). NOT a source checkout.
+      # We read the host path from AGENTIC_STATE_DIR (NOT AGENTIC_HOME) on purpose:
+      # a native install exports AGENTIC_HOME in the user's shell, and Docker
+      # Compose lets shell env override .env — so reusing that name would let the
+      # shell's ~/.agentic silently shadow this. AGENTIC_STATE_DIR can't collide.
+      # Inside the container it still becomes AGENTIC_HOME (what the code reads).
+      AGENTIC_HOME: "${AGENTIC_STATE_DIR}"
+      # The container's HOME lives INSIDE the mounted state dir, so npm/yarn/pnpm
+      # caches and `git config --global` (.gitconfig) write to a place uid 501
+      # actually owns. The host home is NOT mounted, so HOME=host-home would be
+      # unwritable (npm fails, global git config fails → merges lose identity).
+      # Keeping HOME in the state dir also isolates the container from your real
+      # ~/.gitconfig and ~/.npm. The wizard scaffolds this dir before `up`.
+      HOME: "${AGENTIC_STATE_DIR}/home"
+      AGENTIC_BIND: "0.0.0.0"
+      AGENTIC_PORT: "4080"
+      OLLAMA_HOST: "${OLLAMA_HOST:-http://host.docker.internal:11434}"
+      # The in-UI directory picker is confined to this; == the project mount.
+      BROWSE_ROOT: "${PROJECT_DIR}"
+      # Host ownership for files created in the mounts (no chown needed).
+      HOST_UID: "${HOST_UID:-1000}"
+      HOST_GID: "${HOST_GID:-1000}"
+
+    volumes:
+      # ① STATE — identity mount. State only; contains NO app source. Default
+      #    host path is ~/.agentic-data (the wizard enforces this), kept distinct
+      #    from your ~/.agentic source repo so a mount can never hit source.
+      - "${AGENTIC_STATE_DIR}:${AGENTIC_STATE_DIR}"
+      # ② PROJECT(S) — identity mount. The repo (or projects parent) you work on.
+      #    This is the ONLY host code the container can see; the picker browses
+      #    within it. Narrow by design — never the home dir.
+      - "${PROJECT_DIR}:${PROJECT_DIR}"
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    restart: unless-stopped
