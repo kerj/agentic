@@ -56,6 +56,48 @@ the wizard's validation is the safer path.
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph HOST["Host"]
+        BROWSER["Browser :4080"]
+        OLLAMA["Ollama — native GPU<br/>:11434"]
+        subgraph STATE["STATE DIR — rw mount"]
+            ST["AGENTIC_STATE_DIR<br/>queue · worktrees · diffs · logs<br/>settings · secrets · home"]
+        end
+        subgraph PROJ["PROJECT DIR — rw mount"]
+            REPO["PROJECT_DIR<br/>your git repos<br/>worktree pointers · merges"]
+        end
+    end
+    subgraph CONTAINER["Container — runs as host UID:GID"]
+        SERVE["serve.py<br/>dashboard + queue"]
+        WORKER["worker"]
+        subgraph BAKED["BAKED in image — never mounted"]
+            SRC["/opt/agentic<br/>bin · lib · agents · profiles · venv · fnm"]
+        end
+    end
+    BROWSER -->|"4080"| SERVE
+    SERVE --> WORKER
+    WORKER -.->|"source"| SRC
+    WORKER -->|"host.docker.internal"| OLLAMA
+    WORKER <-->|"build · state"| ST
+    WORKER <-->|"git · merge"| REPO
+
+    classDef baked fill:#1f2937,stroke:#6b7280,color:#e5e7eb;
+    classDef state fill:#0f3d2e,stroke:#3fb950,color:#d1fae5;
+    classDef proj fill:#1e3a5f,stroke:#58a6ff,color:#dbeafe;
+    class BAKED,SRC baked;
+    class STATE,ST state;
+    class PROJ,REPO proj;
+```
+
+App source is baked in the image (never mounted). The container writes to exactly
+two host dirs — the state dir (everything it scratches) and the project dir (git
+ops only). Ollama stays on the host. The two rules below make this safe.
+
+---
+
 ## The two rules that matter
 
 ### 1. Identity mounts

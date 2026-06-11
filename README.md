@@ -66,6 +66,66 @@ model, safety, multi-Node via fnm).
 
 ---
 
+## How it works (Docker)
+
+The container holds the app; your machine holds the data. The container writes to
+exactly **two** host directories (both mounted at their real paths), and the app
+source stays **baked in the image** so a mount can never corrupt it. Ollama runs
+natively on the host (it uses the GPU) and the container reaches it over the
+network.
+
+```mermaid
+flowchart TB
+    subgraph HOST["Your machine — host"]
+        BROWSER["Browser<br/>localhost:4080"]
+        OLLAMA["Ollama — native, GPU<br/>0.0.0.0:11434"]
+
+        subgraph STATE["STATE DIR — rw mount"]
+            ST["~/.agentic-data/<br/>queue · worktrees/job · diffs · logs<br/>settings · secrets · home"]
+        end
+
+        subgraph PROJ["PROJECT DIR — rw mount"]
+            REPO["~/Projects/...<br/>your git repos<br/>worktree pointers · accept-merges"]
+        end
+    end
+
+    subgraph CONTAINER["Container — image agentic:local, runs as your UID:GID"]
+        SERVE["serve.py<br/>dashboard + queue"]
+        WORKER["worker<br/>agentic worker-once"]
+        subgraph BAKED["BAKED in image — never mounted"]
+            SRC["/opt/agentic<br/>bin · lib · agents · profiles<br/>venv · fnm"]
+        end
+    end
+
+    BROWSER -->|"port 4080"| SERVE
+    SERVE --> WORKER
+    WORKER -.->|"runs source from"| SRC
+    WORKER -->|"host.docker.internal"| OLLAMA
+    WORKER <-->|"checkout · build · commit"| ST
+    WORKER <-->|"git worktree · merge"| REPO
+
+    classDef baked fill:#1f2937,stroke:#6b7280,color:#e5e7eb;
+    classDef state fill:#0f3d2e,stroke:#3fb950,color:#d1fae5;
+    classDef proj fill:#1e3a5f,stroke:#58a6ff,color:#dbeafe;
+    class BAKED,SRC baked;
+    class STATE,ST state;
+    class PROJ,REPO proj;
+```
+
+**A job's lifecycle:** submit in the dashboard → the worker runs `git worktree
+add` (checkout into the state dir, pointer into your repo) → installs deps (fnm
+picks the Node version, `npm ci`) → runs the agent via host **Ollama** → builds →
+commits to `agentic/<job>`. **Accept** merges that branch into your repo;
+**Review in IDE** applies it to your working tree.
+
+**Three boundaries:**
+- **Baked (gray)** — app source + venv + fnm in the image, never mounted.
+- **State dir (green)** — everything the container scratches; isolated from your
+  host `~/.npm` / `~/.gitconfig`.
+- **Project dir (blue)** — your real repos, touched only by git.
+
+---
+
 ## Command reference
 
 > Run these from the **cloned repo directory** (e.g. `~/agentic-src`) — the
