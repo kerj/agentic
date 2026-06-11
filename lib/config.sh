@@ -120,8 +120,13 @@ CONFIG
 function load_agentic_config() {
   if [[ -f "$AGENTIC_CONF" ]]; then
     source "$AGENTIC_CONF"
-  else
-    # Export auth defaults only (Ollama). Behavior knobs come from settings.json.
+  elif [[ "${AGENTIC_LOCAL:-}" == "1" ]]; then
+    # No .agentic.conf (the Docker case): only the LOCAL/Ollama backend wants
+    # ANTHROPIC_BASE_URL/AUTH_TOKEN pointed at the Ollama endpoint. Exporting
+    # these unconditionally used to leak http://localhost:11434 + token "ollama"
+    # into the CLOUD claude-CLI path, which then dialed Ollama's port and failed
+    # with ConnectionRefused. Cloud leaves them unset so the CLI defaults to
+    # api.anthropic.com (claude-api.sh / job_queue.py both default unset → that).
     export ANTHROPIC_AUTH_TOKEN="$AGENTIC_AUTH_TOKEN"
     export ANTHROPIC_BASE_URL="$AGENTIC_BASE_URL"
   fi

@@ -69,8 +69,35 @@ function run_worker_agent() {
   local model_flag=()
   [[ -n "$model" && "$model" != "auto" ]] && model_flag=(--model "$model")
 
-  echo "🤖 Running Claude agent${model:+ ($model)}..."
-  echo ""
+  # ROOT GUARD: the claude CLI REFUSES --dangerously-skip-permissions when run as
+  # root, then falls into an interactive path that fails as a cryptic
+  # "ConnectionRefused" retry loop. The agent worker MUST run unattended (no
+  # permission prompts), so running as root is unworkable for cloud jobs. Fail
+  # loudly with the real reason instead of the confusing connection error.
+  if [[ "$(id -u)" == "0" ]]; then
+    echo "❌ Cloud worker is running as ROOT — the Claude CLI blocks"
+    echo "   --dangerously-skip-permissions for root, so unattended jobs can't run."
+    echo "   Run the container as your host UID:GID (the entrypoint does this via"
+    echo "   gosu when HOST_UID/HOST_GID are set). In Docker, ensure HOST_UID/GID"
+    echo "   are in docker/.env (the wizard sets them)."
+    return 1
+  fi
+
+  # CLOUD ENDPOINT SCRUB (defense in depth) — the shared config
+  # (lib/config.sh load_agentic_config) historically exported the Ollama
+  # backend's ANTHROPIC_BASE_URL=http://localhost:11434 and
+  # ANTHROPIC_AUTH_TOKEN=ollama whenever there was no .agentic.conf (the Docker
+  # case). Those leaked into THIS cloud path: the claude CLI authenticated fine
+  # (apiKeySource: ANTHROPIC_API_KEY) but then dialed localhost:11434 (Ollama's
+  # port), where no Anthropic API listens → "Unable to connect to API
+  # (ConnectionRefused)" after 10 retries. config.sh now gates that export on
+  # local mode, but we still scrub here so a stray operator-set var can't
+  # repoison the cloud worker. Clearing both makes the CLI use its real default
+  # (api.anthropic.com). Use unset (not ="") — it removes the var unambiguously
+  # across CLI versions instead of relying on empty-string handling, and also
+  # drops the redundant auth token so there's no second auth signal.
+  unset ANTHROPIC_BASE_URL
+  unset ANTHROPIC_AUTH_TOKEN
 
   if [[ -n "$log_file" ]]; then
     claude \
