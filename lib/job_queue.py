@@ -967,11 +967,24 @@ def read_jobs() -> list[Job]:
 
 
 def get_ollama_models() -> list[str]:
-    """Return models available in the local Ollama instance."""
+    """Return models available in Ollama, via its HTTP API.
+
+    Uses OLLAMA_HOST/api/tags (default http://localhost:11434) — NOT the `ollama`
+    CLI. The CLI isn't present in the Docker image (Ollama runs on the host), and
+    the HTTP path also correctly honors a remote OLLAMA_HOST. Falls back to the
+    CLI only if the API is unreachable (e.g. an odd native setup)."""
+    host = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{host}/api/tags", timeout=5) as r:
+            data = json.load(r)
+        models = [m.get("name", "") for m in data.get("models", [])]
+        return [m for m in models if m]
+    except Exception:
+        pass
+    # Fallback: the CLI (native installs where the API isn't reachable directly).
     try:
         result = subprocess.run(
-            ["ollama", "list"],
-            capture_output=True, text=True, timeout=5,
+            ["ollama", "list"], capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
             return []
