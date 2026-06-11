@@ -12,16 +12,130 @@ While jobs run, your working tree is untouched — the agent works in a separate
 
 ---
 
-## Requirements
+## Setup (Docker — recommended)
 
-- `jq` — `brew install jq`
-- `pyenv` — [github.com/pyenv/pyenv](https://github.com/pyenv/pyenv#installation) — `install.sh` uses it to pin Python 3.11.9 for the project venv
-- **Cloud mode:** Claude Code CLI — [claude.ai/code](https://claude.ai/code) (authenticate on first run)
-- **Local mode:** Ollama — [ollama.com](https://ollama.com) + a model (see below)
+Docker is the supported way to run agentic. `docker compose up` and you land on
+the dashboard — no Python, Node, pyenv, or shell config to manage. (Native
+install is still available for contributors — see [Native install](#native-install-advanced).)
+
+### Requirements
+
+- **Docker Desktop** — [docker.com](https://www.docker.com/products/docker-desktop/) (running)
+- **Ollama** on the host — [ollama.com](https://ollama.com) + a pulled model
+  (v1 runs local mode; see [Local model setup](#local-model-setup)).
+  Ollama runs on your host (it uses the GPU); the container reaches it over the
+  network.
+
+> v1 image is **local mode (Ollama) + TypeScript projects**. Cloud (Claude Code)
+> in a container is on the roadmap.
+
+### Steps
+
+```bash
+# 1. Get the code  (clone anywhere — this dir is where you run all ./docker/… commands)
+git clone <repo-url> ~/agentic-src && cd ~/agentic-src
+
+# 2. Start Ollama on all interfaces so the container can reach it
+#    (a plain `ollama serve` binds to localhost only)
+OLLAMA_HOST=0.0.0.0:11434 ollama serve &
+
+# 3. Run the setup wizard — it writes docker/.env and scaffolds the state dir
+./docker/setup.sh
+
+# 4. Start it
+./docker/up.sh --build
+```
+
+> **Run every `./docker/…` command from the cloned repo directory** (e.g.
+> `~/agentic-src`). They're relative paths — `cd` there first, or you'll get
+> `no such file or directory`.
+
+Open [http://localhost:4080](http://localhost:4080), then configure mode/model in
+the **Settings** panel. **To stop:** `./docker/down.sh` (from the repo dir).
+
+**The wizard asks for two paths:**
+- **Project dir** — the repo (or a `Projects/` parent) agents work on. It's the
+  only host code the container can see; the in-app picker browses within it.
+- **State dir** — where the queue/worktrees/diffs/logs/settings live. Defaults to
+  `~/.agentic-data`, kept separate from the app source (the wizard refuses unsafe
+  choices). Pick a repo per job in **Settings → Default project path → Browse…**.
+
+See the [Command reference](#command-reference) below for all start/stop options,
+and [docker/README.md](docker/README.md) for the full Docker reference (mount
+model, safety, multi-Node via fnm).
 
 ---
 
-## Setup
+## Command reference
+
+> Run these from the **cloned repo directory** (e.g. `~/agentic-src`) — the
+> `./docker/…` paths are relative to it. `cd` there first.
+
+Start/stop is done with two wrapper scripts that wrap `docker compose` with the
+right `--env-file`/`-f` so you never type those.
+
+### Start / stop
+
+```bash
+./docker/setup.sh         # one-time: wizard writes docker/.env + scaffolds state dir
+
+./docker/up.sh            # start (foreground — logs in your terminal; Ctrl-C stops)
+./docker/up.sh -d         # start detached (background)
+./docker/up.sh --build    # rebuild the image first (after a code/Dockerfile change)
+./docker/up.sh -d --build # rebuild + detached
+
+./docker/down.sh          # stop and remove the container (state + repos untouched)
+```
+
+### Host prerequisites (before `up`)
+
+```bash
+# Docker Desktop must be running.
+
+# Ollama on the host, on all interfaces so the container can reach it.
+# A plain `ollama serve` binds to 127.0.0.1 only — inline the env var:
+OLLAMA_HOST=0.0.0.0:11434 ollama serve
+
+ollama pull qwen3.6:27b   # or your model of choice (see Model recommendations)
+```
+
+### Inspect / manage a running container
+
+```bash
+docker logs -f agentic                       # tail the dashboard/worker logs
+docker ps --filter name=agentic              # is it running? on what port?
+docker exec -it agentic bash                 # shell into the container
+./docker/down.sh && ./docker/up.sh -d --build  # rebuild + restart in one line
+```
+
+### Change the dashboard port
+
+Edit `HOST_PORT` in `docker/.env` (default `4080`; use `4081` to run alongside a
+native server on `4080`), then `./docker/down.sh && ./docker/up.sh -d`.
+
+### Running the container and a native server at once
+
+You can, but **give them different ports AND different state dirs** — otherwise
+they fight over `:4080` and corrupt the same queue. `up.sh` refuses to start if
+its `HOST_PORT` is already taken (e.g. by a native `agentic serve`). To run both:
+
+- Native on `4080` with state `~/.agentic` (its default).
+- Container on `HOST_PORT=4081` with a separate `AGENTIC_STATE_DIR`
+  (e.g. `~/.agentic-data`, the wizard's default).
+
+They then have independent queues and dashboards. The simpler path is to run one
+at a time: `agentic serve stop` before `./docker/up.sh`, or `./docker/down.sh`
+before `agentic serve`.
+
+> Everything else — mode, model, context budget, default repo — is set in the
+> browser **Settings** panel, not on the command line.
+
+---
+
+## Native install (advanced)
+
+For contributors or anyone who'd rather run on the host. Needs `jq`, `pyenv`
+(pins Python 3.11.9 for the venv), and — for cloud mode — the Claude Code CLI.
 
 ```bash
 git clone <repo-url> ~/.agentic
@@ -29,17 +143,19 @@ bash ~/.agentic/install.sh
 source ~/.zshrc
 ```
 
+Then `cd your-project && agentic serve` (cloud) or `agentic serve --local`
+(Ollama). Native mode keeps app source and state together in `~/.agentic`; the
+Docker setup keeps them separate (source baked in the image, state in a mounted
+dir). All the dashboard/usage docs below apply to both.
+
 ---
 
 ## Usage
 
-```bash
-cd your-project
-agentic serve          # cloud mode (Claude Code)
-agentic serve --local  # local mode (Ollama)
-```
-
-Open [http://localhost:4080](http://localhost:4080).
+Start the app (`./docker/up.sh` for Docker, or `agentic serve` / `agentic serve
+--local` for a native install) and open
+[http://localhost:4080](http://localhost:4080). Everything below is the same in
+both — the dashboard, jobs, review, and merge workflow are identical.
 
 **Submit a job** — describe what you want and hit Submit (`Cmd+Enter`).
 
@@ -143,7 +259,10 @@ Browse [ollama.com/library](https://ollama.com/library) — filter by **tools** 
 
 ---
 
-## Server commands
+## Server commands (native install)
+
+For the native install. With Docker, use `./docker/up.sh` / `./docker/down.sh`
+(see [Command reference](#command-reference)).
 
 ```bash
 agentic serve              # cloud, port 4080
@@ -159,7 +278,7 @@ agentic serve status
 
 | Action | What it does |
 |---|---|
-| **Review in IDE** | Apply agent changes as staged edits — review in VS Code Source Control, edit in place, then commit or discard (`git restore --staged . && git checkout -- .`) |
+| **Review in IDE** | Apply agent changes to your working tree (unstaged) — review in VS Code, edit in place, then commit or discard (`git checkout -- .`) |
 | **Accept** | Merge single job onto base branch |
 | **Accept Chain ↓** | Merge whole chain onto one staging branch |
 | **Reject** | Delete branch and worktree |
@@ -194,7 +313,7 @@ export OLLAMA_KEEP_ALIVE="30m"
 
 # Optional: only needed for `agentic plan` and `agentic doc-gen`
 export ANTHROPIC_API_KEY=""
-export AGENTIC_MODEL="claude-opus-4-7"
+export AGENTIC_MODEL="claude-opus-4-8"
 ```
 
 ---
