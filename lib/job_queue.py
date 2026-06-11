@@ -995,15 +995,27 @@ def get_ollama_models() -> list[str]:
         return []
 
 
+# Shown when no ANTHROPIC_API_KEY is set (so the live /v1/models can't be
+# queried). Keep current: bare IDs, no date suffixes. Verify against the Claude
+# API docs when newer models ship rather than guessing.
 FALLBACK_MODELS = [
     "auto",
     "claude-opus-4-8",
     "claude-opus-4-7",
+    "claude-opus-4-6",
     "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
+    "claude-haiku-4-5",
 ]
 
 _models_cache: list[str] | None = None
+
+
+def invalidate_models_cache() -> None:
+    """Clear the model-list cache so the next fetch re-queries the live API. Call
+    after the API key is saved/changed (otherwise a fallback list cached before
+    the key existed sticks until restart)."""
+    global _models_cache
+    _models_cache = None
 
 
 def fetch_models() -> list[str]:
@@ -1012,7 +1024,14 @@ def fetch_models() -> list[str]:
     if _models_cache is not None:
         return _models_cache
 
-    api_key  = os.environ.get("ANTHROPIC_API_KEY", "")
+    # The key is saved to secrets.json (UI) — read it from there, not just the
+    # environment (the server process has no ANTHROPIC_API_KEY env var unless it
+    # was exported at launch). get_secret() checks secrets.json THEN the env.
+    try:
+        import settings as _s
+        api_key = _s.get_secret("ANTHROPIC_API_KEY") or ""
+    except Exception:
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     base_url = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
 
     if not api_key or not base_url.startswith("https://api.anthropic.com"):

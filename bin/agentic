@@ -216,9 +216,27 @@ case "${1:-}" in
     _wtarget=$(jq -r '.target_repo' "$_wjob_path")
     _wmodel=$(jq -r '.model_hint // empty' "$_wjob_path")
 
+    # Resolve the ACTUAL model this run will use (mode + the global Settings
+    # model), and record it on the job so the UI can show "ran on X" instead of
+    # the ambiguous 'auto'. Model is resolved at RUN time from Settings, not at
+    # submit time. worker.sh applies the same resolution.
+    local _wresolved
+    if [[ "${AGENTIC_LOCAL:-}" == "1" ]]; then
+      _wresolved="${AGENTIC_LOCAL_MODEL:-qwen-coder:latest}"
+      _wresolved="local · ${_wresolved}"
+    else
+      local _cm="${AGENTIC_MODEL:-auto}"
+      _wresolved="cloud · ${_cm}"
+    fi
+    # Write resolved_model into the running job JSON (best-effort).
+    local _wtmp
+    _wtmp=$(mktemp) && jq --arg m "$_wresolved" '.resolved_model = $m' "$_wjob_path" > "$_wtmp" 2>/dev/null \
+      && mv "$_wtmp" "$_wjob_path" 2>/dev/null || rm -f "$_wtmp" 2>/dev/null
+
     echo "🔧 Claimed: $_wid"
     echo "   Request: ${_wrequest:0:80}"
     echo "   Repo:    $_wtarget"
+    echo "   Model:   $_wresolved"
     echo ""
 
     local _wworktree="${AGENTIC_WORKTREES_DIR}/${_wid}"

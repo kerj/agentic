@@ -47,9 +47,10 @@ SCHEMA: dict[str, dict[str, Any]] = {
     "mode": {
         "default": "local", "env": "AGENTIC_MODE", "type": "str",
         "options": ["local", "cloud"],
-        "group": "mode", "control": "select", "label": "Execution mode",
-        "help": "Run jobs locally (Ollama on the host) or via the Claude API (cloud). "
-                "Replaces the old --local flag — set it here, takes effect on the next job.",
+        "group": "mode", "control": "select", "label": "Job execution mode",
+        "help": "How the WORKER runs queued jobs: locally (Ollama) or via the Claude "
+                "API (cloud). Global — applies to every job. Separate from a planning "
+                "channel's backend, which you pick per thread. Takes effect on the next job.",
     },
     "default_repo": {
         "default": "", "env": "AGENTIC_DEFAULT_REPO", "type": "str",
@@ -78,6 +79,29 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "group": "context", "control": "slider", "label": "Max turns per job",
         "help": "Hard cap on agent turns before a job stops.",
     },
+    # ── Planning channels (read-only grounding agent) ──
+    "planning_max_turns": {
+        "default": 8, "env": "AGENTIC_PLANNING_MAX_TURNS", "type": "int",
+        "min": 1, "max": 40, "step": 1,
+        "group": "planning", "control": "slider", "label": "Planning max turns",
+        "help": "Hard cap on read-agent turns when answering a planning-channel "
+                "question (the only cap on a planning thread). Lower than jobs' "
+                "Max turns because grounding a question should be cheap.",
+    },
+    "planning_default_mode": {
+        "default": "local", "env": "AGENTIC_PLANNING_DEFAULT_MODE", "type": "str",
+        "options": ["local", "cloud"],
+        "group": "planning", "control": "select", "label": "Planning default backend",
+        "help": "Backend a new planning thread starts on — Ollama (local) or the "
+                "Claude CLI (cloud). Decoupled from Execution mode: you can plan "
+                "with cloud while jobs run local, or vice-versa. Editable per thread.",
+    },
+    "planning_default_model": {
+        "default": "", "env": "AGENTIC_PLANNING_DEFAULT_MODEL", "type": "str",
+        "group": "planning", "control": "text", "label": "Planning default model",
+        "help": "Model a new planning thread starts on. Empty = let the chosen "
+                "backend pick its default. Editable per thread.",
+    },
     "compress_margin": {
         "default": 4000, "env": "AGENTIC_COMPRESS_MARGIN", "type": "int",
         "min": 0, "max": 20000, "step": 1000,
@@ -90,6 +114,12 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "default": "qwen-coder:latest", "env": "AGENTIC_LOCAL_MODEL", "type": "str",
         "group": "model", "control": "select", "label": "Local model",
         "help": "The Ollama model jobs run against.",
+    },
+    "cloud_model": {
+        "default": "auto", "env": "AGENTIC_MODEL", "type": "str",
+        "group": "cloud", "control": "select", "label": "Cloud model",
+        "help": "The Claude model cloud jobs run against. 'auto' lets the CLI pick. "
+                "The list reflects your account (set the API key above to fetch it).",
     },
     "ollama_keep_alive": {
         "default": "30m", "env": "OLLAMA_KEEP_ALIVE", "type": "str",
