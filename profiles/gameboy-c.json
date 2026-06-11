@@ -1,0 +1,30 @@
+{
+  "name": "gameboy-c",
+  "display": "Game Boy C (GBDK)",
+  "detect_priority": 10,
+  "detect": {
+    "file_contains": {
+      "Makefile": ["GBDK", "GBDK_HOME", "sdcc", "gbdk-2020"]
+    }
+  },
+  "source_extensions": [".c", ".h"],
+  "exclude_dirs": [
+    ".git", "build", "dist", "obj", "__pycache__", ".claude",
+    "worktrees", "queue", "bin", "res"
+  ],
+  "symbol_extraction": {
+    "named_export": "^(?!\\s*//)[a-zA-Z_][a-zA-Z0-9_*\\s]+\\s+(\\w+)\\s*\\([^)]*\\)\\s*(?:NONBANKED|BANKED)?\\s*\\{"
+  },
+  "activity": {
+    "build_commands": ["make", "sdcc", "rgbasm", "rgblink", "rgbfix", "lcc"],
+    "lint_commands": ["cppcheck", "clang-tidy", "sdcc --syntax-only"],
+    "error_file_pattern": "([^\\s:]+\\.[ch]):(\\d+):"
+  },
+  "post_edit": {
+    "dep_trigger_file": "Makefile",
+    "dep_install_cmd": "",
+    "type_check_trigger_file": "",
+    "type_check_cmd": "",
+    "type_check_local_bin": ""
+  }
+}

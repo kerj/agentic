@@ -1,0 +1,25 @@
+LANGUAGE: TypeScript / JavaScript (npm / React) — Local Runner
+
+BUILD AND VERIFY:
+4. Call Setup() — installs node_modules. If you need a new library, pass it:
+   Setup(packages=["react-window", "@types/react-window"])
+5. Call Build() — runs npm run build and returns pass/fail with errors.
+   Fix ALL errors before continuing. Read the error file, line, and code — fix the root cause.
+6. If Build() passes, run lint via Bash if a lint script exists in package.json:
+   Bash("npm run lint 2>&1")
+   Fix errors; warnings are optional but worth reviewing.
+   If .prettierrc exists, run: Bash("npx prettier --write src/")
+7. If the project has tests (check package.json scripts for "test"), run them via Bash too
+8. Stage and commit: git add -A && git commit -m "<short descriptive message>"
+
+EXTERNAL LIBRARY RULE:
+Before writing any code that uses an npm package you haven't already read:
+- Read node_modules/<package>/dist/<package>.d.ts to find the actual exported names and prop types
+- Never assume an API from training data — packages change between versions
+- This is mandatory for any package not in React's core (react, react-dom)
+
+LANGUAGE-SPECIFIC PRINCIPLES:
+- A passing Build() is the minimum bar — keep fixing until it passes
+- For third-party libraries, check actual type definitions before using refs or imperative APIs
+- Hook ordering matters: declare values with useMemo/useState before using them in other hooks
+- Use what already exists — if a hook, type, or component is already in the project, import it

@@ -5,14 +5,47 @@ set -euo pipefail
 
 AGENTIC_HOME="${AGENTIC_HOME:-$HOME/.agentic}"
 
-source "$AGENTIC_HOME/lib/config.sh"
-source "$AGENTIC_HOME/lib/utils.sh"
-source "$AGENTIC_HOME/lib/init.sh"
-source "$AGENTIC_HOME/lib/doc.sh"
-source "$AGENTIC_HOME/lib/apply.sh"
-source "$AGENTIC_HOME/lib/plan.sh"
-source "$AGENTIC_HOME/lib/worker.sh"
-source "$AGENTIC_HOME/lib/queue.sh"
+# APP SOURCE vs STATE split.
+#   AGENTIC_HOME — STATE only (queue/worktrees/diffs/logs/settings/secrets).
+#   AGENTIC_APP  — the app SOURCE tree (bin/lib/agents/profiles/venv).
+# Native install: both live in ~/.agentic, so AGENTIC_APP defaults to
+# AGENTIC_HOME and nothing changes. Docker sets AGENTIC_APP=/opt/agentic (baked,
+# read-only) so the container never needs to write source into the state mount.
+# AGENTIC_PYTHON is the interpreter (the baked venv in Docker, the local venv
+# natively). Exported so every sourced lib and child process inherits them.
+export AGENTIC_HOME
+export AGENTIC_APP="${AGENTIC_APP:-$AGENTIC_HOME}"
+export AGENTIC_PYTHON="${AGENTIC_PYTHON:-$AGENTIC_APP/venv/bin/python3}"
+
+source "$AGENTIC_APP/lib/config.sh"
+source "$AGENTIC_APP/lib/utils.sh"
+source "$AGENTIC_APP/lib/init.sh"
+source "$AGENTIC_APP/lib/claude-api.sh"
+source "$AGENTIC_APP/lib/doc.sh"
+source "$AGENTIC_APP/lib/apply.sh"
+source "$AGENTIC_APP/lib/plan.sh"
+source "$AGENTIC_APP/lib/worker.sh"
+source "$AGENTIC_APP/lib/queue.sh"
+
+# Walk parent_request_id chain to find the root non-review job's ID.
+# All review jobs (and reviews of reviews) commit onto agentic/<root-id>.
+_find_root_branch_id() {
+  local current_id="$1"
+  local seen=""
+  while [[ -n "$current_id" ]]; do
+    case "$seen" in *" $current_id "*) echo "$current_id"; return ;; esac
+    seen="$seen $current_id "
+    local job_file
+    job_file=$(find "${AGENTIC_QUEUE_DIR}" -name "*.json" \
+      -exec grep -l "\"id\": \"${current_id}\"" {} + 2>/dev/null | head -1)
+    [[ -z "$job_file" ]] && { echo "$current_id"; return; }
+    local jtype
+    jtype=$(jq -r '.job_type // empty' "$job_file")
+    [[ "$jtype" != "review" ]] && { echo "$current_id"; return; }
+    current_id=$(jq -r '.parent_request_id // empty' "$job_file")
+  done
+  echo "$1"
+}
 
 _main() {
 case "${1:-}" in
@@ -177,10 +210,11 @@ case "${1:-}" in
       exit 0
     fi
 
-    local _wid _wrequest _wtarget
+    local _wid _wrequest _wtarget _wmodel
     _wid=$(jq -r '.id' "$_wjob_path")
     _wrequest=$(jq -r '.request' "$_wjob_path")
     _wtarget=$(jq -r '.target_repo' "$_wjob_path")
+    _wmodel=$(jq -r '.model_hint // empty' "$_wjob_path")
 
     echo "🔧 Claimed: $_wid"
     echo "   Request: ${_wrequest:0:80}"
@@ -188,55 +222,154 @@ case "${1:-}" in
     echo ""
 
     local _wworktree="${AGENTIC_WORKTREES_DIR}/${_wid}"
-    local _wbranch="agentic/${_wid}"
+    local _wjob_type
+    _wjob_type=$(jq -r '.job_type // empty' "$_wjob_path")
 
-    # Chain: base from parent job's branch if it exists
     local _wparent_id
     _wparent_id=$(jq -r '.parent_request_id // empty' "$_wjob_path")
-    local _wbase_branch
-    if [[ -n "$_wparent_id" ]] && \
-       git -C "$_wtarget" show-ref --verify --quiet "refs/heads/agentic/${_wparent_id}" 2>/dev/null; then
-      _wbase_branch="agentic/${_wparent_id}"
-      echo "🔗 Chaining from: $_wbase_branch"
-    else
-      _wbase_branch=$(git -C "$_wtarget" symbolic-ref --short HEAD 2>/dev/null || echo "HEAD")
+
+    # Export profile so utils.sh, apply.sh, and other sourced scripts can read it
+    export AGENTIC_PROFILE
+    AGENTIC_PROFILE=$(jq -r '.profile // "typescript"' "$_wjob_path")
+
+    # Review jobs commit onto the root (non-review) job's branch — resolve it by
+    # walking up parent_request_id until we find a non-review job.
+    # Reviews-of-reviews all land on agentic/<root-job-id>, same as direct reviews.
+    local _wroot_branch_id="$_wid"
+    if [[ "$_wjob_type" == "review" && -n "$_wparent_id" ]]; then
+      _wroot_branch_id=$(_find_root_branch_id "$_wparent_id")
     fi
 
-    # Clean up stale worktree/branch from previous run of this job
+    local _wbranch _wnew_branch
+    if [[ "$_wjob_type" == "review" ]] && \
+       git -C "$_wtarget" show-ref --verify --quiet "refs/heads/agentic/${_wroot_branch_id}" 2>/dev/null; then
+      _wbranch="agentic/${_wroot_branch_id}"
+      _wnew_branch=""
+      echo "🔍 Review job — committing onto: $_wbranch"
+    else
+      _wbranch="agentic/${_wid}"
+      _wnew_branch="$_wbranch"
+    fi
+
+    # Determine base branch for new-branch jobs
+    local _wbase_branch=""
+    if [[ -n "$_wnew_branch" ]]; then
+      if [[ -n "$_wparent_id" ]] && \
+         git -C "$_wtarget" show-ref --verify --quiet "refs/heads/agentic/${_wparent_id}" 2>/dev/null; then
+        _wbase_branch="agentic/${_wparent_id}"
+        echo "🔗 Chaining from: $_wbase_branch"
+      else
+        _wbase_branch=$(git -C "$_wtarget" symbolic-ref --short HEAD 2>/dev/null || echo "HEAD")
+      fi
+    fi
+
+    # Clean up stale worktree from previous run of this job
     if [[ -d "$_wworktree" ]]; then
       echo "♻️  Removing stale worktree from previous run..."
       git -C "$_wtarget" worktree remove "$_wworktree" --force 2>/dev/null || rm -rf "$_wworktree"
     fi
-    if git -C "$_wtarget" show-ref --verify --quiet "refs/heads/${_wbranch}" 2>/dev/null; then
+
+    # For review jobs: release the parent's worktree so its branch can be checked out here.
+    # The branch and its commit are preserved — only the filesystem checkout is removed.
+    if [[ "$_wjob_type" == "review" && -n "$_wparent_id" ]]; then
+      local _wparent_wt="${AGENTIC_WORKTREES_DIR}/${_wparent_id}"
+      if [[ -d "$_wparent_wt" ]]; then
+        echo "♻️  Releasing parent worktree to free branch for review..."
+        git -C "$_wtarget" worktree remove "$_wparent_wt" --force 2>/dev/null || rm -rf "$_wparent_wt"
+      fi
+    fi
+    # Only clean up a stale branch if we own one (regular jobs, not review jobs)
+    if [[ -n "$_wnew_branch" ]] && \
+       git -C "$_wtarget" show-ref --verify --quiet "refs/heads/${_wnew_branch}" 2>/dev/null; then
       echo "♻️  Removing stale branch from previous run..."
-      git -C "$_wtarget" branch -D "$_wbranch" 2>/dev/null || true
+      git -C "$_wtarget" branch -D "$_wnew_branch" 2>/dev/null || true
     fi
 
-    if ! git -C "$_wtarget" worktree add "$_wworktree" -b "$_wbranch" "$_wbase_branch" 2>&1; then
-      echo "❌ Failed to create worktree at $_wworktree"
-      queue_complete "$_wjob_path" "failed" "worktree creation failed"
-      _queue_notify "agentic: failed" "Job $_wid — worktree creation failed"
-      exit 1
+    if [[ -n "$_wnew_branch" ]]; then
+      if ! git -C "$_wtarget" worktree add "$_wworktree" -b "$_wnew_branch" "$_wbase_branch" 2>&1; then
+        echo "❌ Failed to create worktree at $_wworktree"
+        queue_complete "$_wjob_path" "failed" "worktree creation failed"
+        _queue_notify "agentic: failed" "Job $_wid — worktree creation failed"
+        exit 1
+      fi
+    else
+      if ! git -C "$_wtarget" worktree add "$_wworktree" "$_wbranch" 2>&1; then
+        echo "❌ Failed to create worktree at $_wworktree"
+        queue_complete "$_wjob_path" "failed" "worktree creation failed"
+        _queue_notify "agentic: failed" "Job $_wid — worktree creation failed"
+        exit 1
+      fi
+    fi
+
+    # When chaining, merge the repo's main branch so commits made to main after the
+    # parent job branched (e.g. assets, CLAUDE.md updates) are visible in this worktree.
+    if [[ -n "$_wparent_id" && -n "$_wnew_branch" ]]; then
+      local _wmain
+      _wmain=$(jq -r '.base_branch // empty' "$_wjob_path")
+      [[ -z "$_wmain" ]] && _wmain=$(git -C "$_wtarget" symbolic-ref --short HEAD 2>/dev/null || echo "master")
+      if [[ "$_wbase_branch" != "$_wmain" ]] && \
+         git -C "$_wtarget" show-ref --verify --quiet "refs/heads/${_wmain}" 2>/dev/null; then
+        if git -C "$_wworktree" merge --no-edit --no-ff "$_wmain" -m "Merge ${_wmain} into chain" 2>/dev/null; then
+          echo "🔀 Merged ${_wmain} into chain (new commits since parent branched)"
+        fi
+      fi
     fi
 
     echo "🌿 Worktree: $_wworktree"
     echo "🌿 Branch:   $_wbranch"
     echo ""
 
+    # Record the branch tip before the agent runs so we can squash its commits
+    local _wbase_sha
+    _wbase_sha=$(git -C "$_wworktree" rev-parse HEAD 2>/dev/null || echo "")
+
     # Run the Claude Code agent inside the worktree
-    # Save the JSONL stream alongside the worktree for the dashboard audit view
-    local _wlog="${_wworktree}/.agent_log.jsonl"
+    # Save the JSONL log to LOGS_DIR (outside the worktree) to avoid merge conflicts
+    mkdir -p "${AGENTIC_HOME}/logs"
+    local _wlog="${AGENTIC_HOME}/logs/${_wid}.jsonl"
     local _wrc=0
     (
       cd "$_wworktree" || exit 1
-      run_worker_agent "$_wrequest" "$_wlog"
+      export AGENTIC_TARGET_REPO="$_wtarget"
+      run_worker_agent "$_wrequest" "$_wlog" "$_wmodel"
     ) || _wrc=$?
 
     if [[ $_wrc -eq 0 ]]; then
+      # Squash all agent commits + any unstaged changes into one atomic commit.
+      # This guarantees one commit per job regardless of how many the agent made.
+      if [[ -n "$_wbase_sha" ]]; then
+        git -C "$_wworktree" add -A 2>/dev/null || true
+        git -C "$_wworktree" reset --soft "$_wbase_sha" 2>/dev/null || true
+        git -C "$_wworktree" add -A 2>/dev/null || true
+        if ! git -C "$_wworktree" diff --cached --quiet 2>/dev/null; then
+          git -C "$_wworktree" commit -m "agentic: $_wid" --no-verify 2>/dev/null || true
+          echo "📦 Squashed to single commit"
+        fi
+      fi
+
       local _wsha
       _wsha=$(git -C "$_wworktree" rev-parse --short HEAD 2>/dev/null || echo "unknown")
       local _wsummary="applied to ${_wbranch}, SHA ${_wsha}"
       queue_complete "$_wjob_path" "done" "$_wsummary"
+
+      # For review jobs, append this SHA to the parent job's reviews[] array
+      if [[ "$_wjob_type" == "review" && -n "$_wparent_id" ]]; then
+        local _wparent_file
+        _wparent_file=$(find "${AGENTIC_QUEUE_DIR}" -name "*.json" | \
+          xargs grep -l "\"id\": \"${_wparent_id}\"" 2>/dev/null | head -1)
+        if [[ -n "$_wparent_file" ]]; then
+          local _wnow
+          _wnow=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || echo "")
+          local _wentry="{\"sha\":\"${_wsha}\",\"job_id\":\"${_wid}\",\"at\":\"${_wnow}\"}"
+          local _wtmp
+          _wtmp=$(mktemp)
+          jq --argjson entry "$_wentry" \
+            'if has("reviews") then .reviews += [$entry] else .reviews = [$entry] end' \
+            "$_wparent_file" > "$_wtmp" && mv "$_wtmp" "$_wparent_file"
+          echo "📝 Review SHA recorded on parent job"
+        fi
+      fi
+
       echo ""
       echo "✅ Job complete: $_wid"
       echo "   Branch: $_wbranch"
@@ -255,7 +388,7 @@ case "${1:-}" in
 
   # serve [PORT] | serve stop | serve status
   serve)
-    local _spid_file="${HOME}/.agentic/serve.pid"
+    local _spid_file="${AGENTIC_HOME}/serve.pid"
     case "${2:-start}" in
       stop)
         if [[ ! -f "$_spid_file" ]]; then
@@ -294,10 +427,21 @@ case "${1:-}" in
       start|[0-9]*)
         local _sport_arg=""
         [[ "${2:-}" =~ ^[0-9]+$ ]] && _sport_arg="${2}"
-        exec python3 "$AGENTIC_HOME/lib/serve.py" ${_sport_arg:+"$_sport_arg"}
+        exec "${AGENTIC_PYTHON}" "$AGENTIC_APP/lib/serve.py" ${_sport_arg:+"$_sport_arg"}
+        ;;
+      --local|--local=*)
+        # agentic serve --local [MODEL]
+        # Priority: --local=model > AGENTIC_LOCAL_MODEL env var > default
+        local _lmodel="${AGENTIC_LOCAL_MODEL:-qwen-coder:latest}"
+        [[ "${2}" == --local=* ]] && _lmodel="${2#--local=}"
+        [[ -n "${3:-}" ]] && _lmodel="$3"
+        export AGENTIC_LOCAL=1
+        export AGENTIC_LOCAL_MODEL="$_lmodel"
+        echo "🏠 Local mode: $_lmodel"
+        exec "${AGENTIC_PYTHON}" "$AGENTIC_APP/lib/serve.py"
         ;;
       *)
-        exec python3 "$AGENTIC_HOME/lib/serve.py"
+        exec "${AGENTIC_PYTHON}" "$AGENTIC_APP/lib/serve.py"
         ;;
     esac
     ;;

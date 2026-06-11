@@ -1,0 +1,27 @@
+# Build context exclusions for the agentic image.
+# CRITICAL: secrets and per-host state must NEVER enter the image layer.
+# These live on the mounted host volume at runtime instead.
+
+# Secrets & per-host config (gitignored on the host too)
+secrets.json
+settings.json
+.agentic.conf
+serve.pid
+
+# Runtime state — bind-mounted at runtime, never baked in
+queue/
+worktrees/
+diffs/
+logs/
+
+# The host venv is python/arch-specific; the image builds its own
+venv/
+
+# VCS / editor / OS noise
+.git/
+.gitignore
+.llmignore
+**/.DS_Store
+**/__pycache__/
+**/*.pyc
+node_modules/

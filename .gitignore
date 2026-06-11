@@ -1,8 +1,16 @@
 .agentic.conf
+settings.json
+secrets.json
 .ds_store
 queue/
 worktrees/
+diffs/
+logs/
 serve.pid
 __pycache__/
 *.pyc
+venv/
 .claude/
+
+# Docker env (host paths + uid/gid) — only .env.example is tracked
+docker/.env

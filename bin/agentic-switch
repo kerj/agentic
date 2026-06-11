@@ -73,7 +73,7 @@ _switch_to_anthropic() {
 
   cat > "$CONF" << EOF
 # ── Anthropic ──────────────────────────────────────────────────────────────
-export AGENTIC_MODEL="claude-opus-4-20250514"
+export AGENTIC_MODEL="claude-opus-4-8"
 export ANTHROPIC_BASE_URL="https://api.anthropic.com"
 export ANTHROPIC_API_KEY="$existing_key"
 unset ANTHROPIC_AUTH_TOKEN
@@ -83,7 +83,7 @@ export OLLAMA_KEEP_ALIVE="30m"
 EOF
 
   chmod 600 "$CONF"
-  echo "✅ Switched to Anthropic (claude-opus-4-20250514)"
+  echo "✅ Switched to Anthropic (claude-opus-4-8)"
   echo "   Run: source \$AGENTIC_HOME/.agentic.conf"
 }
 
@@ -94,7 +94,7 @@ _switch_to_ollama() {
 
   cat > "$CONF" << 'EOF'
 # ── Ollama / Qwen ──────────────────────────────────────────────────────────
-export AGENTIC_MODEL="qwen2.5-coder:32b"
+export AGENTIC_MODEL="qwen-coder:latest"
 export ANTHROPIC_BASE_URL="http://localhost:11434"
 export ANTHROPIC_AUTH_TOKEN="ollama"
 unset ANTHROPIC_API_KEY
@@ -110,7 +110,7 @@ EOF
   fi
 
   chmod 600 "$CONF"
-  echo "✅ Switched to Ollama (qwen2.5-coder:32b)"
+  echo "✅ Switched to Ollama (qwen-coder:latest)"
   echo "   Run: source \$AGENTIC_HOME/.agentic.conf"
 }
 

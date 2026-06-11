@@ -1,0 +1,28 @@
+{
+  "name": "typescript",
+  "display": "TypeScript / React",
+  "detect": {
+    "any_file": ["package.json", "tsconfig.json"]
+  },
+  "source_extensions": [".ts", ".tsx"],
+  "exclude_dirs": [
+    "node_modules", ".git", "dist", "build", ".next", ".claude",
+    "coverage", "__pycache__", ".turbo", "out", ".vercel", "worktrees", "queue"
+  ],
+  "symbol_extraction": {
+    "named_export": "^export\\s+(?:(?:async|default|declare|abstract)\\s+)*(?:function\\*?\\s+|const\\s+|let\\s+|var\\s+|class\\s+|interface\\s+|type\\s+|enum\\s+)(\\w+)",
+    "reexport": "^export\\s+\\{([^}]+)\\}"
+  },
+  "activity": {
+    "build_commands": ["npm run build", "yarn build", "pnpm build", "vite build", "tsc"],
+    "lint_commands": ["npm run lint", "yarn lint", "eslint", "prettier"],
+    "error_file_pattern": "([^\\s(]+\\.[tj]sx?)\\(\\d+,\\d+\\):\\s+error"
+  },
+  "post_edit": {
+    "dep_trigger_file": "package.json",
+    "dep_install_cmd": "npm install --silent",
+    "type_check_trigger_file": "tsconfig.json",
+    "type_check_cmd": "tsc --noEmit --skipLibCheck",
+    "type_check_local_bin": "node_modules/.bin/tsc"
+  }
+}

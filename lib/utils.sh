@@ -62,41 +62,55 @@ _apply_get_task_ids() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 _build_repo_map() {
-  python3 - <<'PYEOF'
-import os, re
+  local _profile_path="${AGENTIC_APP:-$AGENTIC_HOME}/profiles/${AGENTIC_PROFILE:-typescript}.json"
+  AGENTIC_PROFILE_PATH="$_profile_path" \
+  "${AGENTIC_PYTHON:-$AGENTIC_HOME/venv/bin/python3}" - <<'PYEOF'
+import os, re, json, sys
 
-EXCLUDES = {'node_modules', '.git', 'dist', 'build', '.next', '.claude',
-            'coverage', '__pycache__', '.turbo', 'out', '.vercel',
-            'worktrees', 'queue'}
+# Load profile — fall back to TypeScript defaults if anything goes wrong
+_profile_path = os.environ.get('AGENTIC_PROFILE_PATH', '')
+try:
+    _p = json.load(open(_profile_path))
+    EXTENSIONS = tuple(_p.get('source_extensions', ['.ts', '.tsx']))
+    EXCLUDES   = set(_p.get('exclude_dirs', []))
+    _sym       = _p.get('symbol_extraction', {})
+    _named     = _sym.get('named_export', '')
+    _reexport  = _sym.get('reexport', '')
+except Exception:
+    EXTENSIONS = ('.ts', '.tsx')
+    EXCLUDES   = set()
+    _named     = (r'^export\s+(?:(?:async|default|declare|abstract)\s+)*'
+                  r'(?:function\*?\s+|const\s+|let\s+|var\s+|class\s+|interface\s+|type\s+|enum\s+)(\w+)')
+    _reexport  = r'^export\s+\{([^}]+)\}'
 
-# Matches: export [async|default|declare]* (function*|const|let|var|class|interface|type|enum|abstract class) NAME
-EXPORT_RE = re.compile(
-    r'^export\s+(?:(?:async|default|declare|abstract)\s+)*'
-    r'(?:function\*?\s+|const\s+|let\s+|var\s+|class\s+|interface\s+|type\s+|enum\s+)'
-    r'(\w+)',
-    re.MULTILINE,
-)
-# Matches: export { Foo, Bar as Baz }
-REEXPORT_RE = re.compile(r'^export\s+\{([^}]+)\}', re.MULTILINE)
+if not EXCLUDES:
+    EXCLUDES = {'node_modules', '.git', 'dist', 'build', '.next', '.claude',
+                'coverage', '__pycache__', '.turbo', 'out', '.vercel', 'worktrees', 'queue'}
+
+EXPORT_RE   = re.compile(_named,    re.MULTILINE) if _named    else None
+REEXPORT_RE = re.compile(_reexport, re.MULTILINE) if _reexport else None
 
 lines = []
 for root, dirs, files in os.walk('.'):
     dirs[:] = sorted(d for d in dirs if d not in EXCLUDES and not d.startswith('.'))
     for fname in sorted(files):
-        if not (fname.endswith('.ts') or fname.endswith('.tsx')):
+        if not any(fname.endswith(ext) for ext in EXTENSIONS):
             continue
         path = os.path.join(root, fname)
-        rel = path[2:] if path.startswith('./') else path
+        rel  = path[2:] if path.startswith('./') else path
         try:
             content = open(path, errors='replace').read()
         except Exception:
             continue
-        names = [m.group(1) for m in EXPORT_RE.finditer(content)]
-        for m in REEXPORT_RE.finditer(content):
-            for part in m.group(1).split(','):
-                n = part.strip().split(' as ')[0].strip()
-                if n and n not in ('default', ''):
-                    names.append(n)
+        names = []
+        if EXPORT_RE:
+            names = [m.group(1) for m in EXPORT_RE.finditer(content)]
+        if REEXPORT_RE:
+            for m in REEXPORT_RE.finditer(content):
+                for part in m.group(1).split(','):
+                    n = part.strip().split(' as ')[0].strip()
+                    if n and n not in ('default', ''):
+                        names.append(n)
         seen, unique = set(), []
         for n in names:
             if n not in seen:
