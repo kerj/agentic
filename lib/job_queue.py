@@ -591,16 +591,44 @@ def review_job(job_id: str) -> str:
     if not diff_result.stdout.strip():
         return "No changes to apply — the agent made no commits."
 
-    # Apply to working tree only (not index). --3way falls back to conflict
-    # markers if a hunk doesn't apply cleanly, rather than hard-failing.
-    apply_result = subprocess.run(
-        ["git", "-C", target, "apply", "--3way"],
-        input=diff_result.stdout,
-        capture_output=True, text=True,
-    )
+    diff_text = diff_result.stdout
+
+    # Apply to the WORKING TREE ONLY — never stage. The old code used
+    # `git apply --3way`, but --3way READS AND WRITES the index: a prior
+    # "Review in IDE" click leaves the patched blob staged, so the NEXT apply
+    # sees the index no longer matches the patch base → "does not match index".
+    # That made the button fail on every click after the first.
+    #
+    # Strategy:
+    #   1. Clear any stale staged state from a previous apply (reset, no
+    #      worktree change) so a fallback --3way starts from a clean index.
+    #   2. Try a plain working-tree apply (no --index, no index writes).
+    #   3. Only if that fails, fall back to --3way (conflict markers) — now safe
+    #      because the index was reset in step 1.
+    def _git(*args, **kw):
+        return subprocess.run(["git", "-C", target, *args],
+                              capture_output=True, text=True, **kw)
+
+    # 1. Drop stale staged entries left by a previous apply (keeps working tree).
+    _git("reset", "-q")
+
+    # 2. Plain apply — working tree only, no staging.
+    apply_result = _git("apply", input=diff_text)
+    if apply_result.returncode != 0:
+        # 3. Fallback: 3-way (writes conflict markers if needed). Index is clean
+        #    now, so this won't trip the "does not match index" path on context.
+        apply_result = _git("apply", "--3way", input=diff_text)
+
     if apply_result.returncode != 0:
         err = (apply_result.stderr or apply_result.stdout).strip()
-        raise RuntimeError(f"Could not apply changes: {err}")
+        # Most common real cause: the working tree has drifted from the job's
+        # base. Give an actionable message instead of git's cryptic one.
+        hint = ""
+        if "does not match index" in err or "patch does not apply" in err:
+            hint = ("\n\nThe working tree may have uncommitted changes or moved "
+                    "since the job ran. Commit/stash or `git checkout -- .` in "
+                    f"{target}, then try again.")
+        raise RuntimeError(f"Could not apply changes: {err}{hint}")
 
     return (
         f"Changes applied to {target} — review modified files in your IDE, "
@@ -650,11 +678,11 @@ def delete_job(job_id: str) -> None:
 
 
 def get_diff(job_id: str) -> str:
-    # Serve from cache — persists after worktree and branch are cleaned up
+    # Cache is an ARCHIVE for after the worktree and branch are gone — it must
+    # NOT shadow live state. A job id can be reused across worktree runs, so a
+    # stale .diff from an earlier run would otherwise mask the current changes.
+    # Precedence: live worktree → live branch → cached .diff (last resort).
     cached = DIFFS_DIR / f"{job_id}.diff"
-    if cached.exists():
-        return cached.read_text(errors="replace")
-
     diff = ""
 
     # Resolve job metadata once so both paths can use it
@@ -670,28 +698,47 @@ def get_diff(job_id: str) -> str:
         base_branch = "HEAD"
         target = ""
 
-    # Try worktree first (job in progress or not yet accepted)
+    # 1) Live worktree (job in progress or not yet accepted) — always recompute.
     wt = WORKTREES_DIR / job_id
     if wt.exists():
         if is_review:
-            # Review worktree sits on the root branch; show full diff from base
+            # Review worktree sits on the root branch; show full diff from base.
             r = subprocess.run(
                 ["git", "-C", str(wt), "diff", f"{base_branch}...HEAD"],
                 capture_output=True, text=True,
             )
             diff = r.stdout
         else:
-            for ref in (["HEAD~1"], ["HEAD^"], ["--cached"], []):
+            # The worker squashes the agent's work into ONE commit at HEAD. The
+            # correct diff is that commit vs its OWN parent — not a positional
+            # HEAD~1, which on a chain-merged history points at an unrelated
+            # ancestor (e.g. a prior job's "Accept …" commit) and surfaces
+            # another job's changes. Diff HEAD against its real parent; if HEAD
+            # is a root commit (no parent), show it whole.
+            has_parent = subprocess.run(
+                ["git", "-C", str(wt), "rev-parse", "--verify", "--quiet", "HEAD^"],
+                capture_output=True, text=True,
+            ).returncode == 0
+            if has_parent:
                 r = subprocess.run(
-                    ["git", "-C", str(wt), "diff"] + ref,
+                    ["git", "-C", str(wt), "diff", "HEAD^", "HEAD"],
                     capture_output=True, text=True,
                 )
-                if r.stdout.strip():
-                    diff = r.stdout
-                    break
+                diff = r.stdout
+            if not diff.strip():
+                # Root commit, or nothing committed yet — fall back to staged /
+                # unstaged so an in-progress job still shows something.
+                for ref in (["HEAD", "--", "."], ["--cached"], []):
+                    r = subprocess.run(
+                        ["git", "-C", str(wt), "diff"] + ref,
+                        capture_output=True, text=True,
+                    )
+                    if r.stdout.strip():
+                        diff = r.stdout
+                        break
 
-    # Worktree gone (accepted/rejected) — compute from the branch directly
-    if not diff and target:
+    # 2) Live branch (worktree removed but branch still present) — recompute.
+    if not diff.strip() and target:
         try:
             r = subprocess.run(
                 ["git", "-C", target, "diff", f"{base_branch}...agentic/{branch_root}"],
@@ -701,9 +748,14 @@ def get_diff(job_id: str) -> str:
         except Exception:
             pass
 
-    if diff:
+    # 3) Last resort: the cached archive (worktree AND branch both gone).
+    if not diff.strip() and cached.exists():
+        return cached.read_text(errors="replace")
+
+    if diff.strip():
         if len(diff) > _MAX_DIFF_BYTES:
             diff = diff[:_MAX_DIFF_BYTES] + "\n\n[diff truncated at 512KB]\n"
+        # Refresh the archive so it reflects the latest recompute, not a stale run.
         try:
             cached.write_text(diff)
         except Exception:
