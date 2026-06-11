@@ -2,7 +2,8 @@
 #
 # v1 scope: LOCAL mode, TypeScript projects. Ollama runs NATIVELY on the host
 # (GPU/models live there) and is reached at host.docker.internal:11434 — there is
-# NO ollama and NO claude CLI in this image. The container runs serve.py, which
+# NO ollama in this image (it runs on the host). The claude CLI IS installed, so
+# cloud execution + cloud planning work. The container runs serve.py, which
 # serves the dashboard and spawns `agentic worker-once` per job.
 #
 # The app source is baked at /opt/agentic. Per-host STATE (queue, worktrees,
@@ -48,6 +49,19 @@ RUN curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir /usr/lo
     && ln -sf "$DEFAULT_BIN/npx"  /usr/local/bin/npx \
     && chmod -R a+rX "$FNM_DIR" \
     && node --version && npm --version
+
+# ── Claude Code CLI — enables CLOUD execution + CLOUD planning ───────────────
+# The cloud worker (worker.sh) and the cloud planning agent (planner.py) both
+# shell out to `claude`. Install it globally on the baked Node and symlink onto
+# PATH so the dropped-uid worker finds it. Auth is the ANTHROPIC_API_KEY env var,
+# injected per-process from secrets.json by serve.py / planner.py (never baked).
+RUN npm install -g @anthropic-ai/claude-code \
+    # $DEFAULT_BIN from an earlier RUN doesn't persist across layers. The global
+    # bin dir is <npm prefix>/bin; symlink the installed `claude` onto PATH.
+    && GLOBAL_BIN="$(npm config get prefix)/bin" \
+    && ln -sf "$GLOBAL_BIN/claude" /usr/local/bin/claude \
+    && chmod -R a+rX "$FNM_DIR" \
+    && /usr/local/bin/claude --version
 
 # Build the app's own venv. worker.sh and bin/agentic invoke
 # APP SOURCE vs STATE split: the source (incl. venv) lives here at AGENTIC_APP

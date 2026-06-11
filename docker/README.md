@@ -14,8 +14,10 @@ and no `claude` CLI inside the image.
 
 ```bash
 # 1. Start the host's Ollama on all interfaces so the container can reach it.
-#    A plain `ollama serve` binds to 127.0.0.1 only — inline the env var:
-OLLAMA_HOST=0.0.0.0:11434 ollama serve &
+#    A plain `ollama serve` binds to 127.0.0.1 only — inline the env var.
+#    OLLAMA_NUM_PARALLEL=2 lets a planning chat run alongside a worker job
+#    instead of queueing behind it (see "Planning while a job runs" below):
+OLLAMA_HOST=0.0.0.0:11434 OLLAMA_NUM_PARALLEL=2 ollama serve &
 
 # 2. Run the wizard — it writes docker/.env and scaffolds the state dir.
 ./docker/setup.sh
@@ -166,6 +168,27 @@ so different projects can use different versions:
 - Dependencies are installed with a **frozen lockfile** (`npm ci` /
   `--frozen-lockfile`) before the baseline build, so the build is real and the
   lockfile is never modified (no churn in the job's diff).
+
+---
+
+## Planning while a job runs
+
+You can chat in a planning thread while a worker job is running — but a single
+Ollama instance **serializes requests by default**, so an all-local setup
+(local worker + local planning) makes the chat **wait behind the worker's turns**
+(often a multi-minute hang). Two ways to make concurrent work feel instant:
+
+1. **Let Ollama serve in parallel** — start it with `OLLAMA_NUM_PARALLEL=2`
+   (see Quick start). The worker and a planning question then run at the same
+   time. Costs extra VRAM/compute; a large model on a memory-tight machine may
+   not fit a second slot, so test it.
+2. **Plan in the cloud, execute locally** — set the planning **thread's backend
+   to cloud (Claude)** in its header dropdown. Planning hits the API while the
+   worker keeps Ollama to itself — zero contention, no VRAM pressure. Needs an
+   `ANTHROPIC_API_KEY`. This is the most reliable path on constrained hardware.
+
+The app detects when both would contend on local Ollama and nudges you toward
+option 2.
 
 ---
 
