@@ -4,7 +4,7 @@
 AGENTIC_CONF="${AGENTIC_HOME}/.agentic.conf"
 
 # Default configuration
-AGENTIC_MODEL="${AGENTIC_MODEL:-qwen2.5-coder:32b}"
+AGENTIC_MODEL="${AGENTIC_MODEL:-qwen-coder:latest}"
 AGENTIC_AUTH_TOKEN="${AGENTIC_AUTH_TOKEN:-ollama}"
 AGENTIC_BASE_URL="${AGENTIC_BASE_URL:-http://localhost:11434}"
 AGENTIC_API_KEY="${AGENTIC_API_KEY:-}"

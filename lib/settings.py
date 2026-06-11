@@ -53,9 +53,10 @@ SCHEMA: dict[str, dict[str, Any]] = {
     },
     "default_repo": {
         "default": "", "env": "AGENTIC_DEFAULT_REPO", "type": "str",
-        "group": "mode", "control": "text", "label": "Default project path",
-        "help": "Project path new jobs default to. Empty = the directory the server "
-                "started in. In Docker, this is the bind-mount path (e.g. /Users/you/proj).",
+        "group": "mode", "control": "dirpicker", "label": "Default project path",
+        "help": "Project new jobs default to. Click Browse to pick a git repo. "
+                "Empty = the directory the server started in. In Docker, paths are "
+                "browsed under the mounted BROWSE_ROOT (default your home dir).",
     },
     # ── Context + loop core ──
     "context_budget": {
@@ -86,7 +87,7 @@ SCHEMA: dict[str, dict[str, Any]] = {
     },
     # ── Model + Ollama ──
     "local_model": {
-        "default": "qwen2.5-coder:32b", "env": "AGENTIC_LOCAL_MODEL", "type": "str",
+        "default": "qwen-coder:latest", "env": "AGENTIC_LOCAL_MODEL", "type": "str",
         "group": "model", "control": "select", "label": "Local model",
         "help": "The Ollama model jobs run against.",
     },
