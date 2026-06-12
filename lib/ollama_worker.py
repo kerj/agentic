@@ -416,6 +416,310 @@ def _make_tools(write_enabled: bool = True) -> list[dict]:
 TOOLS_FULL   = _make_tools(write_enabled=True)
 TOOLS_REPAIR = _make_tools(write_enabled=False)   # Edit-only in repair mode
 
+# ── Planning (read-only) tool set ───────────────────────────────────────────────
+# The planning agent (a "question is a job that may only read", see
+# docs/planning-channels.md) must NEVER edit or run shell commands. The
+# write_enabled=False flag CANNOT be trusted for this — _make_tools(False) still
+# returns Edit (and Bash, Setup, Build). So we filter the base set by NAME down to
+# the genuinely read-only primitives, then add the curated efficient read tools.
+#
+#   Read/Grep/Glob/LS  — existing read primitives (fallback)
+#   Outline(file)      — symbol map of ONE file, no bodies      (~85% vs Read)
+#   Signature(symbol)  — just the declaration line(s)           (~95% vs Read)
+#   ReadSymbol(file,name) — one symbol's body, not the whole file (~60% vs Read)
+#   Usages(symbol)     — grep hits + one context line each      (~70% vs Read)
+#
+# Each efficient tool appends a one-line "saved ~N% vs full read" heuristic so the
+# cost story is legible without real-time token accounting.
+
+_PLANNING_READONLY_NAMES = ("Read", "Grep", "Glob", "LS")
+
+# Heuristic savings vs a full Read, surfaced in tool output as rationale (see
+# docs/planning-channels.md §Cost signals — suggestion, not enforcement).
+_PLANNING_SAVINGS = {
+    "Outline":    85,
+    "Signature":  95,
+    "ReadSymbol": 60,
+    "Usages":     70,
+}
+
+# Per-FILE symbol extraction for the efficient tools. Broader than the upfront
+# repo map (decision 3: include internal functions/types/classes, not only named
+# exports) and captures the 1-based line number so ReadSymbol can slice a body.
+# (file extension → list[(symbol_name, line_no)])
+
+def _outline_symbols_ts(lines: list[str]) -> list[tuple[str, int]]:
+    """TS/JS: exported AND internal functions, consts, classes, interfaces, types, enums."""
+    pat = re.compile(
+        r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+|declare\s+|abstract\s+)*"
+        r"(?:function\*?\s+|const\s+|let\s+|var\s+|class\s+|interface\s+|type\s+|enum\s+)"
+        r"([A-Za-z_$][\w$]*)"
+    )
+    mexp = re.compile(r"^\s*module\.exports\s*=\s*([A-Za-z_$][\w$]*)")
+    out: list[tuple[str, int]] = []
+    for i, ln in enumerate(lines, 1):
+        m = pat.match(ln) or mexp.match(ln)
+        if m:
+            out.append((m.group(1), i))
+    return out
+
+def _outline_symbols_c(lines: list[str]) -> list[tuple[str, int]]:
+    """C/H: function definitions/prototypes, typedefs, structs, enums, #defines."""
+    fn = re.compile(
+        r"^(?!#|//|\s*/?\*)(?:[A-Za-z_][\w\s*]+?)\s+"
+        r"([A-Za-z_]\w*)\s*\([^;{]*\)\s*(?:NONBANKED|BANKED)?\s*[{;]"
+    )
+    td = re.compile(r"^\s*typedef\b.*?\b([A-Za-z_]\w*)\s*;")
+    su = re.compile(r"^\s*(?:typedef\s+)?(?:struct|enum|union)\s+([A-Za-z_]\w*)")
+    df = re.compile(r"^\s*#\s*define\s+([A-Za-z_]\w*)")
+    skip = {"if", "while", "for", "switch", "return", "sizeof"}
+    out: list[tuple[str, int]] = []
+    for i, ln in enumerate(lines, 1):
+        for rx in (fn, td, su, df):
+            m = rx.match(ln)
+            if m and m.group(1) not in skip:
+                out.append((m.group(1), i))
+                break
+    return out
+
+def _outline_symbols_py(lines: list[str]) -> list[tuple[str, int]]:
+    """Python: top-level (and nested) def/class declarations."""
+    pat = re.compile(r"^\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)")
+    out: list[tuple[str, int]] = []
+    for i, ln in enumerate(lines, 1):
+        m = pat.match(ln)
+        if m:
+            out.append((m.group(1), i))
+    return out
+
+def _outline_symbols(file_path: str, lines: list[str]) -> list[tuple[str, int]]:
+    """Dispatch per-file symbol extraction by extension. De-dupes by name (keeps
+    the first occurrence / line)."""
+    ext = Path(file_path).suffix.lower()
+    if ext in (".c", ".h"):
+        raw = _outline_symbols_c(lines)
+    elif ext == ".py":
+        raw = _outline_symbols_py(lines)
+    else:
+        raw = _outline_symbols_ts(lines)
+    seen, out = set(), []
+    for name, line in raw:
+        if name not in seen:
+            seen.add(name)
+            out.append((name, line))
+    return out
+
+def _planning_savings_note(tool: str, lines_returned: int, full_lines: int) -> str:
+    """One-line rationale: the static per-tool heuristic, refined toward the actual
+    fraction returned when we know the full file size (never above the heuristic so
+    it reads as a stable expectation, not a live meter)."""
+    base = _PLANNING_SAVINGS.get(tool, 0)
+    pct = base
+    if full_lines > 0 and lines_returned >= 0:
+        actual = round(100 * (1 - min(lines_returned, full_lines) / full_lines))
+        pct = max(0, min(base, actual)) if actual > 0 else base
+    return f"[{tool}: saved ~{pct}% vs full read]"
+
+def tool_outline(file_path: str) -> str:
+    """Symbol map of ONE file (names + line numbers, no bodies). Answers
+    'what's in here' for ~85% fewer tokens than reading the whole file."""
+    if not _within_sandbox(file_path):
+        return f"Error: '{file_path}' is outside the working directory."
+    p = Path(file_path)
+    if not p.exists():
+        return f"Error: file not found: {file_path}"
+    lines = p.read_text(errors="replace").splitlines()
+    syms = _outline_symbols(file_path, lines)
+    if not syms:
+        return (f"No top-level symbols found in {file_path} ({len(lines)} lines). "
+                f"Use Read to inspect it directly.")
+    body = "\n".join(f"  {name}  (line {line})" for name, line in syms)
+    note = _planning_savings_note("Outline", len(syms), len(lines))
+    return f"{file_path} — {len(syms)} symbol(s):\n{body}\n{note}"
+
+def tool_signature(symbol: str, path: str = ".") -> str:
+    """Just the declaration line(s) for a symbol — its shape, no body. Answers
+    'what's the shape of X' for ~95% fewer tokens than reading its file."""
+    inc = "*.c" if PROFILE == "gameboy-c" else "*"
+    # Word-boundary grep for the symbol; -n gives file:line we can slice from.
+    # -I skips binary files (.pyc etc); exclude vendored/VCS dirs.
+    cmd = ["grep", "-rnwI", "--include", inc,
+           "--exclude-dir=.git", "--exclude-dir=node_modules", "--exclude-dir=__pycache__",
+           symbol, path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return f"Error: {e}"
+    decl_re = re.compile(
+        r"\b(?:export|function|const|let|var|class|interface|type|enum|def|"
+        r"struct|typedef|void|int|static|public|private|async)\b"
+    )
+    found: list[str] = []
+    for raw in result.stdout.splitlines():
+        m = re.match(r"^([^:]+):(\d+):(.*)$", raw)
+        if not m:
+            continue
+        fpath, lineno, text = m.group(1), int(m.group(2)), m.group(3)
+        # Only lines that look like a DECLARATION of the symbol, not a use of it.
+        if decl_re.search(text) and re.search(rf"\b{re.escape(symbol)}\b", text):
+            found.append(f"{fpath}:{lineno}: {text.strip()}")
+        if len(found) >= 6:
+            break
+    if not found:
+        return (f"No declaration found for '{symbol}'. Try Usages('{symbol}') to "
+                f"see where it's referenced, or Grep for a partial name.")
+    note = _planning_savings_note("Signature", len(found), max(len(found) * 20, 1))
+    return "\n".join(found) + f"\n{note}"
+
+def tool_read_symbol(file_path: str, name: str) -> str:
+    """One symbol's body (function/class/block), not the whole file. Answers
+    'how does X work' for ~60% fewer tokens than reading the whole file.
+
+    Symbol-bounded slice: find the symbol's declaration line, then walk to the end
+    of its brace-delimited block (or the next top-level symbol for brace-less
+    languages / prototypes). Falls back to a small window if bounds are unclear."""
+    if not _within_sandbox(file_path):
+        return f"Error: '{file_path}' is outside the working directory."
+    p = Path(file_path)
+    if not p.exists():
+        return f"Error: file not found: {file_path}"
+    lines = p.read_text(errors="replace").splitlines()
+    total = len(lines)
+    syms = _outline_symbols(file_path, lines)
+    start_line = next((line for sname, line in syms if sname == name), None)
+    if start_line is None:
+        return (f"Symbol '{name}' not found in {file_path}. "
+                f"Use Outline('{file_path}') to list its symbols.")
+    start = start_line - 1  # to 0-based index
+    # Default bound: just before the next outlined symbol. This is the right answer
+    # for indentation-delimited languages (Python) and brace-less declarations
+    # (C prototypes, TS type aliases, #defines).
+    next_sym_line = min(
+        (line for _, line in syms if line > start_line), default=total + 1
+    )
+    end = next_sym_line - 1
+    # For brace-delimited languages, tighten the bound to the matching close brace
+    # so we don't include trailing blank lines / comments before the next symbol.
+    # Skip this for Python — its f-string braces ('{x}') would falsely "close" the
+    # block early; the next-symbol bound above is already correct there.
+    ext = Path(file_path).suffix.lower()
+    if ext not in (".py",):
+        depth = 0
+        opened = False
+        for i in range(start, min(next_sym_line - 1 + 200, total)):
+            depth += lines[i].count("{") - lines[i].count("}")
+            if "{" in lines[i]:
+                opened = True
+            if opened and depth <= 0:
+                end = i + 1  # inclusive of the closing-brace line
+                break
+    window = lines[start:end]
+    header = f"{file_path} — symbol '{name}' [lines {start_line}-{start + len(window)} of {total}]\n"
+    note = _planning_savings_note("ReadSymbol", len(window), total)
+    return header + "\n".join(window) + f"\n{note}"
+
+def tool_usages(symbol: str, path: str = ".") -> str:
+    """Where a symbol is referenced — grep hits, one line of context each. Answers
+    'what calls X' for ~70% fewer tokens than reading every caller's file."""
+    inc = "*.c" if PROFILE == "gameboy-c" else "*"
+    cmd = ["grep", "-rnwI", "--include", inc,
+           "--exclude-dir=.git", "--exclude-dir=node_modules", "--exclude-dir=__pycache__",
+           symbol, path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return f"Error: {e}"
+    hits = [ln for ln in result.stdout.splitlines() if ln.strip()]
+    if not hits:
+        return f"No usages of '{symbol}' found under {path}."
+    shown = hits[:40]
+    body = "\n".join(shown)
+    suffix = "" if len(hits) <= 40 else f"\n... [{len(hits) - 40} more — narrow path=]"
+    note = _planning_savings_note("Usages", len(shown), len(shown) * 30)
+    return f"{len(hits)} usage(s) of '{symbol}':\n{body}{suffix}\n{note}"
+
+def _make_planning_tools() -> list[dict]:
+    """Genuinely read-only tool set for the planning/read agent: the base read
+    primitives (filtered by NAME, since write_enabled=False is not trustworthy)
+    plus the curated efficient read tools."""
+    base = [t for t in _make_tools(write_enabled=False)
+            if t["function"]["name"] in _PLANNING_READONLY_NAMES]
+    efficient = [
+        {
+            "type": "function",
+            "function": {
+                "name": "Outline",
+                "description": ("List the top-level symbols (functions, classes, types, "
+                                "consts) of ONE file with their line numbers — no bodies. "
+                                "Prefer this over reading a whole file to learn what's in it "
+                                "(saves ~85% vs a full Read)."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "Path to the file"}
+                    },
+                    "required": ["file_path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "Signature",
+                "description": ("Show just the declaration line(s) of a symbol — its shape, "
+                                "no body. Use to learn the type/arguments of X without "
+                                "reading its file (saves ~95% vs a full Read)."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": {"type": "string", "description": "Symbol name to look up"},
+                        "path":   {"type": "string", "description": "Directory to search (default: project root)"}
+                    },
+                    "required": ["symbol"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ReadSymbol",
+                "description": ("Read ONE symbol's body (a single function/class/block) from a "
+                                "file instead of the whole file. Use to learn how X works "
+                                "(saves ~60% vs a full Read)."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "Path to the file"},
+                        "name":      {"type": "string", "description": "Symbol name within the file"}
+                    },
+                    "required": ["file_path", "name"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "Usages",
+                "description": ("Find where a symbol is referenced — grep hits with one line of "
+                                "context each. Use to learn what calls X (saves ~70% vs reading "
+                                "every caller's file)."),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "symbol": {"type": "string", "description": "Symbol name to find references of"},
+                        "path":   {"type": "string", "description": "Directory to search (default: project root)"}
+                    },
+                    "required": ["symbol"]
+                }
+            }
+        },
+    ]
+    return base + efficient
+
+# The read-only planning tool set. NO Edit, NO Write, NO Bash, NO Build/Setup —
+# verified by name-filtering above (do not trust the write_enabled flag).
+TOOLS_PLANNING = _make_planning_tools()
+
 # ── Tool implementations ────────────────────────────────────────────────────────
 
 # ── Output caps ────────────────────────────────────────────────────────────────
@@ -1197,6 +1501,11 @@ def execute_tool(name: str, args: dict,
         if name == "Glob":   return tool_glob(**args),  False
         if name == "Grep":   return tool_grep(**args),  False
         if name == "LS":     return tool_ls(**args),    False
+        # Curated efficient read tools (planning / read-only agent). All read-only.
+        if name == "Outline":    return tool_outline(**args),     False
+        if name == "Signature":  return tool_signature(**args),   False
+        if name == "ReadSymbol": return tool_read_symbol(**args), False
+        if name == "Usages":     return tool_usages(**args),      False
         if name == "Setup":  return tool_setup(**args), False
         if name == "Build":
             result = tool_build()
@@ -1556,15 +1865,19 @@ def emit_progress(ctx_tokens: int) -> None:
 # ── Ollama API ─────────────────────────────────────────────────────────────────
 
 def call_ollama(messages: list, model: str,
-                tools: list) -> tuple[dict, dict]:
+                tools: Optional[list]) -> tuple[dict, dict]:
     payload = {
         "model":       model,
         "messages":    messages,
-        "tools":       tools,
-        "tool_choice": "auto",
         "stream":      False,
         "options":     {"think": False},
     }
+    # Only advertise tools when we actually have some. Passing tools=None (used
+    # to force a final tool-free synthesis turn) with tool_choice:auto is
+    # malformed on some OpenAI-compatible servers — omit both keys instead.
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
     req = urllib.request.Request(
         f"{OLLAMA_HOST}/v1/chat/completions",
         data=json.dumps(payload).encode(),
@@ -2076,10 +2389,159 @@ def run(request: str, model: str, system_prompt: str) -> int:
     return 0 if passed else 1
 
 
+def run_ask(question: str, model: str) -> int:
+    """Read-only planning entrypoint (`--ask`).
+
+    Runs the existing agent loop with the genuinely read-only TOOLS_PLANNING set
+    so a "question is a job that may only read" (docs/planning-channels.md). The
+    tool events (tool_use / tool_result) and assistant text are already streamed
+    via emit() inside run_agent_loop, so the caller can harvest citations from the
+    files the agent actually opened. A final {"type":"answer"} event carries the
+    finished answer text for convenience.
+
+    Inputs:
+      - question: the user's question (argv).
+      - symbol-map preamble: AGENTIC_ASK_PREAMBLE env, else stdin (if piped),
+        seeded as project context so the agent starts grounded (free).
+      - max_turns: AGENTIC_PLANNING_MAX_TURNS env (default 8), far below jobs' cap.
+
+    SANDBOX_ROOT is import-time/env-driven (AGENTIC_SANDBOX_ROOT), so this MUST be
+    invoked as a subprocess with that env set — the read tools confine to it.
+    """
+    # Planning system prompt (read-only persona). Lives in app source, not state.
+    prompt_path = os.environ.get("AGENTIC_PLANNER_PROMPT", "")
+    prompt_file = Path(prompt_path) if prompt_path else AGENTIC_APP / "agents" / "planner.txt"
+    system_prompt = prompt_file.read_text() if prompt_file.exists() else (
+        "You are a read-only codebase analyst. Answer the question grounded in the "
+        "actual code. Prefer the cheapest tool that answers: Outline to see what's "
+        "in a file, Signature for a symbol's shape, ReadSymbol for one function's "
+        "body, Usages for callers — fall back to Read/Grep/Glob/LS only when those "
+        "don't fit. You CANNOT edit, write, or run shell commands. Cite the files "
+        "and line ranges you relied on."
+    )
+
+    # Symbol-map preamble: explicit env wins; otherwise read piped stdin (if any).
+    preamble = os.environ.get("AGENTIC_ASK_PREAMBLE", "")
+    if not preamble and not sys.stdin.isatty():
+        try:
+            preamble = sys.stdin.read()
+        except Exception:
+            preamble = ""
+
+    repo = SANDBOX_ROOT
+    if preamble.strip():
+        user_content = (
+            f"WORKING DIRECTORY (read-only): {repo}\n"
+            f"All file lookups are within this project.\n\n"
+            f"PROJECT SYMBOL MAP (file → symbols):\n{preamble.strip()}\n\n"
+            f"Use this to find what exists before reading files.\n\n"
+            f"QUESTION:\n{question}"
+        )
+    else:
+        user_content = (
+            f"WORKING DIRECTORY (read-only): {repo}\n"
+            f"All file lookups are within this project.\n\n"
+            f"QUESTION:\n{question}"
+        )
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_content},
+    ]
+
+    try:
+        planning_max_turns = int(os.environ.get("AGENTIC_PLANNING_MAX_TURNS", "8"))
+    except ValueError:
+        planning_max_turns = 8
+
+    # Capture the final answer text from the stream. The agent loop emits each
+    # assistant turn's text as an {"type":"assistant"} event but does NOT append
+    # the FINAL (tool-call-free) message to `messages` — so we sniff the stream
+    # here rather than reading back `messages` (which would miss the answer). We
+    # wrap emit transparently: every event still flows to stdout for the caller.
+    # We want the FINAL synthesized answer — the tool-call-free turn the model
+    # writes after it's done reading. But the loop can exhaust its turn budget
+    # while the model is still calling tools, in which case it never gets to
+    # synthesize. Worse, naively keeping "the last assistant text" would keep the
+    # PREAMBLE ("Let me check the CSS…") emitted alongside the first tool call —
+    # which is exactly the truncated, answer-less response the user sees. So we
+    # only treat a turn's text as the answer when that turn made NO tool calls
+    # (a real final answer), and force one synthesis turn if we ran out first.
+    captured = {"answer": "", "final": False}
+    _turn_has_tools = {"v": False}
+    _orig_emit = globals()["emit"]
+    def _capturing_emit(event: dict) -> None:
+        et = event.get("type")
+        if et == "assistant":
+            for block in event.get("message", {}).get("content", []):
+                if block.get("type") == "text" and block.get("text", "").strip():
+                    # Provisionally capture; _turn_has_tools tells us after the
+                    # turn whether this was a final answer or just a preamble.
+                    captured["answer"] = block["text"]
+                    captured["final"] = False
+            _turn_has_tools["v"] = False  # reset for this new assistant turn
+        elif et == "tool_use":
+            _turn_has_tools["v"] = True   # this turn called a tool → preamble, not answer
+        _orig_emit(event)
+    globals()["emit"] = _capturing_emit
+    try:
+        messages, in_tok, out_tok = run_agent_loop(
+            messages, model, TOOLS_PLANNING, max_turns=planning_max_turns
+        )
+        # Did the loop end with a real, tool-call-free answer? The loop only
+        # breaks without tool calls when the model is genuinely done; otherwise
+        # it ran out of turns mid-read. If the last assistant text was a preamble
+        # to a tool call (not a final answer), force ONE synthesis turn with
+        # tools disabled so the model actually answers the question.
+        last = messages[-1] if messages else {}
+        ran_out = (last.get("role") == "tool") or _turn_has_tools["v"]
+        if ran_out:
+            emit({"type": "assistant", "message": {"content": [{
+                "type": "text",
+                "text": "\n[Synthesizing answer from what I've read…]"
+            }]}})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "You've gathered enough context — stop reading now. Using ONLY "
+                    "what you've already read above, give your complete final answer "
+                    "to the question. Do not call any more tools. Cite the files and "
+                    "line ranges you relied on."
+                ),
+            })
+            msg, usage = call_ollama(messages, model, tools=None)
+            in_tok  += usage.get("prompt_tokens", 0)
+            out_tok += usage.get("completion_tokens", 0)
+            final_text = msg.get("content", "") or ""
+            if final_text.strip():
+                captured["answer"] = final_text
+                captured["final"] = True
+                emit({"type": "assistant", "message": {
+                    "content": [{"type": "text", "text": final_text}]
+                }})
+    finally:
+        globals()["emit"] = _orig_emit
+
+    # Final structured event so the caller can grab the answer without re-parsing
+    # the streamed assistant turns; tool events were already emitted live.
+    emit({"type": "answer", "text": captured["answer"]})
+    emit({"type": "result", "usage": {"input_tokens": in_tok, "output_tokens": out_tok}})
+    return 0
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: ollama_worker.py '<request>'", file=sys.stderr)
+        print("       ollama_worker.py --ask '<question>'   (read-only planning)", file=sys.stderr)
         sys.exit(1)
+
+    # Read-only planning path: a question that may only read. Separate from run()
+    # so the job path is untouched (docs/planning-channels.md).
+    if sys.argv[1] == "--ask":
+        if len(sys.argv) < 3:
+            print("Usage: ollama_worker.py --ask '<question>'", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(run_ask(sys.argv[2], MODEL))
 
     request     = sys.argv[1]
     prompt_path = os.environ.get("AGENTIC_WORKER_PROMPT", "")

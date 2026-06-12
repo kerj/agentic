@@ -43,20 +43,27 @@ LEGACY_CONF   = AGENTIC_HOME / ".agentic.conf"
 # control: slider | number | text | select
 
 SCHEMA: dict[str, dict[str, Any]] = {
-    # ── Run mode + target ──
-    "mode": {
-        "default": "local", "env": "AGENTIC_MODE", "type": "str",
-        "options": ["local", "cloud"],
-        "group": "mode", "control": "select", "label": "Execution mode",
-        "help": "Run jobs locally (Ollama on the host) or via the Claude API (cloud). "
-                "Replaces the old --local flag — set it here, takes effect on the next job.",
-    },
+    # ── Run target ──
+    # NOTE: the old global "mode" (local/cloud) knob has been REMOVED. Backend is
+    # now per-job (the submit form's Backend picker → model_hint local/remote,
+    # changeable on a pending job's card). Any legacy "auto"/missing model_hint
+    # resolves to LOCAL — readers all default to "local" so removing the setting
+    # is behaviour-preserving for the local default.
     "default_repo": {
         "default": "", "env": "AGENTIC_DEFAULT_REPO", "type": "str",
         "group": "mode", "control": "dirpicker", "label": "Default project path",
         "help": "Project new jobs default to. Click Browse to pick a git repo. "
                 "Empty = the directory the server started in. In Docker, paths are "
                 "browsed under the mounted BROWSE_ROOT (default your home dir).",
+    },
+    "pause_chain_for_review": {
+        "default": False, "env": "AGENTIC_CHAIN_GATE", "type": "bool",
+        "group": "mode", "control": "toggle", "label": "Pause chains for review",
+        "help": "When ON, a finished job in a chain waits for review before its "
+                "next job runs: the child stays pending until you ACCEPT the parent "
+                "(merge it). Review comments still chain onto the job you review, so "
+                "you fix things between links. OFF = chains run straight through. "
+                "Read at claim time — applies to chains currently in flight.",
     },
     # ── Context + loop core ──
     "context_budget": {
@@ -78,6 +85,29 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "group": "context", "control": "slider", "label": "Max turns per job",
         "help": "Hard cap on agent turns before a job stops.",
     },
+    # ── Planning channels (read-only grounding agent) ──
+    "planning_max_turns": {
+        "default": 8, "env": "AGENTIC_PLANNING_MAX_TURNS", "type": "int",
+        "min": 1, "max": 40, "step": 1,
+        "group": "planning", "control": "slider", "label": "Planning max turns",
+        "help": "Hard cap on read-agent turns when answering a planning-channel "
+                "question (the only cap on a planning thread). Lower than jobs' "
+                "Max turns because grounding a question should be cheap.",
+    },
+    "planning_default_mode": {
+        "default": "local", "env": "AGENTIC_PLANNING_DEFAULT_MODE", "type": "str",
+        "options": ["local", "cloud"],
+        "group": "planning", "control": "select", "label": "Planning default backend",
+        "help": "Backend a new planning thread starts on — Ollama (local) or the "
+                "Claude CLI (cloud). Decoupled from Execution mode: you can plan "
+                "with cloud while jobs run local, or vice-versa. Editable per thread.",
+    },
+    "planning_default_model": {
+        "default": "", "env": "AGENTIC_PLANNING_DEFAULT_MODEL", "type": "str",
+        "group": "planning", "control": "text", "label": "Planning default model",
+        "help": "Model a new planning thread starts on. Empty = let the chosen "
+                "backend pick its default. Editable per thread.",
+    },
     "compress_margin": {
         "default": 4000, "env": "AGENTIC_COMPRESS_MARGIN", "type": "int",
         "min": 0, "max": 20000, "step": 1000,
@@ -91,6 +121,20 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "group": "model", "control": "select", "label": "Local model",
         "help": "The Ollama model jobs run against.",
     },
+    "cloud_model": {
+        "default": "auto", "env": "AGENTIC_MODEL", "type": "str",
+        "group": "cloud", "control": "select", "label": "Cloud model",
+        "help": "The Claude model cloud jobs run against. 'auto' lets the CLI pick. "
+                "The list reflects your account (set the API key above to fetch it).",
+    },
+    "cloud_max_workers": {
+        "default": 4, "env": "CLOUD_MAX_WORKERS", "type": "int",
+        "min": 1, "max": 16, "step": 1,
+        "group": "cloud", "control": "number", "label": "Cloud parallel workers",
+        "help": "How many CLOUD (Claude CLI) jobs may run at once — the size of "
+                "the cloud dispatch pool. Higher fan-out finishes a queue faster "
+                "but uses more API throughput.",
+    },
     "ollama_keep_alive": {
         "default": "30m", "env": "OLLAMA_KEEP_ALIVE", "type": "str",
         "group": "model", "control": "text", "label": "Ollama keep-alive",
@@ -101,6 +145,14 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "min": 1, "max": 8, "step": 1,
         "group": "model", "control": "number", "label": "Max loaded models",
         "help": "How many models Ollama may hold in memory at once.",
+    },
+    "ollama_num_parallel": {
+        "default": 2, "env": "OLLAMA_NUM_PARALLEL", "type": "int",
+        "min": 1, "max": 8, "step": 1,
+        "group": "model", "control": "number", "label": "Local parallel workers",
+        "help": "How many LOCAL (Ollama) jobs may run at once — the size of the "
+                "local dispatch pool. Match it to how many models your hardware "
+                "can serve concurrently.",
     },
     # ── Tool output caps ──
     "read_max_lines": {
@@ -139,6 +191,10 @@ def _coerce(spec: dict[str, Any], value: Any) -> Any:
     try:
         if spec["type"] == "int":
             return int(value)
+        if spec["type"] == "bool":
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() in ("1", "true", "yes", "on")
         return str(value)
     except (TypeError, ValueError):
         return _INVALID

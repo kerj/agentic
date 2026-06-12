@@ -200,14 +200,66 @@ case "${1:-}" in
     echo "✅ Cancelled: $_cjob"
     ;;
 
-  # worker-once — claim one job, run the Claude agent in an isolated worktree
+  # claim — atomically claim one pending job for a backend, print ONLY its id.
+  # Used by the server-side dispatcher: it claims here, then spawns
+  # `worker-once --id <id> --backend <b>` against the moved running/ file.
+  #   agentic claim --backend local|cloud [--exclude-chain-roots id,id,...]
+  claim)
+    shift
+    _queue_init
+    local _cl_path
+    if ! _cl_path=$(queue_claim "$@"); then
+      exit 1   # nothing claimable for this backend/filter
+    fi
+    jq -r '.id' "$_cl_path"   # stdout: the claimed job id, and nothing else
+    exit 0
+    ;;
+
+  # worker-once — run one job in an isolated worktree.
+  #   no flags          : claim the next pending job then run it (CLI back-compat).
+  #   --id <job_id>     : the dispatcher already claimed it (it's in running/);
+  #                       SKIP queue_claim and run THAT job.
+  #   --backend l|cloud : route this process — local sets AGENTIC_LOCAL=1, cloud
+  #                       unsets it (uses AGENTIC_MODEL) — so one server drives
+  #                       both pools.
   worker-once)
+    shift
     _queue_init
 
+    local _warg_id="" _warg_backend=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --id)         _warg_id="$2"; shift 2 ;;
+        --id=*)       _warg_id="${1#*=}"; shift ;;
+        --backend)    _warg_backend="$2"; shift 2 ;;
+        --backend=*)  _warg_backend="${1#*=}"; shift ;;
+        *) echo "❌ worker-once: unknown argument '$1'" >&2; exit 2 ;;
+      esac
+    done
+
+    # Per-process backend routing (mirrors serve.py's per-spawn env).
+    case "$_warg_backend" in
+      local) export AGENTIC_LOCAL=1 ;;
+      cloud) unset AGENTIC_LOCAL ;;        # cloud → claude CLI via AGENTIC_MODEL
+      "")    : ;;                          # no override — honour inherited env
+      *) echo "❌ worker-once: --backend must be 'local' or 'cloud'" >&2; exit 2 ;;
+    esac
+
     local _wjob_path
-    if ! _wjob_path=$(queue_claim); then
-      echo "No pending jobs."
-      exit 0
+    if [[ -n "$_warg_id" ]]; then
+      # Dispatcher path: the job is already claimed and in running/ — find by id.
+      _wjob_path=$(grep -rlE "\"id\":[[:space:]]*\"${_warg_id}\"" \
+        "${AGENTIC_QUEUE_DIR}/running/" 2>/dev/null | head -1)
+      if [[ -z "$_wjob_path" || ! -f "$_wjob_path" ]]; then
+        echo "❌ worker-once: no running/ job found for id '$_warg_id'" >&2
+        exit 1
+      fi
+    else
+      # CLI back-compat: claim the next pending job ourselves.
+      if ! _wjob_path=$(queue_claim); then
+        echo "No pending jobs."
+        exit 0
+      fi
     fi
 
     local _wid _wrequest _wtarget _wmodel
@@ -216,9 +268,27 @@ case "${1:-}" in
     _wtarget=$(jq -r '.target_repo' "$_wjob_path")
     _wmodel=$(jq -r '.model_hint // empty' "$_wjob_path")
 
+    # Resolve the ACTUAL model this run will use (mode + the global Settings
+    # model), and record it on the job so the UI can show "ran on X" instead of
+    # the ambiguous 'auto'. Model is resolved at RUN time from Settings, not at
+    # submit time. worker.sh applies the same resolution.
+    local _wresolved
+    if [[ "${AGENTIC_LOCAL:-}" == "1" ]]; then
+      _wresolved="${AGENTIC_LOCAL_MODEL:-qwen-coder:latest}"
+      _wresolved="local · ${_wresolved}"
+    else
+      local _cm="${AGENTIC_MODEL:-auto}"
+      _wresolved="cloud · ${_cm}"
+    fi
+    # Write resolved_model into the running job JSON (best-effort).
+    local _wtmp
+    _wtmp=$(mktemp) && jq --arg m "$_wresolved" '.resolved_model = $m' "$_wjob_path" > "$_wtmp" 2>/dev/null \
+      && mv "$_wtmp" "$_wjob_path" 2>/dev/null || rm -f "$_wtmp" 2>/dev/null
+
     echo "🔧 Claimed: $_wid"
     echo "   Request: ${_wrequest:0:80}"
     echo "   Repo:    $_wtarget"
+    echo "   Model:   $_wresolved"
     echo ""
 
     local _wworktree="${AGENTIC_WORKTREES_DIR}/${_wid}"
