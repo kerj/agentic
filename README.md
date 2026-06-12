@@ -18,16 +18,46 @@ Docker is the supported way to run agentic. `docker compose up` and you land on
 the dashboard — no Python, Node, pyenv, or shell config to manage. (Native
 install is still available for contributors — see [Native install](#native-install-advanced).)
 
-### Requirements
+### Before you start — what a fresh machine needs
 
-- **Docker Desktop** — [docker.com](https://www.docker.com/products/docker-desktop/) (running)
-- **Ollama** on the host — [ollama.com](https://ollama.com) + a pulled model
-  (v1 runs local mode; see [Local model setup](#local-model-setup)).
-  Ollama runs on your host (it uses the GPU); the container reaches it over the
-  network.
+Jobs run on a **backend you pick per job**: **Local** (Ollama) or **Cloud**
+(Claude Code). You can use one or both. Install only what the backends you want
+require.
 
-> v1 image is **local mode (Ollama) + TypeScript projects**. Cloud (Claude Code)
-> in a container is on the roadmap.
+**Always required (host):**
+
+- **Docker Desktop**, running — [docker.com](https://www.docker.com/products/docker-desktop/).
+  Everything else (Python, Node, git, jq, the `claude` CLI) is **baked into the
+  image** — you do **not** install those on the host.
+
+**For LOCAL jobs (Ollama) — host only:**
+
+- **Ollama**, running on the host on all interfaces (it uses the GPU; the
+  container reaches it over the network) — [ollama.com](https://ollama.com).
+  Start it with the env inline so it binds beyond localhost **and** allows two
+  concurrent generations (a planning chat alongside a worker):
+  ```bash
+  OLLAMA_HOST=0.0.0.0:11434 OLLAMA_NUM_PARALLEL=2 ollama serve &
+  ```
+  > This host `OLLAMA_NUM_PARALLEL` is what actually controls Ollama concurrency.
+  > Match it to the `Max local in parallel` value in the dashboard's Settings
+  > (default 2) — that one only sizes agentic's own dispatch pool.
+- **A pulled model.** The default model name agentic expects is
+  `qwen-coder:latest`; either build it (see [Local model setup](#local-model-setup))
+  or `ollama pull <model>` and set that name in **Settings → Local model**.
+
+**For CLOUD jobs (Claude Code) — no host install:**
+
+- The `claude` CLI is **already in the image**. You only need an
+  **`ANTHROPIC_API_KEY`**, which you paste into the dashboard's **Settings** gear
+  after first launch. It is stored in `secrets.json` (mode 0600) inside your
+  mounted **state dir** — never baked into the image, never sent to the browser,
+  never committed. No env var or compose wiring is needed.
+
+> **Nothing to set in a shell or env file for the key.** The only things the
+> wizard writes (to `docker/.env`) are your **project dir**, **state dir**,
+> `HOST_UID`/`HOST_GID` (auto-detected — needed so the non-root cloud worker can
+> write files), the port, and the Ollama URL.
 
 ### Steps
 
@@ -35,11 +65,12 @@ install is still available for contributors — see [Native install](#native-ins
 # 1. Get the code  (clone anywhere — this dir is where you run all ./docker/… commands)
 git clone <repo-url> ~/agentic-src && cd ~/agentic-src
 
-# 2. Start Ollama on all interfaces so the container can reach it
-#    (a plain `ollama serve` binds to localhost only)
-OLLAMA_HOST=0.0.0.0:11434 ollama serve &
+# 2. (Local jobs only) Start Ollama on all interfaces + parallelism, then pull a model
+OLLAMA_HOST=0.0.0.0:11434 OLLAMA_NUM_PARALLEL=2 ollama serve &
+ollama pull qwen2.5-coder:14b      # or build `qwen-coder` per "Local model setup"
 
-# 3. Run the setup wizard — it writes docker/.env and scaffolds the state dir
+# 3. Run the setup wizard — writes docker/.env (project dir, state dir, HOST_UID/GID,
+#    port, Ollama URL) and scaffolds the state dir
 ./docker/setup.sh
 
 # 4. Start it
@@ -50,8 +81,11 @@ OLLAMA_HOST=0.0.0.0:11434 ollama serve &
 > `~/agentic-src`). They're relative paths — `cd` there first, or you'll get
 > `no such file or directory`.
 
-Open [http://localhost:4080](http://localhost:4080), then configure mode/model in
-the **Settings** panel. **To stop:** `./docker/down.sh` (from the repo dir).
+Open [http://localhost:4080](http://localhost:4080). Then in the **Settings**
+gear: pick a **default project** (Browse…), set your **Local model** and/or
+**Cloud model**, and — for cloud jobs — **paste your `ANTHROPIC_API_KEY`**.
+Per job, choose **Local** or **Cloud** with the Backend picker on the submit
+form (changeable on a pending job's card). **To stop:** `./docker/down.sh`.
 
 **The wizard asks for two paths:**
 - **Project dir** — the repo (or a `Projects/` parent) agents work on. It's the

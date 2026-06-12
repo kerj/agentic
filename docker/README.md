@@ -1,12 +1,18 @@
 # Running agentic in Docker
 
 `docker compose up` and you land on the dashboard at `http://localhost:4080` —
-then configure mode, model, and context in the browser. No shell env vars to
+then configure model, backend, and context in the browser. No shell env vars to
 manage; the only host config is a few paths the wizard writes for you.
 
-**v1 scope:** local mode, TypeScript projects. Ollama runs **on the host** (it
-needs the GPU); the container reaches it over the network. There is no `ollama`
-and no `claude` CLI inside the image.
+**Backends are per-job:** **Local** (Ollama) and **Cloud** (Claude Code) both
+work from one container.
+- **Local:** Ollama runs **on the host** (it needs the GPU); the container
+  reaches it over the network. There is no `ollama` in the image.
+- **Cloud:** the **`claude` CLI is baked into the image**. It authenticates with
+  the `ANTHROPIC_API_KEY` you set in the dashboard's Settings gear (stored in
+  `secrets.json` in the mounted state dir, mode 0600 — never in the image or git),
+  and runs as your non-root host UID (gosu), since the CLI refuses
+  `--dangerously-skip-permissions` as root.
 
 ---
 

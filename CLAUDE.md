@@ -104,7 +104,7 @@ Key endpoints (all under `/api/`): `jobs`, `submit`, `worker-stream`, `worker-st
 ## Local worker (Ollama) — and one correction
 
 - [ollama_worker.py](lib/ollama_worker.py) talks to Ollama over the **OpenAI-compatible** endpoint `${OLLAMA_HOST}/v1/chat/completions` (default `http://localhost:11434`, [ollama_worker.py:32](lib/ollama_worker.py#L32), [:1177](lib/ollama_worker.py#L1177)) — **not** `/api/generate` or `/api/chat`. Streaming is **off** (`stream: false`).
-- Model name = `AGENTIC_LOCAL_MODEL` (default `qwen2.5-coder:32b`, [ollama_worker.py:33](lib/ollama_worker.py#L33)), passed through **unmodified**.
+- Model name = `AGENTIC_LOCAL_MODEL` (default `qwen-coder:latest`, [settings.py](lib/settings.py) + [ollama_worker.py:33](lib/ollama_worker.py#L33)), passed through **unmodified**.
 - Tools (`Read/Edit/Write/Bash/Glob/Grep/LS`) are implemented as **Python functions**, not the `claude` CLI. `Bash` blocks destructive commands (`rm -rf`, `killall`, `pkill`).
 - **Surgical repair loop**: after the main loop, it runs the project build; on failure it fixes **one error per round** in **Edit-only** mode, locks edits to the files named in the error output, checkpoints via `git stash`, and **reverts + escalates** if the error count goes up. Max **5 rounds** (`MAX_REPAIR_ROUNDS`, [:36](lib/ollama_worker.py#L36)). A spiral guard hard-stops after 5 consecutive `Bash` calls with no Read/Edit/Write.
 - **Context compression**: when an estimate exceeds `AGENTIC_CONTEXT_BUDGET` it replaces old `Read` results with symbol maps (TS exports / CSS selectors / truncation), keeping the most recent `AGENTIC_KEEP_RECENT_TURNS` (15) turns.
@@ -115,11 +115,26 @@ Key endpoints (all under `/api/`): `jobs`, `submit`, `worker-stream`, `worker-st
 
 ## Config & backend switching
 
+> ⚠️ **Stale section — current architecture.** Configuration now lives in
+> **`${AGENTIC_HOME}/settings.json`** (knobs, via [settings.py](lib/settings.py)'s
+> SCHEMA — `load()`/`save()`/`get()`) and **`${AGENTIC_HOME}/secrets.json`**
+> (mode 0600 — `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, via
+> `get_secret`/`set_secret`). The dashboard's **Settings gear** is the source of
+> truth; env vars are only a fallback/seed. The legacy `~/.agentic/.agentic.conf`
+> (below) is a one-time migration source only ([settings.py](lib/settings.py)
+> `migrate_from_conf_if_needed`). There is **no global "mode" knob** anymore —
+> backend is **per-job** (the job's `model_hint`: `local`/`remote`/`auto`→local;
+> resolved by `_backend_of` in [serve.py](lib/serve.py) and `_queue_job_backend`
+> in [queue.sh](lib/queue.sh), which MUST agree). In Docker the API key is set in
+> the UI and persists in the mounted state dir's `secrets.json` — never baked into
+> the image, never committed. The remainder of this section describes the legacy
+> native `.agentic.conf` flow.
+
 Settings live in `~/.agentic/.agentic.conf` (sourced from `~/.zshrc`); env vars override the file ([config.sh](lib/config.sh)). See [.agentic.conf.example](.agentic.conf.example).
 
 | Key | Default | Notes |
 |-----|---------|-------|
-| `AGENTIC_LOCAL_MODEL` | `qwen2.5-coder:32b` | Ollama model for local mode |
+| `AGENTIC_LOCAL_MODEL` | `qwen-coder:latest` | Ollama model for local mode |
 | `AGENTIC_CONTEXT_BUDGET` | `24000` | Token budget before old reads are compressed; example conf and `ollama_worker.py` default agree |
 | `AGENTIC_KEEP_RECENT_TURNS` | `15` | Turns kept verbatim before compression |
 | `ANTHROPIC_API_KEY` / `AGENTIC_MODEL` / `ANTHROPIC_BASE_URL` | unset | Cloud/Anthropic settings |
