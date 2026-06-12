@@ -662,7 +662,8 @@ def run_agent(mode: str, model: str, request: str, repo: str,
               max_turns: int = PLANNING_MAX_TURNS_DEFAULT,
               timeout: int = 600,
               seed_map: str = "",
-              on_event: Optional[Any] = None) -> dict[str, Any]:
+              on_event: Optional[Any] = None,
+              on_start: Optional[Any] = None) -> dict[str, Any]:
     """Dispatch a read-only agent subprocess, stream-parse its output, and
     harvest citations from the read tool calls it actually made.
 
@@ -687,7 +688,15 @@ def run_agent(mode: str, model: str, request: str, repo: str,
         proc = subprocess.Popen(
             cmd, cwd=repo, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,   # own process group, so cancel can killpg it
         )
+        # Hand the live subprocess to the caller so it can be cancelled (the
+        # dashboard registers it per-thread and kills it on Stop).
+        if on_start is not None:
+            try:
+                on_start(proc)
+            except Exception:
+                pass
     except FileNotFoundError as e:
         return {
             "answer": f"Planning agent could not start ({mode}): {e}",
@@ -753,7 +762,8 @@ def _percent_saved_hint(files_read: int, turns: int) -> str:
 
 def ask(channel: dict[str, Any], thread: dict[str, Any], question: str,
         symbol_map: Optional[str] = None, dig_deeper: bool = False,
-        on_event: Optional[Any] = None) -> dict[str, Any]:
+        on_event: Optional[Any] = None,
+        on_start: Optional[Any] = None) -> dict[str, Any]:
     """Run the tiered grounding flow for one question.
 
     channel: {cid, repo, profile, ...}; thread: {planning_mode, planning_model,
@@ -794,7 +804,7 @@ def ask(channel: dict[str, Any], thread: dict[str, Any], question: str,
     # Seed the agent with the symbol map (routed per-backend by run_agent) so it
     # knows where things live and can jump straight to the right files.
     res = run_agent(mode, model, question, repo, max_turns=max_turns,
-                    seed_map=symbol_map or "", on_event=on_event)
+                    seed_map=symbol_map or "", on_event=on_event, on_start=on_start)
     files_read = res.get("files_read", [])
     return {
         "answer": res["answer"],
@@ -1080,7 +1090,8 @@ def bake_anchors_into_request(request: str, anchors: list[dict[str, Any]]) -> st
 
 
 def derive(channel: dict[str, Any], thread: dict[str, Any], transcript: str,
-           on_event: Optional[Any] = None) -> dict[str, Any]:
+           on_event: Optional[Any] = None,
+           on_start: Optional[Any] = None) -> dict[str, Any]:
     """Run the derivation agent + two-stage anchor verification.
 
     transcript: the thread conversation text to derive jobs from (the engine is
@@ -1104,7 +1115,8 @@ def derive(channel: dict[str, Any], thread: dict[str, Any], transcript: str,
         "=== END CONVERSATION ===\n"
         "Open the real files to confirm your anchors, then return ONLY the JSON array."
     )
-    res = run_agent(mode, model, request, repo, max_turns=max_turns, on_event=on_event)
+    res = run_agent(mode, model, request, repo, max_turns=max_turns,
+                    on_event=on_event, on_start=on_start)
     raw_jobs = _extract_json_array(res["answer"])
 
     jobs_out: list[dict[str, Any]] = []

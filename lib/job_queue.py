@@ -362,32 +362,20 @@ def accept_job(job_id: str, acknowledge_risk: bool = False) -> str:
     is_review   = job.get("job_type") == "review"
     branch_root = _branch_job_id(job_id) if is_review else job_id
     branch      = f"agentic/{branch_root}"
-    base_branch = job.get("base_branch") or "HEAD"
 
-    if base_branch != "HEAD":
-        current = subprocess.run(
-            ["git", "-C", target, "symbolic-ref", "--short", "HEAD"],
-            capture_output=True, text=True,
-        ).stdout.strip()
-
-        if current != base_branch:
-            # Switching branches — fail loudly if the working tree is dirty
-            dirty = subprocess.run(
-                ["git", "-C", target, "status", "--porcelain"],
-                capture_output=True, text=True,
-            ).stdout.strip()
-            if dirty:
-                raise RuntimeError(
-                    f"Cannot switch to '{base_branch}': you have uncommitted changes. "
-                    f"Stash or commit them first, then accept again. "
-                    f"Alternatively, use Accept Chain to merge to a staging branch."
-                )
-            co = subprocess.run(
-                ["git", "-C", target, "checkout", base_branch],
-                capture_output=True, text=True,
-            )
-            if co.returncode != 0:
-                raise RuntimeError(f"Could not checkout {base_branch}: {co.stderr.strip()}")
+    # Merge into whatever branch is CURRENTLY checked out — no switching to the
+    # job's frozen base_branch (which silently moved you to a different branch),
+    # no staging branch. "Accept" means "bring this work into the branch I'm on
+    # right now". Resolve HEAD just for the message / detached-HEAD guard.
+    current = subprocess.run(
+        ["git", "-C", target, "symbolic-ref", "--short", "HEAD"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if not current:
+        raise RuntimeError(
+            "Cannot accept onto a detached HEAD — check out a branch first, "
+            "then accept again."
+        )
 
     r = subprocess.run(
         ["git", "-C", target, "merge", branch, "--no-ff", "-m", f"Accept agentic job: {job_id}"],
@@ -443,49 +431,44 @@ def accept_job(job_id: str, acknowledge_risk: bool = False) -> str:
                     except Exception:
                         pass
 
-    return f"Merged {branch} into {base_branch}"
+    return f"Merged {branch} into {current}"
 
 
 def accept_chain(job_id: str) -> AcceptChainResult:
     """
-    Collect all done jobs in the chain into a single staging branch.
-    Creates agent-work/<date>-<short-id> from the base branch, merges each
-    agentic/<id> branch into it in order, then removes worktrees.
-    The user then merges the staging branch into their own branch when ready.
+    Merge every done job in the chain, in order, into the CURRENTLY checked-out
+    branch — no agent-work/ staging branch, no extra "git merge <staging>" step.
+    Each agentic/<id> is merged into your current branch in chain order; review
+    jobs are skipped (their commits ride on the parent's branch). The first merge
+    conflict stops the run and is left in your working tree to resolve.
     """
     all_jobs = read_jobs()
 
     # Walk forward through done descendants
-    chain, current = [job_id], job_id
+    chain, cur = [job_id], job_id
     while True:
         child = next(
             (j["id"] for j in all_jobs
-             if j.get("parent_request_id") == current and j.get("_state") == "done"),
+             if j.get("parent_request_id") == cur and j.get("_state") == "done"),
             None,
         )
         if not child:
             break
         chain.append(child)
-        current = child
+        cur = child
 
-    # Use the first job's base branch and target repo
     first_job, _ = find_job(chain[0])
-    target      = first_job["target_repo"]
-    base_branch = first_job.get("base_branch") or "HEAD"
-    stamp       = time.strftime("%Y%m%d")
-    short_id    = chain[0][-4:]
-    staging     = f"agent-work/{stamp}-{short_id}"
+    target = first_job["target_repo"]
 
-    # Create staging branch from base
-    r = subprocess.run(
-        ["git", "-C", target, "checkout", "-b", staging, base_branch],
+    # Merge into whatever branch is checked out now (not a staging branch).
+    current = subprocess.run(
+        ["git", "-C", target, "symbolic-ref", "--short", "HEAD"],
         capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        # Branch may already exist — check it out instead
-        subprocess.run(
-            ["git", "-C", target, "checkout", staging],
-            capture_output=True,
+    ).stdout.strip()
+    if not current:
+        raise RuntimeError(
+            "Cannot accept onto a detached HEAD — check out a branch first, "
+            "then accept again."
         )
 
     # Merge each agent branch in order
@@ -498,20 +481,21 @@ def accept_chain(job_id: str) -> AcceptChainResult:
             continue
 
         # Review jobs commit onto the parent's branch — their commits are already
-        # included when the parent's branch was merged above. Skip the git merge.
+        # included when the parent's branch was merged. Skip the git merge.
         is_review = jjob.get("job_type") == "review"
 
         if not is_review:
             branch = f"agentic/{jid}"
             r = subprocess.run(
                 ["git", "-C", target, "merge", branch, "--no-ff",
-                 "-m", f"Agent job: {jid}"],
+                 "-m", f"Accept agentic job: {jid}"],
                 capture_output=True, text=True,
             )
             if r.returncode != 0:
                 raise RuntimeError(
-                    f"Merge conflict on {branch}: {r.stderr.strip()}\n"
-                    f"Resolve manually in {target} on branch {staging}"
+                    f"Merge conflict on {branch} while merging into {current}: "
+                    f"{r.stderr.strip()}\nResolve the conflict in {target}, commit, "
+                    f"then accept the remaining jobs."
                 )
 
         wt = WORKTREES_DIR / jid
@@ -528,7 +512,8 @@ def accept_chain(job_id: str) -> AcceptChainResult:
         jf.unlink()
         accepted.append(jid)
 
-    return cast(AcceptChainResult, {"accepted": accepted, "staging_branch": staging, "target": target})
+    # staging_branch now reports the branch we merged INTO (kept for API/UI shape).
+    return cast(AcceptChainResult, {"accepted": accepted, "staging_branch": current, "target": target})
 
 
 def abandon_job(job_id: str) -> None:
@@ -549,6 +534,23 @@ def set_chain(job_id: str, parent_id: str | None) -> None:
     data, f = find_job(job_id)
     data.pop("_state", None)
     data["parent_request_id"] = parent_id or None
+    f.write_text(json.dumps(data, indent=2))
+
+
+def set_backend(job_id: str, backend: str) -> None:
+    """Switch a PENDING job's execution backend ('local' | 'cloud').
+
+    Backend is stored as the job's model_hint ('local'→local pool, 'cloud'→remote
+    pool / cloud). Only valid while the job is pending: once claimed the worker
+    has already chosen its route, and done/merged jobs are immutable. Mirrors
+    set_chain (in-place field edit, no directory move)."""
+    if backend not in ("local", "cloud"):
+        raise ValueError(f"Invalid backend: {backend!r} (expected 'local' or 'cloud')")
+    data, f = find_job(job_id)
+    if data.get("_state") != "pending":
+        raise ValueError("backend can only be changed while the job is pending")
+    data.pop("_state", None)
+    data["model_hint"] = "local" if backend == "local" else "remote"
     f.write_text(json.dumps(data, indent=2))
 
 
@@ -574,7 +576,14 @@ def review_job(job_id: str) -> str:
 
     Uses `git diff base...agent | git apply` — no MERGE_HEAD state, no staging.
     Files appear as ordinary working-tree changes in the IDE. The user edits,
-    then commits (or discards with `git checkout -- .`) however they like.
+    then commits (or discards with `git reset && git checkout -- .`) however they
+    like.
+
+    Doubles as "Resolve merge": when the base has moved (another job was accepted
+    over the same lines), the plain apply fails and the `--3way` fallback writes
+    standard conflict markers by 3-way-merging the job's delta against the live
+    working tree — which already holds the accepted change. So a real overlap
+    surfaces as ordinary conflict markers to resolve in the IDE.
     """
     job, _ = find_job(job_id, states=["done"])
     target      = job["target_repo"]
@@ -614,10 +623,22 @@ def review_job(job_id: str) -> str:
 
     # 2. Plain apply — working tree only, no staging.
     apply_result = _git("apply", input=diff_text)
+    conflicted = False
     if apply_result.returncode != 0:
         # 3. Fallback: 3-way (writes conflict markers if needed). Index is clean
         #    now, so this won't trip the "does not match index" path on context.
         apply_result = _git("apply", "--3way", input=diff_text)
+        # CRUCIAL: `git apply --3way` exits NON-ZERO when it writes conflict
+        # markers ("Applied patch to 'X' with conflicts.") even though it
+        # succeeded at surfacing the conflict — which is exactly the "Resolve
+        # merge" outcome we want. Treat that as success, not failure, so the
+        # markers are left in the working tree for the user to resolve in their
+        # IDE. Only a TRUE failure (patch doesn't apply at all) should raise.
+        blob = (apply_result.stdout + apply_result.stderr)
+        if "with conflicts" in blob or "U " in blob:
+            conflicted = True
+            apply_result = subprocess.CompletedProcess(  # mark as handled
+                apply_result.args, 0, apply_result.stdout, apply_result.stderr)
 
     if apply_result.returncode != 0:
         err = (apply_result.stderr or apply_result.stdout).strip()
@@ -626,13 +647,20 @@ def review_job(job_id: str) -> str:
         hint = ""
         if "does not match index" in err or "patch does not apply" in err:
             hint = ("\n\nThe working tree may have uncommitted changes or moved "
-                    "since the job ran. Commit/stash or `git checkout -- .` in "
-                    f"{target}, then try again.")
+                    "since the job ran. Commit/stash or `git reset && git "
+                    f"checkout -- .` in {target}, then try again.")
         raise RuntimeError(f"Could not apply changes: {err}{hint}")
 
+    if conflicted:
+        return (
+            f"Applied with CONFLICTS to {target} — the base moved since this job "
+            f"ran (another job changed the same code). Resolve the conflict "
+            f"markers (<<<<<<< / ======= / >>>>>>>) in your IDE, then commit. "
+            f"Abort with: git reset && git checkout -- ."
+        )
     return (
         f"Changes applied to {target} — review modified files in your IDE, "
-        f"then commit. Discard with: git checkout -- ."
+        f"then commit. Discard with: git reset && git checkout -- ."
     )
 
 
@@ -685,15 +713,24 @@ def get_diff(job_id: str) -> str:
     cached = DIFFS_DIR / f"{job_id}.diff"
     diff = ""
 
-    # Resolve job metadata once so both paths can use it
+    # A chained child commits ON TOP of its parent(s) on the same branch. We
+    # want the reviewer to see the WHOLE chain up to and including this job —
+    # parent foundation + this job's delta — as one unified, commentable diff,
+    # so reviewing the tip of a chain reviews everything. (Review comments still
+    # chain a review job onto THIS job, never the parent: changing the parent
+    # could invalidate the child, so fixes belong after the child in the chain.)
+    #
+    # Resolve job metadata once so both paths can use it.
     try:
         job, _ = find_job(job_id)
         is_review   = job.get("job_type") == "review"
+        is_chained  = bool(job.get("parent_request_id"))
         branch_root = _branch_job_id(job_id) if is_review else job_id
         base_branch = job.get("base_branch") or "HEAD"
         target      = job["target_repo"]
     except Exception:
         is_review = False
+        is_chained = False
         branch_root = job_id
         base_branch = "HEAD"
         target = ""
@@ -701,20 +738,22 @@ def get_diff(job_id: str) -> str:
     # 1) Live worktree (job in progress or not yet accepted) — always recompute.
     wt = WORKTREES_DIR / job_id
     if wt.exists():
-        if is_review:
-            # Review worktree sits on the root branch; show full diff from base.
+        if is_review or is_chained:
+            # Review worktrees sit on the root branch, and chained children build
+            # on their parents — in both cases the meaningful diff is the full
+            # delta from the base branch (base...HEAD), which captures the whole
+            # chain regardless of intermediate commit topology.
             r = subprocess.run(
                 ["git", "-C", str(wt), "diff", f"{base_branch}...HEAD"],
                 capture_output=True, text=True,
             )
             diff = r.stdout
         else:
-            # The worker squashes the agent's work into ONE commit at HEAD. The
-            # correct diff is that commit vs its OWN parent — not a positional
-            # HEAD~1, which on a chain-merged history points at an unrelated
-            # ancestor (e.g. a prior job's "Accept …" commit) and surfaces
-            # another job's changes. Diff HEAD against its real parent; if HEAD
-            # is a root commit (no parent), show it whole.
+            # Standalone job: the worker squashes its work into ONE commit at
+            # HEAD. The correct diff is that commit vs its OWN parent — not a
+            # positional HEAD~1, which on a chain-merged history points at an
+            # unrelated ancestor. Diff HEAD against its real parent; if HEAD is a
+            # root commit (no parent), show it whole.
             has_parent = subprocess.run(
                 ["git", "-C", str(wt), "rev-parse", "--verify", "--quiet", "HEAD^"],
                 capture_output=True, text=True,
@@ -738,10 +777,14 @@ def get_diff(job_id: str) -> str:
                         break
 
     # 2) Live branch (worktree removed but branch still present) — recompute.
+    #    A chained child has its own branch tip (agentic/<job_id>) carrying the
+    #    full chain; a standalone/review job uses branch_root. Either way,
+    #    base...tip yields the cumulative delta.
     if not diff.strip() and target:
+        tip = job_id if is_chained else branch_root
         try:
             r = subprocess.run(
-                ["git", "-C", target, "diff", f"{base_branch}...agentic/{branch_root}"],
+                ["git", "-C", target, "diff", f"{base_branch}...agentic/{tip}"],
                 capture_output=True, text=True,
             )
             diff = r.stdout
@@ -949,6 +992,89 @@ def get_repos(default_repo: str = "") -> list[str]:
     return ordered
 
 
+# ── Merge-conflict pre-detection ────────────────────────────────────────────────
+# Predict whether accepting (merging) a done job's branch into its base would
+# conflict — WITHOUT touching the working tree — so the dashboard can warn before
+# you hit an aborted accept. Uses `git merge-tree --write-tree` (git ≥ 2.38), an
+# in-memory merge that mutates nothing. A conflict only becomes real once another
+# job has been accepted (moving the base), so this is recomputed on every poll —
+# but gated behind a SHA-pair cache so a steady-state poll runs zero merges.
+#
+# Result is a pure function of (base_tip_sha, branch_tip_sha): both fully identify
+# the two trees, and nothing else affects the merge outcome.
+_CONFLICT_CACHE: "dict[tuple[str, str], tuple[bool, list[str]]]" = {}
+_CONFLICT_CACHE_MAX = 512
+
+
+def _git_out(target: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", target, *args],
+                          capture_output=True, text=True)
+
+
+def _resolve_base_ref(target: str, base_branch: str) -> str | None:
+    """Resolve the job's base into a concrete ref to merge against. A literal
+    "HEAD" base is ambiguous (it's whatever the repo currently has checked out),
+    so resolve it to the real branch name; if HEAD is detached, return None so
+    the caller SKIPS the probe rather than comparing against the wrong base."""
+    if base_branch and base_branch != "HEAD":
+        return base_branch
+    r = _git_out(target, "symbolic-ref", "--short", "HEAD")
+    if r.returncode == 0 and r.stdout.strip():
+        return r.stdout.strip()
+    return None  # detached HEAD — don't guess
+
+
+def _rev(target: str, ref: str) -> str | None:
+    r = _git_out(target, "rev-parse", "--verify", "--quiet", ref)
+    sha = r.stdout.strip()
+    return sha if (r.returncode == 0 and sha) else None
+
+
+def _merge_conflict_probe(target: str, base_ref: str, branch: str
+                          ) -> tuple[bool | None, list[str]]:
+    """Return (conflict, files): conflict True/False, or None when the answer is
+    unknown (missing ref, unrelated histories, git error) — in which case the UI
+    shows NO badge. Cached by (base_sha, branch_sha)."""
+    if not os.path.isdir(target):
+        return None, []
+    base_sha   = _rev(target, base_ref)
+    branch_sha = _rev(target, branch)
+    if not base_sha or not branch_sha:
+        return None, []          # missing branch / bad base → skip, never "conflict"
+    if base_sha == branch_sha:
+        return False, []         # identical trees can't conflict
+
+    key = (base_sha, branch_sha)
+    if key in _CONFLICT_CACHE:
+        c, files = _CONFLICT_CACHE[key]
+        return c, files
+
+    p = _git_out(target, "merge-tree", "--write-tree", "--name-only",
+                 "--no-messages", base_ref, branch)
+    if p.returncode == 0:
+        result: tuple[bool | None, list[str]] = (False, [])
+    elif p.returncode == 1:
+        # stdout: line 0 = merged-tree OID; then one conflicting path per line
+        # until the first blank line; trailing lines are informational.
+        files = []
+        for ln in p.stdout.splitlines()[1:]:
+            if ln == "":
+                break
+            files.append(ln)
+        result = (True, files)
+    else:
+        # >1 (or other): bad ref / unrelated histories / usage error — UNKNOWN,
+        # not a conflict. Do not cache (the condition may be transient).
+        return None, []
+
+    if len(_CONFLICT_CACHE) >= _CONFLICT_CACHE_MAX:
+        # cheap prune: drop an arbitrary ~quarter of entries (no LRU bookkeeping)
+        for k in list(_CONFLICT_CACHE)[: _CONFLICT_CACHE_MAX // 4]:
+            _CONFLICT_CACHE.pop(k, None)
+    _CONFLICT_CACHE[key] = result
+    return result
+
+
 def read_jobs() -> list[Job]:
     jobs = []
     for state in STATES:
@@ -963,7 +1089,58 @@ def read_jobs() -> list[Job]:
             except Exception:
                 pass
     jobs.sort(key=lambda j: j.get("submitted_at", ""), reverse=True)
+
+    # Annotate chain-gated children: when the review gate is ON, a pending child
+    # whose parent has finished (done) but isn't yet merged is BLOCKED waiting
+    # for you to accept the parent. Surface that so the card can say why it's
+    # stuck instead of looking mysteriously idle. (A parent still pending/running
+    # is ordinary chain-waiting, not gate-specific.)
+    gate_on = False
+    try:
+        import settings as _s
+        gate_on = bool(_s.get("pause_chain_for_review"))
+    except Exception:
+        gate_on = str(os.environ.get("AGENTIC_CHAIN_GATE", "")).strip() == "1"
+    if gate_on:
+        state_by_id = {j.get("id"): j.get("_state") for j in jobs}
+        for j in jobs:
+            pid = j.get("parent_request_id")
+            if j.get("_state") == "pending" and pid and state_by_id.get(pid) == "done":
+                j["chain_gated"] = True  # type: ignore[typeddict-unknown-key]
+
+    _annotate_merge_conflicts(jobs)
     return jobs
+
+
+def _annotate_merge_conflicts(jobs: list[Job]) -> None:
+    """Tag each DONE job with whether accepting it now would conflict with its
+    (possibly-moved) base, so the dashboard can badge it. Mirrors accept_job's
+    merge exactly. Per the design:
+      - SKIP review jobs (they fold into the root's branch — no own branch).
+      - SKIP interior chain members (a done job that has a done descendant is the
+        MIDDLE of a chain; its normal merge path is Accept Chain, not standalone).
+        The badge belongs on standalone jobs and chain TIPS.
+    The probe is SHA-pair-cached, so a steady-state poll runs no merges."""
+    done = [j for j in jobs if j.get("_state") == "done"]
+    if not done:
+        return
+    # A done job is an "interior chain member" if some other done job names it as
+    # parent — i.e. it has a done descendant waiting on it.
+    done_parents = {j.get("parent_request_id") for j in done if j.get("parent_request_id")}
+    for j in done:
+        jid = j.get("id")
+        if j.get("job_type") == "review":
+            continue                       # folded into root — no standalone accept
+        if jid in done_parents:
+            continue                       # interior chain member — accept via chain
+        target = j.get("target_repo") or ""
+        base_ref = _resolve_base_ref(target, j.get("base_branch") or "HEAD")
+        if not base_ref:
+            continue                       # detached HEAD / no repo — no badge
+        conflict, files = _merge_conflict_probe(target, base_ref, f"agentic/{jid}")
+        if conflict:
+            j["merge_conflict"] = True            # type: ignore[typeddict-unknown-key]
+            j["conflict_files"] = files           # type: ignore[typeddict-unknown-key]
 
 
 def get_ollama_models() -> list[str]:

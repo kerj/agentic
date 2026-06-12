@@ -200,14 +200,66 @@ case "${1:-}" in
     echo "✅ Cancelled: $_cjob"
     ;;
 
-  # worker-once — claim one job, run the Claude agent in an isolated worktree
+  # claim — atomically claim one pending job for a backend, print ONLY its id.
+  # Used by the server-side dispatcher: it claims here, then spawns
+  # `worker-once --id <id> --backend <b>` against the moved running/ file.
+  #   agentic claim --backend local|cloud [--exclude-chain-roots id,id,...]
+  claim)
+    shift
+    _queue_init
+    local _cl_path
+    if ! _cl_path=$(queue_claim "$@"); then
+      exit 1   # nothing claimable for this backend/filter
+    fi
+    jq -r '.id' "$_cl_path"   # stdout: the claimed job id, and nothing else
+    exit 0
+    ;;
+
+  # worker-once — run one job in an isolated worktree.
+  #   no flags          : claim the next pending job then run it (CLI back-compat).
+  #   --id <job_id>     : the dispatcher already claimed it (it's in running/);
+  #                       SKIP queue_claim and run THAT job.
+  #   --backend l|cloud : route this process — local sets AGENTIC_LOCAL=1, cloud
+  #                       unsets it (uses AGENTIC_MODEL) — so one server drives
+  #                       both pools.
   worker-once)
+    shift
     _queue_init
 
+    local _warg_id="" _warg_backend=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --id)         _warg_id="$2"; shift 2 ;;
+        --id=*)       _warg_id="${1#*=}"; shift ;;
+        --backend)    _warg_backend="$2"; shift 2 ;;
+        --backend=*)  _warg_backend="${1#*=}"; shift ;;
+        *) echo "❌ worker-once: unknown argument '$1'" >&2; exit 2 ;;
+      esac
+    done
+
+    # Per-process backend routing (mirrors serve.py's per-spawn env).
+    case "$_warg_backend" in
+      local) export AGENTIC_LOCAL=1 ;;
+      cloud) unset AGENTIC_LOCAL ;;        # cloud → claude CLI via AGENTIC_MODEL
+      "")    : ;;                          # no override — honour inherited env
+      *) echo "❌ worker-once: --backend must be 'local' or 'cloud'" >&2; exit 2 ;;
+    esac
+
     local _wjob_path
-    if ! _wjob_path=$(queue_claim); then
-      echo "No pending jobs."
-      exit 0
+    if [[ -n "$_warg_id" ]]; then
+      # Dispatcher path: the job is already claimed and in running/ — find by id.
+      _wjob_path=$(grep -rlE "\"id\":[[:space:]]*\"${_warg_id}\"" \
+        "${AGENTIC_QUEUE_DIR}/running/" 2>/dev/null | head -1)
+      if [[ -z "$_wjob_path" || ! -f "$_wjob_path" ]]; then
+        echo "❌ worker-once: no running/ job found for id '$_warg_id'" >&2
+        exit 1
+      fi
+    else
+      # CLI back-compat: claim the next pending job ourselves.
+      if ! _wjob_path=$(queue_claim); then
+        echo "No pending jobs."
+        exit 0
+      fi
     fi
 
     local _wid _wrequest _wtarget _wmodel

@@ -112,12 +112,64 @@ queue_submit() {
   echo "$id"
 }
 
-# queue_claim — atomically claims the highest-priority oldest job from pending/.
+# _queue_job_backend FILE — echo the pool ("local"|"cloud") a job routes to,
+# derived from its model_hint: remote→cloud, local/auto/anything-else→local.
+# MUST match serve.py:_backend_of exactly so the claim filter and the dispatcher
+# never disagree. There is no global "mode" anymore (backend is per-job); an
+# unset/auto job defaults to local.
+_queue_job_backend() {
+  local f="$1" hint
+  hint=$(jq -r '.model_hint // "auto"' "$f" 2>/dev/null)
+  case "$hint" in
+    remote) echo "cloud" ;;
+    *)      echo "local" ;;   # local, auto, blank, or unknown → local
+  esac
+}
+
+# _queue_chain_root JOB_ID — echo the TOPMOST ancestor id (the chain root) by
+# walking parent_request_id until a job has no parent. ALL jobs in one chain
+# (root, children, reviews) resolve to the same root, so excluding a root
+# serializes the whole chain. (This differs from job_queue.py:_branch_job_id,
+# which answers "which branch do commits land on" — not the same question.)
+# Searches pending/running/done for each ancestor's file.
+_queue_chain_root() {
+  local cur="$1" seen="" f parent
+  while [[ -n "$cur" && ",$seen," != *",$cur,"* ]]; do
+    seen="$seen,$cur"
+    f=$(grep -rlE "\"id\":[[:space:]]*\"${cur}\"" \
+          "${AGENTIC_QUEUE_DIR}/pending" "${AGENTIC_QUEUE_DIR}/running" \
+          "${AGENTIC_QUEUE_DIR}/done" 2>/dev/null | head -1)
+    [[ -z "$f" || ! -f "$f" ]] && { echo "$cur"; return; }   # ancestor file gone → cur is root
+    parent=$(jq -r '.parent_request_id // empty' "$f" 2>/dev/null)
+    [[ -z "$parent" || "$parent" == "null" ]] && { echo "$cur"; return; }  # no parent → root
+    cur="$parent"
+  done
+  echo "$cur"
+}
+
+# queue_claim [--backend local|cloud] [--exclude-chain-roots id,id,...]
+# Atomically claims the highest-priority oldest job from pending/.
 # Skips any job whose parent_request_id is still in pending/ or running/ so that
 # chained jobs never execute before their parent has completed.
-# Echoes the path to the now-running/ job file on stdout.
-# Returns 1 if nothing claimable is pending.
+#   --backend            : only claim jobs that route to this pool (model_hint).
+#   --exclude-chain-roots: skip a job if its chain root is in this comma list
+#                          (the dispatcher passes roots already in flight, so two
+#                          siblings of one chain never run concurrently).
+# With NO flags, behaviour is byte-for-byte the original (claim anything).
+# Echoes the path to the now-running/ job file on stdout. Returns 1 if nothing
+# claimable.
 queue_claim() {
+  local want_backend="" exclude_roots=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --backend)              want_backend="$2"; shift 2 ;;
+      --backend=*)            want_backend="${1#*=}"; shift ;;
+      --exclude-chain-roots)  exclude_roots="$2"; shift 2 ;;
+      --exclude-chain-roots=*) exclude_roots="${1#*=}"; shift ;;
+      *) shift ;;   # ignore unknown args (forward-compat)
+    esac
+  done
+
   _queue_init
 
   local worker_id
@@ -133,13 +185,37 @@ queue_claim() {
     local src="${AGENTIC_QUEUE_DIR}/pending/${candidate}"
     local dst="${AGENTIC_QUEUE_DIR}/running/${candidate}"
 
-    # Chain-dependency check: skip if the parent job is still pending or running
+    # Backend filter: only claim jobs that route to the requested pool.
+    if [[ -n "$want_backend" ]]; then
+      local _cand_backend
+      _cand_backend=$(_queue_job_backend "$src")
+      [[ "$_cand_backend" != "$want_backend" ]] && continue
+    fi
+
+    # Chain-sibling serialization: skip a job whose chain root is already in
+    # flight (the dispatcher passes the in-flight roots), so two siblings of one
+    # chain never run at the same time.
+    if [[ -n "$exclude_roots" ]]; then
+      local _cand_id _cand_root
+      _cand_id=$(jq -r '.id // empty' "$src" 2>/dev/null)
+      if [[ -n "$_cand_id" ]]; then
+        _cand_root=$(_queue_chain_root "$_cand_id")
+        [[ ",$exclude_roots," == *",$_cand_root,"* ]] && continue
+      fi
+    fi
+
+    # Chain-dependency check: skip if the parent job is still pending or running.
+    # When the review gate is ON (AGENTIC_CHAIN_GATE=1), ALSO skip while the
+    # parent is in done/ — the child waits until the parent is ACCEPTED (merged),
+    # giving you a breakpoint to review (and chain review jobs onto) each link
+    # before the next one runs. Gate OFF = release as soon as the parent is done.
     local parent_id
     parent_id=$(jq -r '.parent_request_id // empty' "$src" 2>/dev/null)
     if [[ -n "$parent_id" ]]; then
+      local _gate_dirs=("${AGENTIC_QUEUE_DIR}/pending" "${AGENTIC_QUEUE_DIR}/running")
+      [[ "${AGENTIC_CHAIN_GATE:-}" == "1" ]] && _gate_dirs+=("${AGENTIC_QUEUE_DIR}/done")
       if grep -rl "\"id\": \"${parent_id}\"" \
-           "${AGENTIC_QUEUE_DIR}/pending" \
-           "${AGENTIC_QUEUE_DIR}/running" 2>/dev/null | grep -q .; then
+           "${_gate_dirs[@]}" 2>/dev/null | grep -q .; then
         continue
       fi
     fi

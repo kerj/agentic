@@ -1865,15 +1865,19 @@ def emit_progress(ctx_tokens: int) -> None:
 # ── Ollama API ─────────────────────────────────────────────────────────────────
 
 def call_ollama(messages: list, model: str,
-                tools: list) -> tuple[dict, dict]:
+                tools: Optional[list]) -> tuple[dict, dict]:
     payload = {
         "model":       model,
         "messages":    messages,
-        "tools":       tools,
-        "tool_choice": "auto",
         "stream":      False,
         "options":     {"think": False},
     }
+    # Only advertise tools when we actually have some. Passing tools=None (used
+    # to force a final tool-free synthesis turn) with tool_choice:auto is
+    # malformed on some OpenAI-compatible servers — omit both keys instead.
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
     req = urllib.request.Request(
         f"{OLLAMA_HOST}/v1/chat/completions",
         data=json.dumps(payload).encode(),
@@ -2455,19 +2459,66 @@ def run_ask(question: str, model: str) -> int:
     # the FINAL (tool-call-free) message to `messages` — so we sniff the stream
     # here rather than reading back `messages` (which would miss the answer). We
     # wrap emit transparently: every event still flows to stdout for the caller.
-    captured = {"answer": ""}
+    # We want the FINAL synthesized answer — the tool-call-free turn the model
+    # writes after it's done reading. But the loop can exhaust its turn budget
+    # while the model is still calling tools, in which case it never gets to
+    # synthesize. Worse, naively keeping "the last assistant text" would keep the
+    # PREAMBLE ("Let me check the CSS…") emitted alongside the first tool call —
+    # which is exactly the truncated, answer-less response the user sees. So we
+    # only treat a turn's text as the answer when that turn made NO tool calls
+    # (a real final answer), and force one synthesis turn if we ran out first.
+    captured = {"answer": "", "final": False}
+    _turn_has_tools = {"v": False}
     _orig_emit = globals()["emit"]
     def _capturing_emit(event: dict) -> None:
-        if event.get("type") == "assistant":
+        et = event.get("type")
+        if et == "assistant":
             for block in event.get("message", {}).get("content", []):
                 if block.get("type") == "text" and block.get("text", "").strip():
+                    # Provisionally capture; _turn_has_tools tells us after the
+                    # turn whether this was a final answer or just a preamble.
                     captured["answer"] = block["text"]
+                    captured["final"] = False
+            _turn_has_tools["v"] = False  # reset for this new assistant turn
+        elif et == "tool_use":
+            _turn_has_tools["v"] = True   # this turn called a tool → preamble, not answer
         _orig_emit(event)
     globals()["emit"] = _capturing_emit
     try:
         messages, in_tok, out_tok = run_agent_loop(
             messages, model, TOOLS_PLANNING, max_turns=planning_max_turns
         )
+        # Did the loop end with a real, tool-call-free answer? The loop only
+        # breaks without tool calls when the model is genuinely done; otherwise
+        # it ran out of turns mid-read. If the last assistant text was a preamble
+        # to a tool call (not a final answer), force ONE synthesis turn with
+        # tools disabled so the model actually answers the question.
+        last = messages[-1] if messages else {}
+        ran_out = (last.get("role") == "tool") or _turn_has_tools["v"]
+        if ran_out:
+            emit({"type": "assistant", "message": {"content": [{
+                "type": "text",
+                "text": "\n[Synthesizing answer from what I've read…]"
+            }]}})
+            messages.append({
+                "role": "user",
+                "content": (
+                    "You've gathered enough context — stop reading now. Using ONLY "
+                    "what you've already read above, give your complete final answer "
+                    "to the question. Do not call any more tools. Cite the files and "
+                    "line ranges you relied on."
+                ),
+            })
+            msg, usage = call_ollama(messages, model, tools=None)
+            in_tok  += usage.get("prompt_tokens", 0)
+            out_tok += usage.get("completion_tokens", 0)
+            final_text = msg.get("content", "") or ""
+            if final_text.strip():
+                captured["answer"] = final_text
+                captured["final"] = True
+                emit({"type": "assistant", "message": {
+                    "content": [{"type": "text", "text": final_text}]
+                }})
     finally:
         globals()["emit"] = _orig_emit
 

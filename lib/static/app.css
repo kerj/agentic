@@ -1,6 +1,6 @@
 :root {
   --log-h: 300px;          /* live worker-console height (JS keeps it in sync) */
-  --header-h: 57px;        /* sticky header height */
+  --header-h: 92px;        /* sticky header height (two rows: info + controls) */
 
   /* ── Modern-IDE design tokens ──────────────────────────────────────────
      A disciplined system: surfaces (layered depth), one accent, a spacing
@@ -57,14 +57,17 @@ body {
 body.log-open #queue-view { padding-bottom: var(--log-h); }
 body.log-open #channels-view { height: calc(100vh - var(--header-h) - var(--log-h)); }
 
-/* Header */
+/* Header — two rows: info (identity + status) on top, controls below. */
 header {
   background: var(--surface-1); border-bottom: 1px solid var(--border-strong);
-  padding: var(--s2) var(--s5); display: flex; align-items: center; gap: var(--s3);
+  padding: var(--s2) var(--s5); display: flex; flex-direction: column; gap: var(--s2);
   position: sticky; top: 0; z-index: 100; height: var(--header-h);
 }
+.header-row { display: flex; align-items: center; gap: var(--s3); min-height: 30px; }
+.header-row.header-controls { gap: var(--s2); }
 header h1 { font-size: var(--fs-md); font-weight: 600; font-family: var(--font-mono); letter-spacing: -.01em; }
 #age { font-size: var(--fs-sm); color: var(--text-mut); margin-left: auto; font-family: var(--font-mono); }
+#pool-chip-slot { display: inline-flex; align-items: center; }
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
 .pulse { animation: pulse 1.8s ease-in-out infinite; }
@@ -169,6 +172,8 @@ a.job-id:hover { color: var(--accent); text-decoration: underline; }
 .chain-review > .job-card { border-left: 3px solid var(--accent); }
 .badge-review-type { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px; color: #79c0ff; border: 1px solid var(--accent-dim); background: var(--accent-bg); margin-left: 6px; vertical-align: middle; }
 .badge-profile { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px; color: #7ee787; border: 1px solid #1a4a26; background: #0a1f12; margin-left: 6px; vertical-align: middle; }
+.badge-gated { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px; color: var(--amber); border: 1px solid #7a4010; background: var(--amber-bg); margin-left: 6px; vertical-align: middle; white-space: nowrap; }
+.badge-conflict { display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px; color: var(--red); border: 1px solid #6d2120; background: var(--red-bg); margin-left: 6px; vertical-align: middle; white-space: nowrap; cursor: help; }
 
 /* Status popover menu */
 .status-menu { position: relative; display: inline-block; }
@@ -412,6 +417,10 @@ body.log-open #detail-drawer { bottom: var(--log-h); }
 .md-code { background: var(--surface-1); border: 1px solid var(--surface-3); border-radius: 4px; padding: 1px 5px; font-family: ui-monospace, monospace; font-size: 12px; color: #88b4ff; }
 .md-pre { background: var(--inset); border: 1px solid var(--surface-3); border-radius: 6px; padding: 10px 12px; overflow-x: auto; margin: 8px 0; }
 .md-pre code { font-family: ui-monospace, monospace; font-size: 12px; color: var(--text); white-space: pre; }
+.md-table { border-collapse: collapse; margin: 8px 0; font-size: 12px; display: block; overflow-x: auto; max-width: 100%; }
+.md-table th, .md-table td { border: 1px solid var(--surface-3); padding: 4px 10px; text-align: left; vertical-align: top; }
+.md-table th { background: var(--surface-2); color: var(--text); font-weight: 600; }
+.md-table tbody tr:nth-child(even), .md-table tbody tr:nth-child(even) { background: var(--surface-1); }
 .ch-cost-badge { display: inline-block; font-size: 10px; padding: 1px 7px; border-radius: 10px; background: var(--green-bg); color: var(--green); border: 1px solid #1e4a26; margin-top: 6px; }
 .ch-cost-badge.agent { background: #2a1900; color: #f0883e; border-color: #6d3d1a; }
 .ch-grounded-footer { font-size: 11px; color: var(--accent); font-family: monospace; margin-top: 6px; }
@@ -463,3 +472,72 @@ body.log-open #detail-drawer { bottom: var(--log-h); }
 .prop-dep { font-size: 11px; color: var(--text-dim); }
 .prop-dep select { font-size: 11px; padding: 3px 6px; }
 #prop-foot { padding: 12px 16px; border-top: 1px solid var(--border-strong); display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+
+/* ── Concurrent worker panes (live console) ──────────────────────────────────
+   The console body (#log-body) hosts #worker-panes: one collapsible <details>
+   per running job, driven by the dispatch stream. Each pane lazily tails its own
+   worker stream while expanded. */
+#worker-panes { display: flex; flex-direction: column; gap: var(--s2); }
+.wpane {
+  border: 1px solid var(--border); border-radius: var(--r);
+  background: var(--surface-1); overflow: hidden;
+}
+.wpane[open] { border-color: var(--border-strong); }
+.wpane-head {
+  display: flex; align-items: center; gap: var(--s2);
+  padding: var(--s2) var(--s3); cursor: pointer; list-style: none;
+  background: var(--surface-2); user-select: none;
+}
+.wpane-head::-webkit-details-marker { display: none; }
+.wpane[open] > .wpane-head { border-bottom: 1px solid var(--divider); }
+.wpane-status { font-size: var(--fs-sm); width: 14px; text-align: center; flex-shrink: 0; color: var(--text-mut); }
+.wpane-status.spin { color: #f0883e; display: inline-block; animation: wspin 1s linear infinite; }
+.wpane-status.ok  { color: var(--green); }
+.wpane-status.bad { color: var(--red); }
+@keyframes wspin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.wpane-badge {
+  font-size: var(--fs-sm); width: 18px; text-align: center; flex-shrink: 0;
+  border-radius: var(--r-sm);
+}
+.wpane-badge-local { color: var(--green); }
+.wpane-badge-cloud { color: var(--accent); }
+.wpane-name { font-size: var(--fs-sm); font-weight: 600; color: var(--text); flex-shrink: 0; }
+.wpane-id { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-mut); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wpane-tokens { margin-left: auto; font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-dim); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.wpane-stop {
+  flex-shrink: 0; background: var(--red-bg); color: var(--red);
+  border: 1px solid #6d2120; border-radius: var(--r-sm);
+  cursor: pointer; font-size: 10px; line-height: 1; padding: 3px 7px;
+}
+.wpane-stop:hover { border-color: var(--red); }
+.wpane-body {
+  max-height: 320px; overflow-y: auto; padding: var(--s2) var(--s3);
+  font-family: var(--font-mono); font-size: var(--fs-sm); line-height: 1.55;
+  background: var(--inset);
+}
+.wpane-body:empty::after { content: 'expand to stream…'; color: var(--text-mut); font-size: var(--fs-xs); }
+
+/* ── Header pool chip ("🏠 local 2/2 · ☁ cloud 1/4 · 3 queued") ─────────────── */
+#pool-chip {
+  display: inline-flex; align-items: center; gap: var(--s1);
+  font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--text-dim);
+  padding: 3px 8px; border: 1px solid var(--border); border-radius: var(--r-sm);
+  background: var(--surface-1); white-space: nowrap; margin-left: var(--s2);
+}
+#pool-chip .pc-seg { color: var(--text-dim); }
+#pool-chip .pc-seg.pc-active { color: var(--text); }
+#pool-chip .pc-dot { color: var(--text-mut); opacity: .6; }
+#pool-chip .pc-queued { color: var(--amber); }
+
+/* ── "queued" pill on a pending job card the pool can't start yet ───────────── */
+.badge-queued {
+  display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px;
+  color: var(--amber); border: 1px solid #7a4010; background: var(--amber-bg);
+  margin-left: 6px; vertical-align: middle; white-space: nowrap;
+}
+.badge-backend {
+  display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 4px;
+  margin-left: 6px; vertical-align: middle; white-space: nowrap; font-weight: 600;
+}
+.badge-be-local { color: var(--green); border: 1px solid #1e4a26; background: var(--green-bg); }
+.badge-be-cloud { color: var(--accent); border: 1px solid var(--accent-dim); background: var(--accent-bg); }

@@ -20,25 +20,128 @@ from job_queue import (
     AGENTIC_HOME, STATES,
     queue_init, submit_job, find_job, read_jobs,
     cancel_job, accept_job, accept_chain, abandon_job,
-    set_chain, set_job_status, reject_job, delete_job, review_job, submit_review_job,
+    set_chain, set_backend, set_job_status, reject_job, delete_job, review_job, submit_review_job,
     get_diff, get_agent_activity, fetch_models, get_ollama_models,
     get_job_chain, get_job_detail, get_job_full, get_repos,
 )
 import settings as _settings
 import channels as _channels
 import planner as _planner
+from slots import POOL
 
-# ── Worker state (global, guarded by _worker_lock) ────────────────────────────
+# ── Per-job worker buffers (DICT-KEYED, shape-identical to the _ask_* pattern) ─
+# The old singleton _worker_* buffer assumed one worker at a time. With the
+# concurrency rework we run N workers (across the local + cloud pools), so every
+# buffer is now keyed by job_id, exactly like the proven planning-channel
+# _ask_* buffers below. Each job_id owns a log list, a done flag, a return code,
+# its own Condition, a meta dict (backend/proc/pid/name), and a GC timestamp.
+# Reconnecting SSE clients replay the buffer; closing the browser never stops
+# the worker (the dispatcher thread owns the subprocess lifetime).
+_w_lock = threading.Lock()
+_w_log:  dict[str, list[dict]] = {}   # job_id -> ordered event dicts (line/progress)
+_w_done: dict[str, bool] = {}         # job_id -> stream complete
+_w_rc:   dict[str, int | None] = {}   # job_id -> worker exit code
+_w_cond: dict[str, threading.Condition] = {}  # job_id -> waiter condition
+_w_meta: dict[str, dict] = {}         # job_id -> {backend, proc, pid, name, ...}
+_w_gc:   dict[str, float] = {}        # job_id -> monotonic stamp when finished (for GC)
+_w_final: dict[str, "int | None"] = {}  # job_id -> terminal rc, SURVIVES buffer GC (bounded)
 
-_worker_lock    = threading.Lock()
-_worker_running = False
-_worker_proc: "subprocess.Popen[str] | None" = None
 
-# Line buffer + condition so reconnecting SSE clients can catch up.
-# Primary stream appends here; waiters wake on _worker_cond.notify_all().
-_worker_log: list[str] = []
-_worker_rc:  int | None = None
-_worker_cond = threading.Condition(_worker_lock)
+def _w_buf(job_id: str) -> threading.Condition:
+    """Get (creating if needed) the per-job condition guarding its buffer.
+    Mirrors _ask_buf — first touch lazily allocates every parallel slot for the
+    job_id so _w_emit/_w_finish/tailers all share one Condition."""
+    with _w_lock:
+        cond = _w_cond.get(job_id)
+        if cond is None:
+            cond = threading.Condition()
+            _w_cond[job_id] = cond
+            _w_log.setdefault(job_id, [])
+            _w_done.setdefault(job_id, False)
+            _w_rc.setdefault(job_id, None)
+            _w_meta.setdefault(job_id, {})
+        return cond
+
+
+def _w_emit(job_id: str, ev: dict) -> None:
+    """Append one event to a job's buffer and wake all SSE tailers (mirrors
+    _ask_emit)."""
+    cond = _w_buf(job_id)
+    with cond:
+        _w_log[job_id].append(ev)
+        cond.notify_all()
+
+
+def _w_finish(job_id: str, rc: int | None) -> None:
+    """Mark a job's worker stream complete, record its return code, stamp it for
+    GC, and wake tailers a final time (mirrors _ask_finish)."""
+    cond = _w_buf(job_id)
+    with cond:
+        _w_rc[job_id]   = rc
+        _w_done[job_id] = True
+        _w_gc[job_id]   = time.monotonic()
+        cond.notify_all()
+
+
+# ── Dispatcher state (slot-driven, both backends) ──────────────────────────────
+# The dispatcher fills free slots from the queue for each backend. _disp_lock
+# guards all of (_drain, _pending_n, _active) AND the claim+spawn serialization;
+# it is NEVER held while a Condition wait happens and is NEVER nested under the
+# POOL lock or a _w_cond. _disp_cond/_disp_seq/_disp_log are the reconnect INDEX
+# for /api/dispatch-stream — a ring of dispatch-level events (start/end/drained/
+# truncated) that the frontend uses to discover which per-job streams exist.
+_DISP_RING_CAP = 2000
+_disp_lock = threading.Lock()
+_disp_cond = threading.Condition()         # standalone — notified on dispatch events only
+_disp_seq  = 0                             # monotonic event sequence (next id to assign)
+_disp_base = 0                             # seq of the oldest event still in the ring
+_disp_log: list[dict] = []                 # ring of {seq, ...event} dicts, cap _DISP_RING_CAP
+
+_BACKENDS = ("local", "cloud")
+_drain:     dict[str, bool] = {"local": False, "cloud": False}   # Run-All latch per backend
+_pending_n: dict[str, int]  = {"local": 0, "cloud": 0}           # one-shot Run-Worker requests
+_active:    dict[str, dict] = {}            # job_id -> {backend, proc, started} for live workers
+_leak_seen: dict[str, int]  = {"local": 0, "cloud": 0}  # watchdog: persistent slot-leak tracking
+# Planning agents (chat + derive) also consume POOL slots but are NOT in _active
+# (they're not worker subprocesses). Track how many planning slots are held per
+# backend so the slot-leak reaper compares POOL.used against workers+planning,
+# not workers alone — otherwise it wrongly reclaims a live planning slot.
+_plan_held_lock = threading.Lock()
+_plan_held: dict[str, int] = {"local": 0, "cloud": 0}
+
+
+def _plan_acquire(backend: str) -> bool:
+    """Take a POOL slot for a planning agent and record it as planning-held."""
+    got = POOL.try_acquire(backend)
+    if got:
+        with _plan_held_lock:
+            _plan_held[backend] = _plan_held.get(backend, 0) + 1
+    return got
+
+
+def _plan_release(backend: str) -> None:
+    """Release a planning-held POOL slot (mirrors _plan_acquire)."""
+    with _plan_held_lock:
+        if _plan_held.get(backend, 0) > 0:
+            _plan_held[backend] -= 1
+    POOL.release(backend)
+
+
+def _emit_disp(ev: dict) -> None:
+    """Append a dispatch-level event to the reconnect ring and wake dispatch-stream
+    tailers. Assigns a monotonic seq, caps the ring at _DISP_RING_CAP (advancing
+    _disp_base so reconnecting clients can detect truncation). Notifies ONLY here
+    — never per worker log line — so dispatch-stream stays a thin index."""
+    global _disp_seq, _disp_base
+    with _disp_cond:
+        ev = {**ev, "seq": _disp_seq}
+        _disp_seq += 1
+        _disp_log.append(ev)
+        if len(_disp_log) > _DISP_RING_CAP:
+            drop = len(_disp_log) - _DISP_RING_CAP
+            del _disp_log[:drop]
+            _disp_base += drop
+        _disp_cond.notify_all()
 
 # ── Planning-channel SSE state (DICT-KEYED, per-thread) ────────────────────────
 # Unlike the singleton worker buffer above, planning streams are keyed by thread
@@ -51,6 +154,40 @@ _ask_log: dict[str, list[dict]] = {}
 _ask_done: dict[str, bool] = {}
 _ask_cond: dict[str, threading.Condition] = {}
 _ask_running: dict[str, bool] = {}
+# Live planning subprocess per thread, so a running chat/derive can be cancelled.
+_ask_proc: "dict[str, subprocess.Popen]" = {}
+
+
+def _register_ask_proc(tid: str, proc: "subprocess.Popen") -> None:
+    with _ask_lock:
+        _ask_proc[tid] = proc
+
+
+def _cancel_ask_proc(tid: str) -> bool:
+    """Kill the in-flight planning subprocess for a thread (whole process group,
+    so the agent and any child stop). Returns True if something was killed."""
+    with _ask_lock:
+        proc = _ask_proc.get(tid)
+    if proc is None or proc.poll() is not None:
+        return False
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            return False
+    return True
+
+
+def _planning_backend(channel_dict: dict, thread_dict: dict) -> str:
+    """Resolve a planning thread's backend ('local'|'cloud') the same way
+    planner.ask does: thread.planning_mode → channel default → 'local'. Cloud
+    mode = cloud pool; anything else = local pool. Used so planning agents
+    (chat + derive) consume the SAME slot pool as worker jobs — a local chat
+    competes with a local worker for Ollama, so it must count against it."""
+    mode = thread_dict.get("planning_mode") or channel_dict.get("default_mode") or "local"
+    return "cloud" if mode == "cloud" else "local"
 
 
 def _ask_buf(tid: str) -> threading.Condition:
@@ -82,6 +219,312 @@ def _ask_finish(tid: str) -> None:
         _ask_running[tid] = False
         cond.notify_all()
 
+
+# ── Dispatcher (slot-driven worker fan-out) ────────────────────────────────────
+# The dispatcher replaces the old "one worker, recursion in the browser" model.
+# It fills free POOL slots for BOTH backends from the queue, serializing
+# acquire+claim+spawn under _disp_lock, and self-rearms: each worker's _run,
+# on finish, releases its slot OUTSIDE _disp_lock then calls _pump() to refill.
+#
+# Backend is DERIVED from the existing job field model_hint (no new field, no
+# migration): "local"->local pool, "remote"->cloud pool, "auto"->the server's
+# default mode (settings.json "mode"). Chain siblings never run concurrently:
+# _claim excludes any chain root already active or in running/.
+#
+# LOCK ORDER (strict, never violated):
+#   _disp_lock  is leaf-ish: taken alone for state; POOL.acquire/release and
+#               _w_*/_emit_disp Conditions are taken OUTSIDE it (acquire is done
+#               inside _pump before claim, but POOL has its own lock and is never
+#               nested under a _w_cond). A slot RELEASE always happens OUTSIDE
+#               _disp_lock. We never wait on a Condition while holding _disp_lock.
+
+_AGENTIC_BIN = Path(os.environ.get("AGENTIC_APP", str(AGENTIC_HOME))) / "bin" / "agentic"
+
+
+def _backend_of(job: dict) -> str:
+    """Resolve a job's execution backend from its model_hint. 'local'->local,
+    'remote'->cloud, 'auto'/anything-else->LOCAL. Returns 'local' or 'cloud'.
+    This is the ONLY place the model_hint->pool mapping lives. There is no global
+    'mode' anymore (backend is per-job): an unset/auto job defaults to local, and
+    queue.sh's _queue_job_backend MUST use the identical rule so the claim filter
+    and the dispatcher never disagree."""
+    hint = str(job.get("model_hint", "auto") or "auto").strip().lower()
+    if hint == "remote":
+        return "cloud"
+    return "local"   # 'local', 'auto', blank, or anything unexpected → local
+
+
+def _chain_root(job_id: str) -> str:
+    """Walk parent_request_id up to the first non-review job — the chain root,
+    matching job_queue._branch_job_id semantics. Used to serialize chain
+    siblings: two jobs sharing a root must never run at once."""
+    seen: set[str] = set()
+    current = job_id
+    while current and current not in seen:
+        seen.add(current)
+        try:
+            job, _ = find_job(current)
+        except Exception:
+            break
+        if job.get("job_type") != "review":
+            return current
+        parent = job.get("parent_request_id")
+        if not parent:
+            return current
+        current = parent
+    return job_id
+
+
+def _excluded_chain_roots() -> list[str]:
+    """Chain roots that must NOT be claimed right now: the root of every job in
+    _active, plus the root of every job currently in running/. Prevents two
+    siblings of one chain from running concurrently (correctness).
+
+    CALLED ONLY from _claim, which already holds _disp_lock — so we read _active
+    WITHOUT re-acquiring _disp_lock (it is non-reentrant; re-locking would
+    deadlock). The running/ scan needs no lock (filesystem snapshot)."""
+    roots: set[str] = set()
+    # Active (in-flight) workers — caller holds _disp_lock.
+    for jid in list(_active.keys()):
+        roots.add(_chain_root(jid))
+    # Anything already sitting in running/ (claimed by us or another process).
+    try:
+        running_dir = AGENTIC_HOME / "queue" / "running"
+        if running_dir.is_dir():
+            for f in running_dir.glob("*.json"):
+                try:
+                    data = json.loads(f.read_text())
+                except Exception:
+                    continue
+                jid = data.get("id")
+                if jid:
+                    roots.add(_chain_root(jid))
+    except Exception:
+        pass
+    return sorted(r for r in roots if r)
+
+
+def _claim(backend: str, excluded: "list[str] | None" = None) -> dict | None:
+    """Atomically claim one pending job for `backend` via queue.sh's queue_claim,
+    passing --backend and --exclude-chain-roots so the shell skips non-matching
+    backends and chain siblings. Returns the claimed Job dict (now in running/),
+    or None when nothing is claimable. Never raises into the dispatcher.
+
+    `excluded` is the in-flight chain-root set, snapshotted by the caller UNDER
+    _disp_lock and passed in — this function runs the claim subprocess and must
+    NOT itself touch _active (it is called OUTSIDE _disp_lock to avoid blocking
+    the whole dispatcher on a multi-second shell claim)."""
+    if excluded is None:
+        excluded = _excluded_chain_roots()
+    # Phase 0 exposes queue.sh's queue_claim as `agentic claim`, which prints the
+    # claimed job id (now moved to running/) on success and nothing on an empty
+    # claim. --backend filters by model_hint→pool; --exclude-chain-roots skips
+    # chain siblings already running.
+    cmd = [str(_AGENTIC_BIN), "claim", "--backend", backend]
+    if excluded:
+        cmd += ["--exclude-chain-roots", ",".join(excluded)]
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30,
+            env={**os.environ,
+                 "AGENTIC_MODE": _settings.load().get("mode", "local")},
+        )
+    except Exception:
+        return None
+    claimed_id = (out.stdout or "").strip().splitlines()
+    claimed_id = claimed_id[-1].strip() if claimed_id else ""
+    if not claimed_id or out.returncode != 0:
+        return None
+    # queue_claim prints the claimed job id; load it from running/.
+    try:
+        job, _ = find_job(claimed_id, states=["running"])
+        return dict(job)
+    except Exception:
+        return None
+
+
+def _spawn(job: dict, backend: str) -> "subprocess.Popen[str] | None":
+    """Launch `agentic worker-once --id <job_id> --backend <backend>` as a
+    detached process group, mirroring the per-spawn env that the old _run_worker
+    built. The dispatcher already claimed the job, so worker-once SKIPS its own
+    claim and reads running/<id>. --backend sets AGENTIC_LOCAL per-process."""
+    job_id = job["id"]
+    _cfg = _settings.load()
+    _env = {
+        **os.environ,
+        # worker-once --backend will also set AGENTIC_LOCAL; we set it here too so
+        # any early code in bin/agentic sees a consistent value per spawn.
+        "AGENTIC_LOCAL":       "1" if backend == "local" else "",
+        "AGENTIC_LOCAL_MODEL": _cfg.get("local_model", "qwen-coder:latest"),
+        "AGENTIC_CHAIN_GATE":  "1" if _cfg.get("pause_chain_for_review") else "",
+    }
+    if backend == "cloud":
+        _key = _settings.get_secret("ANTHROPIC_API_KEY")
+        if _key:
+            _env["ANTHROPIC_API_KEY"] = _key
+        _env["AGENTIC_MODEL"] = _cfg.get("cloud_model", "auto")
+    else:
+        # Ensure no stale cloud model leaks into a local spawn.
+        _env.pop("AGENTIC_MODEL", None)
+    try:
+        return subprocess.Popen(
+            [str(_AGENTIC_BIN), "worker-once", "--id", job_id, "--backend", backend],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+            env=_env,
+        )
+    except Exception:
+        return None
+
+
+def _ingest_line(job_id: str, line: str) -> None:
+    """Route one raw worker stdout line into the job's buffer. A PROGRESS
+    sentinel (from stream_parser) becomes a {progress} event for the header
+    counter; everything else is a {line} event."""
+    if line.startswith("\x01PROGRESS "):
+        try:
+            prog = json.loads(line[len("\x01PROGRESS "):])
+        except Exception:
+            prog = None
+        if prog is not None:
+            _w_emit(job_id, {"progress": prog})
+            return
+    _w_emit(job_id, {"line": line})
+
+
+def _run(job_id: str, backend: str, proc: "subprocess.Popen[str]") -> None:
+    """Worker lifetime thread: stream the subprocess's stdout into the per-job
+    buffer, then on finish: pop _active, RELEASE the slot OUTSIDE _disp_lock,
+    finalize the buffer, emit the dispatch-level `end` event, and re-arm the
+    pump to fill the freed slot. The process outlives any SSE connection."""
+    rc: int | None = 1
+    try:
+        if proc.stdout is not None:
+            for raw in iter(proc.stdout.readline, ""):
+                _ingest_line(job_id, raw.rstrip("\n"))
+        proc.wait()
+        rc = proc.returncode
+    except Exception:
+        rc = proc.returncode if proc.returncode is not None else 1
+    finally:
+        # Single-owner teardown: popping _active[job_id] is the ownership token.
+        # Whoever pops it (this thread OR the watchdog's dead-proc reaper, never
+        # both) is the sole party that releases the slot, finalizes the buffer,
+        # and emits `end`. This closes the TOCTOU where the reaper could reap a
+        # job in the stdout-EOF window and double-release / double-emit.
+        _finalize_worker(job_id, backend, rc)
+
+
+def _finalize_worker(job_id: str, backend: str, rc: "int | None") -> None:
+    """Idempotent, exactly-once teardown for one worker. Returns immediately if
+    another party already owned (popped) this job. The pop under _disp_lock is
+    the atomic claim of ownership."""
+    with _disp_lock:
+        owned = _active.pop(job_id, None) is not None
+    if not owned:
+        return  # someone else (reaper or a prior call) already finalized this job
+    POOL.release(backend)                 # release OUTSIDE _disp_lock (POOL self-locks)
+    _w_finish(job_id, rc if rc is not None else 1)
+    _emit_disp({"type": "end", "job_id": job_id, "backend": backend, "rc": rc})
+    _pump()                               # a freed slot may admit a queued job
+
+
+def _pump() -> None:
+    """Idempotent dispatch step: for each backend, while there is a free slot AND
+    either a Run-All drain is latched or a one-shot Run-Worker request is pending,
+    try to acquire a slot, claim a matching job, and spawn it. Serializes
+    acquire+claim+spawn under _disp_lock. Safe to call from anywhere (control
+    endpoints, submit-while-draining, a worker finishing) — it just fills what it
+    can and returns.
+
+    Drain latch handling (lost-wakeup guard): on an EMPTY claim we only clear the
+    one-shot pending counter, never the _drain latch while a worker for this
+    backend is still active — a chain child can become eligible the moment a
+    parent finishes, and clearing drain here would strand it. We emit {drained}
+    only when nothing is claimable for a backend AND no worker for that backend
+    is still active."""
+    for backend in _BACKENDS:
+        while True:
+            # Phase A1 — under _disp_lock: gate on demand, take a slot, and
+            # snapshot the in-flight chain roots. We hold the lock only for these
+            # fast in-memory ops, NOT across the claim subprocess.
+            with _disp_lock:
+                if not (_drain[backend] or _pending_n[backend] > 0):
+                    break  # no demand for this backend
+                if not POOL.try_acquire(backend):
+                    break  # pool full — a future release() re-pumps us
+                excluded = _excluded_chain_roots()  # reads _active under the lock
+
+            # Phase A2 — OUTSIDE the lock: the claim shells out to queue.sh and can
+            # take a while; holding _disp_lock across it would freeze status/stop/
+            # other pumps. The atomic `mv` inside queue_claim still guarantees no
+            # double-claim even with two pumps racing here.
+            job = _claim(backend, excluded)
+
+            # Phase A3 — back under _disp_lock: commit the result.
+            with _disp_lock:
+                if job is None:
+                    # Nothing claimable now: return the slot, consume one one-shot
+                    # request, and clear the drain latch ONLY if no worker for this
+                    # backend is still running (else a chain child may yet appear).
+                    POOL.release(backend)
+                    if _pending_n[backend] > 0:
+                        _pending_n[backend] -= 1
+                    if _drain[backend] and not any(
+                        m["backend"] == backend for m in _active.values()
+                    ):
+                        _drain[backend] = False
+                    break  # nothing more to do this round
+                proc = _spawn(job, backend)
+                job_id = job["id"]
+                if _pending_n[backend] > 0:
+                    _pending_n[backend] -= 1
+                if proc is None:
+                    POOL.release(backend)
+                    outcome = "failed"
+                else:
+                    _active[job_id] = {"backend": backend, "proc": proc,
+                                       "started": time.monotonic()}
+                    outcome = "spawned"
+            # ── outside _disp_lock ──
+            if outcome == "failed":
+                # Spawn failed: synthesize a finished stream so the UI never hangs.
+                _w_emit(job_id, {"line": "worker spawn failed"})
+                _w_finish(job_id, 1)
+                _emit_disp({"type": "end", "job_id": job_id,
+                            "backend": backend, "rc": 1})
+                continue  # try another job for this backend
+            # Spawn OK: seed meta, emit the dispatch start event, run the worker.
+            cond = _w_buf(job_id)
+            with cond:
+                _w_meta[job_id].update({"backend": backend, "proc": proc,
+                                        "pid": proc.pid,
+                                        "name": job.get("name", job_id)})
+            _emit_disp({"type": "start", "job_id": job_id, "backend": backend,
+                        "name": job.get("name", job_id),
+                        "request": job.get("request", "")})
+            t = threading.Thread(target=_run, args=(job_id, backend, proc),
+                                 daemon=True)
+            t.start()
+            # Loop again to try filling another free slot for this backend.
+        # After the while: announce drained when this backend is fully idle.
+        # Dedupe consecutive drained events for the same backend so repeated pumps
+        # (initial + each worker's refill pump) don't spam the index.
+        with _disp_lock:
+            idle = (not any(m["backend"] == backend for m in _active.values())
+                    and _pending_n[backend] == 0 and not _drain[backend])
+        if idle:
+            with _disp_cond:
+                last = next((e for e in reversed(_disp_log)
+                             if e.get("backend") == backend), None)
+                already = bool(last and last.get("type") == "drained")
+            if not already:
+                _emit_disp({"type": "drained", "backend": backend})
+
+
 # ── HTML template ──────────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -95,18 +538,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <body>
 
 <header>
-  <div class="dot pulse"></div>
-  <h1>agentic</h1>
-  __LOCAL_BADGE__
-  <div id="view-toggle">
-    <button id="vt-queue" class="vt-btn active" onclick="setView('queue')">Queue</button>
-    <button id="vt-channels" class="vt-btn" onclick="setView('channels')">Channels</button>
+  <!-- Row 1 — identity + status (no controls): title, model badges, pool counts, freshness -->
+  <div class="header-row header-info">
+    <div class="dot pulse"></div>
+    <h1>agentic</h1>
+    __LOCAL_BADGE__
+    <span id="pool-chip-slot"></span>
+    <span id="age">loading…</span>
   </div>
-  <button id="run-btn" onclick="runWorker(false)">▶ Run Worker</button>
-  <button id="run-all-btn" onclick="runWorker(true)" style="background:#1f4391;color:#88b4ff;padding:6px 14px;border-radius:6px;border:none;cursor:pointer;font-size:13px;font-weight:500;margin-left:4px;">▶▶ Run All</button>
-  <button id="stop-btn" onclick="stopWorker()" style="display:none;background:#6d2120;color:#f47067;padding:6px 14px;border-radius:6px;border:1px solid #6d2120;cursor:pointer;font-size:13px;font-weight:500;margin-left:4px;">■ Stop</button>
-  <button id="settings-btn" onclick="openSettings()" title="Settings" style="display:none;background:none;border:1px solid #21262d;color:#8b949e;padding:6px 10px;border-radius:6px;cursor:pointer;font-size:14px;margin-left:4px;">⚙</button>
-  <span id="age">loading…</span>
+  <!-- Row 2 — controls: view switch + worker buttons + settings -->
+  <div class="header-row header-controls">
+    <div id="view-toggle">
+      <button id="vt-queue" class="vt-btn active" onclick="setView('queue')">Queue</button>
+      <button id="vt-channels" class="vt-btn" onclick="setView('channels')">Channels</button>
+    </div>
+    <button id="run-btn" onclick="runWorker(false)">▶ Run Worker</button>
+    <button id="run-all-btn" onclick="runWorker(true)" style="background:#1f4391;color:#88b4ff;padding:6px 14px;border-radius:6px;border:none;cursor:pointer;font-size:13px;font-weight:500;margin-left:4px;">▶▶ Run All</button>
+    <button id="stop-btn" onclick="stopWorker()" style="display:none;background:#6d2120;color:#f47067;padding:6px 14px;border-radius:6px;border:1px solid #6d2120;cursor:pointer;font-size:13px;font-weight:500;margin-left:4px;">■ Stop</button>
+    <button id="settings-btn" onclick="openSettings()" title="Settings" style="display:none;background:none;border:1px solid #21262d;color:#8b949e;padding:6px 10px;border-radius:6px;cursor:pointer;font-size:14px;margin-left:auto;">⚙</button>
+  </div>
 </header>
 
 <div id="settings-overlay" onclick="if(event.target===this)closeSettings()" style="display:none;position:fixed;inset:0;background:rgba(1,4,9,.7);z-index:200;align-items:flex-start;justify-content:center;overflow-y:auto;padding:40px 16px">
@@ -162,6 +612,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     </select>
     <textarea id="req" placeholder="Describe the change you want…" rows="3"></textarea>
     <div class="form-row">
+      <label class="field"><span class="field-label">Backend</span>
+        <select id="backend" title="Which engine runs this job. Local = Ollama; Cloud = Claude. Set per job; you can change it later while the job is still pending.">
+          <option value="local">🏠 Local (Ollama)</option>
+          <option value="cloud">☁ Cloud (Claude)</option>
+        </select>
+      </label>
       <label class="field"><span class="field-label">Priority</span>
         <select id="priority">
           <option value="0">0 — normal</option>
@@ -178,8 +634,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         </select>
       </label>
     </div>
-    <div id="exec-mode-hint" style="font-size:11px;color:#6e7681;margin-top:6px"></div>
-    <div style="font-size:11px;color:#6e7681;margin-top:2px">Cmd+Enter / Ctrl+Enter to submit · the worker runs this job using the <b>execution mode</b> set in ⚙ Settings</div>
+    <div style="font-size:11px;color:#6e7681;margin-top:6px">Cmd+Enter / Ctrl+Enter to submit · each job runs on its own <b>backend</b> (Local or Cloud) — change it on a pending job's card any time before it runs.</div>
   </div>
 
   <div class="filters">
@@ -229,7 +684,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div id="ch-input-row" style="display:none">
       <textarea id="ch-input" placeholder="Ask about this codebase…" rows="2" onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter')askQuestion()"></textarea>
       <label id="ch-dig" title="Force a full grounded read-agent answer (opens real files, cites code) instead of the cheap instant index lookup — even for a simple question. Costs more, but digs into the actual code. Use it when the quick answer felt thin."><input type="checkbox" id="ch-dig-cb"> Dig deeper</label>
-      <button class="btn btn-green" onclick="askQuestion()">Send</button>
+      <button id="ch-send-btn" class="btn btn-green" onclick="askQuestion()">Send</button>
+      <button id="ch-stop-btn" class="btn btn-amber" style="display:none" onclick="cancelPlanning()" title="Stop the running answer">■ Stop</button>
     </div>
   </div>
 </div>
@@ -246,6 +702,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div id="prop-body"></div>
   <div id="prop-foot">
     <span id="prop-status" style="font-size:12px;color:#8b949e"></span>
+    <button id="prop-stop-btn" class="btn btn-amber" style="display:none" onclick="cancelPlanning()" title="Stop the running derivation">■ Stop</button>
     <button class="btn btn-green" style="margin-left:auto" onclick="submitProposal()">Submit all as chain</button>
   </div>
 </div>
@@ -395,14 +852,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._api_browse()
         elif self.path.startswith("/api/peek?"):
             self._api_peek()
-        elif self.path == "/api/worker-stream":
-            self._api_worker_stream()
-        elif self.path == "/api/worker-status":
-            self._send_json({"running": _worker_running})
+        elif self.path == "/api/dispatch-stream" or self.path.startswith("/api/dispatch-stream?"):
+            self._api_dispatch_stream()
+        elif self.path.startswith("/api/worker-stream/"):
+            job_id = self.path.split("/api/worker-stream/", 1)[-1].split("?", 1)[0].strip("/")
+            self._api_worker_stream_job(job_id)
+        elif self.path == "/api/worker-status" or self.path.startswith("/api/worker-status?"):
+            self._api_worker_status()
         elif self.path == "/api/channels":
             self._api_channels_list()
         elif self.path == "/api/channels/models":
             self._api_channels_models()
+        elif self.path.startswith("/api/ask-reconnect"):
+            self._api_ask_reconnect()
         elif self.path.startswith("/api/ask-stream"):
             self._api_ask_stream()
         elif self.path.startswith("/api/channel/"):
@@ -435,6 +897,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._api_review()
         elif self.path == "/api/apply-to-tree":
             self._api_apply_to_tree()
+        elif self.path == "/api/run-worker":
+            self._api_run_worker()
+        elif self.path == "/api/run-all":
+            self._api_run_all()
+        elif self.path == "/api/pool":
+            self._api_pool()
         elif self.path == "/api/stop-worker":
             self._api_stop_worker()
         elif self.path == "/api/reject":
@@ -447,12 +915,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._api_set_status()
         elif self.path == "/api/set-chain":
             self._api_set_chain()
+        elif self.path == "/api/set-backend":
+            self._api_set_backend()
         elif self.path == "/api/settings":
             self._api_save_settings()
         elif self.path == "/api/secrets":
             self._api_save_secret()
         elif self.path == "/api/channel/create":
             self._api_channel_create()
+        elif self.path == "/api/ask-cancel":
+            self._api_ask_cancel()
         elif self.path.startswith("/api/channel/"):
             self._api_channel_post()
         else:
@@ -486,22 +958,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _serve_dashboard(self) -> None:
         _local = is_local()
         _repo  = default_repo()
-        # Active-model badge in the header — shows the model jobs CURRENTLY run on,
-        # per the execution mode + the matching Settings knob. Local = amber 🏠,
-        # cloud = blue ☁. (Mirrors so you always see what's running your jobs.)
-        if _local:
-            mode_badge = (
-                f'<span style="font-size:11px;background:#2a1f00;color:#d29922;'
-                f'border:1px solid #5a3e1b;border-radius:10px;padding:2px 8px;margin-left:4px">'
-                f'🏠 local · {local_model()}</span>'
-            )
-        else:
-            _cm = _settings.load().get("cloud_model", "auto")
-            mode_badge = (
-                f'<span style="font-size:11px;background:#0d2440;color:#58a6ff;'
-                f'border:1px solid #1f4391;border-radius:10px;padding:2px 8px;margin-left:4px">'
-                f'☁ cloud · {_cm}</span>'
-            )
+        # Backend is per-job now, so the header shows BOTH pools' models — a job
+        # can run on either. Local = amber 🏠, cloud = blue ☁; each shows the
+        # model that backend resolves to from Settings.
+        _cm = _settings.load().get("cloud_model", "auto")
+        mode_badge = (
+            f'<span style="font-size:11px;background:#2a1f00;color:#d29922;'
+            f'border:1px solid #5a3e1b;border-radius:10px;padding:2px 8px;margin-left:4px" '
+            f'title="Model local jobs run on (Settings → Local model)">'
+            f'🏠 {local_model()}</span>'
+            f'<span style="font-size:11px;background:#0d2440;color:#58a6ff;'
+            f'border:1px solid #1f4391;border-radius:10px;padding:2px 8px;margin-left:4px" '
+            f'title="Model cloud jobs run on (Settings → Cloud model)">'
+            f'☁ {_cm}</span>'
+        )
         html = (HTML_TEMPLATE
                 .replace("__DEFAULT_REPO_HTML__", _repo)
                 .replace("__DEFAULT_REPO_JS__",   json.dumps(_repo))
@@ -521,150 +991,268 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json({"error": str(exc)}, 500)
 
-    def _api_worker_stream(self) -> None:
-        global _worker_running, _worker_proc, _worker_log, _worker_rc
+    # ── Dispatch + per-job streaming (T6) ──
 
-        with _worker_lock:
-            already_running = _worker_running
-            if not already_running:
-                _worker_running = True
-                _worker_log = []
-                _worker_rc  = None
+    def _api_dispatch_stream(self) -> None:
+        """GET /api/dispatch-stream?since=<seq> — the reconnect INDEX.
 
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Connection", "keep-alive")
-        self.end_headers()
+        Streams only dispatch-level events (start/end/drained/truncated) from the
+        _disp_log ring, so the frontend can discover which per-job worker streams
+        exist (and open one each). It carries NO worker log lines — those flow on
+        /api/worker-stream/<job_id>. On reconnect, `since` replays everything with
+        seq >= since; if `since` predates the ring (events were dropped), we send
+        one {type:"truncated", base_seq} so the client knows to resync, then
+        replay from the ring base. Tails on _disp_cond, which is notified ONLY by
+        _emit_disp — never per log line — so this stream is cheap."""
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        try:
+            since = int((qs.get("since") or ["0"])[0])
+        except ValueError:
+            since = 0
 
-        def _send(obj: dict) -> bool:
-            try:
-                self.wfile.write(f"data: {json.dumps(obj)}\n\n".encode())
-                self.wfile.flush()
-                return True
-            except (BrokenPipeError, ConnectionResetError):
-                return False
-
-        if already_running:
-            # Reconnect: replay buffered lines then tail until worker finishes.
-            cursor = 0
-            while True:
-                with _worker_cond:
-                    # Drain any new lines since last check
-                    snapshot = _worker_log[cursor:]
-                    done_rc  = _worker_rc
-                for line in snapshot:
-                    if not _send({"line": line, "replayed": cursor == 0}):
-                        return
-                cursor += len(snapshot)
-                if done_rc is not None:
-                    _send({"done": True, "rc": done_rc})
+        send = self._sse_open()
+        cursor = since
+        while True:
+            with _disp_cond:
+                base = _disp_base
+                # Snapshot events with seq >= cursor from the ring.
+                if cursor < base:
+                    truncated_to = base
+                    pending = list(_disp_log)
+                else:
+                    truncated_to = None
+                    pending = [e for e in _disp_log if e["seq"] >= cursor]
+            if truncated_to is not None:
+                if not send({"type": "truncated", "base_seq": truncated_to}):
                     return
-                if not snapshot:
-                    # Wait for the primary thread to append more lines
-                    with _worker_cond:
-                        _worker_cond.wait(timeout=2.0)
+                cursor = truncated_to
+                continue
+            for ev in pending:
+                if not send(ev):
+                    return
+                cursor = ev["seq"] + 1
+            if not pending:
+                with _disp_cond:
+                    _disp_cond.wait(timeout=15.0)
+
+    def _api_worker_stream_job(self, job_id: str) -> None:
+        """GET /api/worker-stream/<job_id>?cursor=<n> — per-job tail.
+
+        Replays the job's buffered events (line/progress) from `cursor`, then
+        tails until the worker finishes (then emits done{rc[,gc]}). The client is
+        always an EventSource, so EVERY response — including the terminal/GC-d
+        case — must be an SSE frame, never JSON (a JSON body fires the browser's
+        onerror, not onmessage, and the carefully-returned state is never read)."""
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        try:
+            cursor = int((qs.get("cursor") or ["0"])[0])
+        except ValueError:
+            cursor = 0
+
+        # Buffer already GC-d, or a job we never buffered: there is nothing to
+        # tail, but the job DID finish. Emit the recorded terminal rc (preserved
+        # in _w_final across GC) as a single SSE `done` frame so the UI renders
+        # the correct ✓/✗ instead of hanging or showing a false failure.
+        with _w_lock:
+            known = job_id in _w_cond
+            final_rc = _w_final.get(job_id, None)
+            had_final = job_id in _w_final
+        if not known:
+            send = self._sse_open()
+            send({"done": True, "rc": final_rc, "gc": had_final})
             return
 
-        # Primary connection: spin up the worker in a daemon thread so it
-        # outlives this SSE connection. The thread owns the process lifetime;
-        # this handler just tails the shared buffer like any other reconnect.
-        def _run_worker():
-            global _worker_running, _worker_proc, _worker_rc
-            # bin/agentic is APP SOURCE — resolve via AGENTIC_APP (defaults to
-            # AGENTIC_HOME for native; Docker sets it to the baked /opt/agentic).
-            agentic_bin = Path(os.environ.get("AGENTIC_APP", str(AGENTIC_HOME))) / "bin" / "agentic"
-            # Re-resolve mode/model from settings.json AT SPAWN TIME (not server
-            # start) so flipping mode in the UI takes effect on the very next job
-            # with no restart. worker.sh reads AGENTIC_LOCAL to choose ollama vs
-            # the claude CLI; AGENTIC_LOCAL_MODEL selects the local model.
-            _cfg = _settings.load()
-            _env = {
-                **os.environ,
-                "AGENTIC_LOCAL":       "1" if _cfg.get("mode") == "local" else "",
-                "AGENTIC_LOCAL_MODEL": _cfg.get("local_model", "qwen-coder:latest"),
-            }
-            # CLOUD execution: the claude CLI authenticates via ANTHROPIC_API_KEY
-            # (in secrets.json, not the env) — inject it. The cloud MODEL is now a
-            # global Settings knob (cloud_model), resolved at RUN time → passed as
-            # AGENTIC_MODEL so worker.sh's --model flag uses it.
-            if _cfg.get("mode") != "local":
-                _key = _settings.get_secret("ANTHROPIC_API_KEY")
-                if _key:
-                    _env["ANTHROPIC_API_KEY"] = _key
-                _env["AGENTIC_MODEL"] = _cfg.get("cloud_model", "auto")
-            proc = None
-            try:
-                proc = subprocess.Popen(
-                    [str(agentic_bin), "worker-once"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    start_new_session=True,
-                    env=_env,
-                )
-                with _worker_cond:
-                    _worker_proc = proc
-                for line in iter(proc.stdout.readline, "") if proc.stdout else []:
-                    with _worker_cond:
-                        _worker_log.append(line.rstrip("\n"))
-                        _worker_cond.notify_all()
-                proc.wait()
-            except Exception:
-                pass
-            finally:
-                rc = proc.returncode if proc else 1
-                with _worker_cond:
-                    _worker_rc      = rc
-                    _worker_running = False
-                    _worker_proc    = None
-                    _worker_cond.notify_all()
-
-        t = threading.Thread(target=_run_worker, daemon=True)
-        t.start()
-
-        # Now tail the buffer exactly like a reconnecting client.
-        cursor = 0
+        cond = _w_buf(job_id)
+        send = self._sse_open()
         while True:
-            with _worker_cond:
-                snapshot = _worker_log[cursor:]
-                done_rc  = _worker_rc
-            for line in snapshot:
-                # Live progress sentinel (from stream_parser) → structured event
-                # for the header counter, NOT a log line.
-                if line.startswith("\x01PROGRESS "):
-                    try:
-                        prog = json.loads(line[len("\x01PROGRESS "):])
-                    except Exception:
-                        prog = None
-                    if prog is not None and not _send({"progress": prog}):
-                        return
-                    continue
-                if not _send({"line": line}):
-                    return  # browser disconnected — worker keeps running
+            with cond:
+                snapshot = _w_log.get(job_id, [])[cursor:]
+                done = _w_done.get(job_id, False)
+                rc   = _w_rc.get(job_id)
+                gc   = job_id in _w_gc
+            for ev in snapshot:
+                if not send(ev):
+                    return  # browser gone — worker keeps running
             cursor += len(snapshot)
-            if done_rc is not None:
-                _send({"done": True, "rc": done_rc})
+            if done:
+                send({"done": True, "rc": rc, "gc": gc})
                 return
             if not snapshot:
-                with _worker_cond:
-                    _worker_cond.wait(timeout=2.0)
+                with cond:
+                    cond.wait(timeout=2.0)
+
+    # ── Dispatch control + status (T7) ──
+
+    def _api_run_worker(self) -> None:
+        """POST /api/run-worker {backend?} — one-shot: run ONE more job. With an
+        explicit backend, targets that pool; WITHOUT one (the header Run button),
+        it kicks BOTH pools so the next claimable job of either backend runs.
+        Bumps the per-backend pending counter(s) and pumps."""
+        try:
+            body = self._read_body()
+            backends = self._resolve_backends(body.get("backend"))
+            with _disp_lock:
+                for b in backends:
+                    _pending_n[b] += 1
+            _pump()
+            self._send_json({"ok": True, "backends": backends})
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    def _api_run_all(self) -> None:
+        """POST /api/run-all {backend?} — latch the drain so the dispatcher keeps
+        claiming+running matching jobs until the queue is empty. With an explicit
+        backend, drains that pool; WITHOUT one (the header Run All button), drains
+        BOTH — "run everything" regardless of each job's backend."""
+        try:
+            body = self._read_body()
+            backends = self._resolve_backends(body.get("backend"))
+            with _disp_lock:
+                for b in backends:
+                    _drain[b] = True
+            _pump()
+            self._send_json({"ok": True, "backends": backends})
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    def _resolve_backends(self, raw: Any) -> list:
+        """An explicit 'local'/'cloud' → just that pool; anything else (absent/
+        auto/blank) → BOTH pools. With per-job backends there is no single global
+        mode, so an unspecified Run/Run-All means 'run whatever's queued'."""
+        b = str(raw or "").strip().lower()
+        if b in ("local", "cloud"):
+            return [b]
+        return list(_BACKENDS)
+
+    def _resolve_backend(self, raw: Any) -> str:
+        """Normalize a request 'backend' field to 'local'|'cloud'; absent/auto →
+        the server's current execution mode."""
+        b = str(raw or "").strip().lower()
+        if b in ("local", "cloud"):
+            return b
+        return "local" if _settings.load().get("mode", "local") == "local" else "cloud"
 
     def _api_stop_worker(self) -> None:
-        global _worker_running, _worker_proc
-        with _worker_lock:
-            if not _worker_running or _worker_proc is None:
-                self._send_json({"ok": False, "error": "No worker running"})
+        """POST /api/stop-worker {job_id} | {all:true} — SIGTERM a worker's whole
+        process group (targeted by job_id, or every active worker for {all}).
+        For {all}, also clear both drain latches and pending counters so the
+        dispatcher stops re-spawning. The dying procs' _run finalizers clean up
+        slots and buffers."""
+        try:
+            body = self._read_body()
+            stop_all = bool(body.get("all"))
+            job_id   = str(body.get("job_id", "")).strip()
+            if stop_all:
+                with _disp_lock:
+                    for b in _BACKENDS:
+                        _drain[b] = False
+                        _pending_n[b] = 0
+                    targets = [(jid, m.get("proc")) for jid, m in _active.items()]
+                killed = 0
+                for jid, proc in targets:
+                    if self._killpg(proc):
+                        killed += 1
+                self._send_json({"ok": True, "stopped": killed})
                 return
-            proc = _worker_proc
+            if not job_id:
+                self._send_json({"ok": False, "error": "job_id or all required"}, 400)
+                return
+            with _disp_lock:
+                meta = _active.get(job_id)
+                proc = meta.get("proc") if meta else None
+            if proc is None:
+                self._send_json({"ok": False, "error": "no active worker for that job"}, 404)
+                return
+            self._killpg(proc)
+            self._send_json({"ok": True})
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    @staticmethod
+    def _killpg(proc: "subprocess.Popen[str] | None") -> bool:
+        """SIGTERM a worker's process group; True if a signal was delivered (or it
+        was already gone). Its _run finalizer releases the slot + buffer."""
+        if proc is None:
+            return False
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            self._send_json({"ok": True})
+            return True
         except ProcessLookupError:
-            self._send_json({"ok": True})   # already dead
+            return True  # already dead — its finalizer will reap
+        except Exception:
+            return False
+
+    def _api_worker_status(self) -> None:
+        """GET /api/worker-status — rich dispatcher snapshot for the header chips:
+        per-backend pool usage (used/max), whether each backend is draining, how
+        many pending jobs map to each backend, and the live active worker list."""
+        try:
+            pools = POOL.snapshot()
+            with _disp_lock:
+                draining = dict(_drain)
+                pending_oneshot = dict(_pending_n)
+                active_ids = [(jid, m.get("backend"), m.get("started"))
+                              for jid, m in _active.items()]
+            # name lives in _w_meta (under _w_lock) so a reconnect rebuilds panes
+            # with the friendly adjective-noun label, not the raw job id.
+            with _w_lock:
+                active = [
+                    {"job_id": jid, "backend": b, "started": started,
+                     "name": _w_meta.get(jid, {}).get("name", jid)}
+                    for jid, b, started in active_ids
+                ]
+            # Count pending-queue jobs per backend by their derived backend.
+            pending_by_backend = {"local": 0, "cloud": 0}
+            try:
+                pending_dir = AGENTIC_HOME / "queue" / "pending"
+                if pending_dir.is_dir():
+                    for f in pending_dir.glob("*.json"):
+                        try:
+                            job = json.loads(f.read_text())
+                        except Exception:
+                            continue
+                        b = _backend_of(job)
+                        pending_by_backend[b] = pending_by_backend.get(b, 0) + 1
+            except Exception:
+                pass
+            self._send_json({
+                "ok": True,
+                "pools": pools,
+                "draining": draining,
+                "pending_oneshot": pending_oneshot,
+                "pending": pending_by_backend,
+                "active": active,
+                "running": bool(active),  # back-compat flag for old UI
+            })
         except Exception as exc:
-            self._send_json({"ok": False, "error": str(exc)})
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    def _api_pool(self) -> None:
+        """POST /api/pool {backend, max} — set a backend's max slots live (and
+        persist it to the matching Settings knob so it survives restart). Applies
+        immediately via POOL.configure, then pumps in case raising the cap freed
+        capacity."""
+        try:
+            body = self._read_body()
+            backend = self._resolve_backend(body.get("backend"))
+            new_max = int(body.get("max"))
+            if new_max < 1:
+                self._send_json({"ok": False, "error": "max must be >= 1"}, 400)
+                return
+            # Persist to the matching knob, then reconfigure POOL from settings so
+            # the other backend keeps its current cap.
+            key = "ollama_num_parallel" if backend == "local" else "cloud_max_workers"
+            cfg = _settings.save({key: new_max})
+            POOL.configure(int(cfg.get("ollama_num_parallel", 2)),
+                           int(cfg.get("cloud_max_workers", 4)))
+            _pump()
+            self._send_json({"ok": True, "pools": POOL.snapshot()})
+        except (TypeError, ValueError):
+            self._send_json({"ok": False, "error": "max must be an integer"}, 400)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
 
     def _api_activity(self) -> None:
         job_id = self.path.split("/api/activity/", 1)[-1].strip("/")
@@ -685,6 +1273,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _api_diff(self) -> None:
         job_id = self.path.split("/api/diff/", 1)[-1].strip("/")
         try:
+            # For a chained child this is the cumulative chain diff (base...HEAD)
+            # — parent foundation + this job's delta — so reviewing the tip
+            # reviews the whole chain, and any line is commentable.
             diff = get_diff(job_id)
             self._send_json({"ok": True, "diff": diff})
         except ValueError as exc:
@@ -737,6 +1328,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "repo path could not be determined"}, 400)
                 return
             job_id, job_name = submit_job(request, repo, priority, model_hint, after or None)
+            # If a Run-All drain is latched for any backend, a newly-submitted job
+            # should be picked up without waiting for the next pump trigger. Read
+            # _drain under _disp_lock to honor the "never touch dispatcher state
+            # outside the lock" invariant.
+            with _disp_lock:
+                drain_any = any(_drain.values())
+            if drain_any:
+                _pump()
             self._send_json({"ok": True, "id": job_id, "name": job_name})
         except ValueError as exc:
             self._send_json({"ok": False, "error": str(exc)}, 400)
@@ -941,6 +1540,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "settings must be an object"}, 400)
                 return
             resolved = _settings.save(updates)
+            # Apply the two concurrency knobs to the live pool so a Settings save
+            # changes capacity without a restart (then pump in case a cap rose).
+            try:
+                POOL.configure(int(resolved.get("ollama_num_parallel", 2)),
+                               int(resolved.get("cloud_max_workers", 4)))
+                _pump()
+            except Exception:
+                pass
             self._send_json({"ok": True, "settings": resolved})
         except Exception as exc:
             self._send_json({"ok": False, "error": str(exc)}, 500)
@@ -1078,6 +1685,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             set_chain(job_id, parent_id)
             self._send_json({"ok": True})
+        except ValueError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 400)
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
+    def _api_set_backend(self) -> None:
+        """POST /api/set-backend {id, backend:'local'|'cloud'} — switch a PENDING
+        job's execution backend (stored as model_hint). 400 if not pending."""
+        try:
+            body = self._read_body()
+            job_id  = str(body.get("id", "")).strip()
+            backend = str(body.get("backend", "")).strip()
+            if not job_id:
+                self._send_json({"ok": False, "error": "id required"}, 400)
+                return
+            set_backend(job_id, backend)
+            self._send_json({"ok": True, "backend": backend})
         except ValueError as exc:
             self._send_json({"ok": False, "error": str(exc)}, 400)
         except Exception as exc:
@@ -1282,6 +1906,45 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 with cond:
                     cond.wait(timeout=2.0)
 
+    def _api_ask_reconnect(self) -> None:
+        """GET /api/ask-reconnect?tid — re-attach to a planning run already in
+        flight for this thread (e.g. after the user navigated away and back).
+        Tails the per-thread buffer WITHOUT starting a new run or re-recording the
+        question. If no run is active, returns {ok, running:false} as JSON so the
+        client just renders the persisted transcript. The run itself lives in a
+        daemon thread and is unaffected by the browser disconnecting."""
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(self.path).query)
+        tid = (qs.get("tid") or [""])[0]
+        if not tid:
+            self._send_json({"ok": False, "error": "tid required"}, 400)
+            return
+        with _ask_lock:
+            running = _ask_running.get(tid, False)
+        if not running:
+            # Nothing in flight — the answer (if any) is already in the transcript.
+            self._send_json({"ok": True, "running": False})
+            return
+        send = self._sse_open()
+        self._stream_thread_buffer(tid, send)
+
+    def _api_ask_cancel(self) -> None:
+        """POST /api/ask-cancel {tid} — stop an in-flight planning run (chat or
+        derive) for a thread by killing its subprocess. The run's finally then
+        releases its slot and emits its error/finish to any tailing stream."""
+        try:
+            tid = str(self._read_body().get("tid", "")).strip()
+            if not tid:
+                self._send_json({"ok": False, "error": "tid required"}, 400)
+                return
+            killed = _cancel_ask_proc(tid)
+            # Nudge the stream to wrap up even if the kill was a no-op (already done).
+            if killed:
+                _ask_emit(tid, {"type": "error", "error": "stopped by user"})
+            self._send_json({"ok": True, "stopped": killed})
+        except Exception as exc:
+            self._send_json({"ok": False, "error": str(exc)}, 500)
+
     def _api_ask_stream(self) -> None:
         """GET /api/ask-stream?cid&tid&q&dig — SSE grounding flow.
         Index path returns instantly (zero turns); agent path spawns a read-only
@@ -1331,7 +1994,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
         thread_dict = dict(thread)
         thread_dict.setdefault("planning_max_turns", _settings.get("planning_max_turns"))
 
+        _ask_backend = _planning_backend(channel_dict, thread_dict)
+
         def _run():
+            # A planning agent consumes a slot in the SAME pool as worker jobs so
+            # the header chip and ceiling reflect ALL work on a backend (a local
+            # chat competes with a local worker for Ollama). try_acquire is
+            # non-blocking and advisory here — we always run the chat, but the
+            # acquire/release keeps the live count accurate.
+            _configure_pool_from_settings()
+            _got_slot = _plan_acquire(_ask_backend)
             try:
                 smap, _ = _planner.cached_symbol_map(cid, channel["repo"], channel.get("profile"))
             except Exception:
@@ -1341,6 +2013,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     channel_dict, thread_dict, q,
                     symbol_map=smap, dig_deeper=dig,
                     on_event=lambda ev: _ask_emit(tid, ev),
+                    on_start=lambda p: _register_ask_proc(tid, p),
                 )
                 _ask_emit(tid, {"type": "answer_final", **res})
                 # Persist the grounded turn + harvested citations.
@@ -1361,6 +2034,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as exc:
                 _ask_emit(tid, {"type": "error", "error": str(exc)})
             finally:
+                if _got_slot:
+                    _plan_release(_ask_backend)
+                with _ask_lock:
+                    _ask_proc.pop(tid, None)
                 _ask_finish(tid)
 
         threading.Thread(target=_run, daemon=True).start()
@@ -1395,12 +2072,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         thread_dict.setdefault("planning_max_turns", _settings.get("planning_max_turns"))
 
         send = self._sse_open()
+        _derive_backend = _planning_backend(channel_dict, thread_dict)
 
         def _run():
+            # Deriving runs a planning agent — count it against the same pool as
+            # worker jobs + chats so the header chip reflects it (the bug: derive
+            # never took a slot, so local stayed 0/2 while an agent was running).
+            _configure_pool_from_settings()
+            _got_slot = _plan_acquire(_derive_backend)
             try:
                 prop = _planner.derive(
                     channel_dict, thread_dict, transcript_text,
                     on_event=lambda ev: _ask_emit(tid, ev),
+                    on_start=lambda p: _register_ask_proc(tid, p),
                 )
                 jobs = prop.get("jobs", [])
                 created = _channels.proposal_create(
@@ -1432,6 +2116,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except Exception as exc:
                 _ask_emit(tid, {"type": "error", "error": str(exc)})
             finally:
+                if _got_slot:
+                    _plan_release(_derive_backend)
+                with _ask_lock:
+                    _ask_proc.pop(tid, None)
                 _ask_finish(tid)
 
         threading.Thread(target=_run, daemon=True).start()
@@ -1540,6 +2228,114 @@ def browse_root() -> str:
     except Exception:
         return str(Path.home())
 
+def _configure_pool_from_settings() -> None:
+    """Size both pools from the current Settings knobs (call at start + on save)."""
+    cfg = _settings.load()
+    try:
+        POOL.configure(int(cfg.get("ollama_num_parallel", 2)),
+                       int(cfg.get("cloud_max_workers", 4)))
+    except Exception:
+        pass
+
+
+def _watchdog_loop() -> None:
+    """ONE persistent daemon (10s tick) that keeps the dispatcher honest:
+
+      1) Slot-leak reaper — if POOL reports more used slots for a backend than we
+         have live worker procs in _active, a worker died without its _run
+         finalizer releasing (e.g. an unexpected kill). Release the difference and
+         re-pump so the freed capacity is used.
+      2) Dead-proc reaper — a proc in _active whose poll() is set but whose _run
+         never finished (finalizer crashed): synthesize the finish (drop from
+         _active, release its slot, _w_finish, emit end) so nothing hangs.
+      3) Buffer GC — drop per-job _w_* buffers 60s after their _w_gc stamp so a
+         long-lived server doesn't accumulate finished-job buffers forever."""
+    while True:
+        try:
+            time.sleep(10.0)
+        except Exception:
+            return
+        try:
+            now = time.monotonic()
+            # ── 2) Dead-proc reaper (do this first so leak counts are accurate). ──
+            # Identify procs whose OS process exited but whose _run never reached
+            # finalize (a stuck/crashed finalizer). Snapshot candidates under the
+            # lock, then hand each to _finalize_worker — the SAME single-owner
+            # path _run uses. _finalize_worker's atomic _active.pop is the
+            # ownership token, so if _run's finally races us, exactly one of us
+            # finalizes (no double-release, no duplicate `end`).
+            dead = []
+            with _disp_lock:
+                for jid, m in list(_active.items()):
+                    proc = m.get("proc")
+                    if proc is not None and proc.poll() is not None:
+                        dead.append((jid, m.get("backend", "local"),
+                                     proc.returncode))
+            for jid, backend, rc in dead:
+                _finalize_worker(jid, backend, rc if rc is not None else 1)
+
+            # ── 1) Slot-leak reaper (only for PERSISTENT leaks). ──
+            # A real leak (a thread died before releasing) persists; a transient
+            # used>live window — where _finalize_worker has popped _active but not
+            # yet called POOL.release — resolves in microseconds. Acting on the
+            # transient window would double-release. So we only reclaim a slot
+            # whose discrepancy persisted across TWO consecutive 10s ticks for the
+            # same backend (tracked in _leak_seen), which a teardown window never
+            # survives.
+            snap = POOL.snapshot()
+            with _disp_lock:
+                live = {b: 0 for b in _BACKENDS}
+                for m in _active.values():
+                    b = m.get("backend")
+                    if b in live:
+                        live[b] += 1
+            # Planning agents (chat/derive) hold slots too but aren't in _active.
+            # Count them as live so the reaper doesn't reclaim a slot a live
+            # planning agent is using (the bug: a derive's slot got "leaked" back
+            # to 0 mid-run after ~20s).
+            with _plan_held_lock:
+                for b in _BACKENDS:
+                    live[b] += _plan_held.get(b, 0)
+            leaked = False
+            for b in _BACKENDS:
+                used = int(snap.get(b, {}).get("used", 0))
+                diff = used - live.get(b, 0)
+                prev = _leak_seen.get(b, 0)
+                if diff > 0:
+                    # reclaim only the count that was ALSO over last tick
+                    reclaim = min(diff, prev)
+                    for _ in range(reclaim):
+                        POOL.release(b)
+                        leaked = True
+                    _leak_seen[b] = diff  # remember for next tick
+                else:
+                    _leak_seen[b] = 0
+            if leaked:
+                _pump()
+
+            # ── 3) Buffer GC (60s after finish). ──
+            # Drop the big per-job buffers but PRESERVE the terminal rc in
+            # _w_final so a late reconnect to a long-finished job still renders
+            # the correct ✓/✗ instead of an unknown (rc=None → false failure).
+            with _w_lock:
+                stale = [jid for jid, t in list(_w_gc.items()) if now - t > 60.0]
+                for jid in stale:
+                    _w_final[jid] = _w_rc.get(jid, 0)   # remember the outcome
+                    _w_log.pop(jid, None)
+                    _w_done.pop(jid, None)
+                    _w_rc.pop(jid, None)
+                    _w_cond.pop(jid, None)
+                    _w_meta.pop(jid, None)
+                    _w_gc.pop(jid, None)
+                # Bound _w_final so it can't grow forever (keep newest ~500).
+                if len(_w_final) > 500:
+                    for k in list(_w_final)[:len(_w_final) - 500]:
+                        _w_final.pop(k, None)
+        except Exception:
+            # The watchdog must never die — swallow and tick again.
+            pass
+
+
 class _Server(http.server.ThreadingHTTPServer):
     def handle_error(self, request: Any, client_address: Any) -> None:
         # Swallow disconnects — these are normal when browsers close SSE streams
@@ -1557,6 +2353,11 @@ if __name__ == "__main__":
     PID_FILE.write_text(f"{os.getpid()}:{port}")
     atexit.register(lambda: PID_FILE.unlink(missing_ok=True))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+
+    # Size the slot pools from Settings, then start the single watchdog daemon
+    # (slot-leak / dead-proc reaper + buffer GC). Both must be up before serving.
+    _configure_pool_from_settings()
+    threading.Thread(target=_watchdog_loop, daemon=True).start()
 
     # Bind localhost by default (bare-metal: don't expose on the network). The
     # container entrypoint sets AGENTIC_BIND=0.0.0.0 so the Docker port mapping

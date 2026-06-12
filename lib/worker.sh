@@ -6,7 +6,17 @@
 function run_worker_agent() {
   local request="$1"
   local log_file="${2:-}"   # optional path for JSONL stream
-  local model_hint="${3:-}" # optional per-job model override
+  local model_hint="${3:-}" # job's model_hint
+
+  # model_hint is now a BACKEND MARKER (local|remote|auto), NOT a model name —
+  # the dispatcher routes via AGENTIC_LOCAL and supplies the real model in
+  # AGENTIC_LOCAL_MODEL / AGENTIC_MODEL. Using "remote"/"local" as a --model
+  # name made the claude CLI 404 ("model 'remote' not found"). So treat those
+  # markers as "no override" and fall back to the env-resolved model. (A real
+  # model name in model_hint — a legacy/explicit override — is still honored.)
+  case "$model_hint" in
+    local|remote|auto|"") model_hint="" ;;
+  esac
 
   # ── Local mode: Ollama ──────────────────────────────────────────────────────
   if [[ "${AGENTIC_LOCAL:-}" == "1" ]]; then
