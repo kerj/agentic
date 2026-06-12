@@ -325,14 +325,12 @@ def _claim(backend: str, excluded: "list[str] | None" = None) -> dict | None:
         cmd += ["--exclude-chain-roots", ",".join(excluded)]
     try:
         out = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30,
-            env={**os.environ,
-                 "AGENTIC_MODE": _settings.load().get("mode", "local")},
+            cmd, capture_output=True, text=True, timeout=30, env=os.environ.copy(),
         )
     except Exception:
         return None
-    claimed_id = (out.stdout or "").strip().splitlines()
-    claimed_id = claimed_id[-1].strip() if claimed_id else ""
+    lines = (out.stdout or "").strip().splitlines()
+    claimed_id = lines[-1].strip() if lines else ""
     if not claimed_id or out.returncode != 0:
         return None
     # queue_claim prints the claimed job id; load it from running/.
@@ -1128,11 +1126,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _resolve_backend(self, raw: Any) -> str:
         """Normalize a request 'backend' field to 'local'|'cloud'; absent/auto →
-        the server's current execution mode."""
+        local (there is no global mode — backend is per-job)."""
         b = str(raw or "").strip().lower()
-        if b in ("local", "cloud"):
-            return b
-        return "local" if _settings.load().get("mode", "local") == "local" else "cloud"
+        return "cloud" if b == "cloud" else "local"
 
     def _api_stop_worker(self) -> None:
         """POST /api/stop-worker {job_id} | {all:true} — SIGTERM a worker's whole
@@ -1237,7 +1233,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             body = self._read_body()
             backend = self._resolve_backend(body.get("backend"))
-            new_max = int(body.get("max"))
+            try:
+                new_max = int(body.get("max"))
+            except (TypeError, ValueError):
+                self._send_json({"ok": False, "error": "max must be an integer"}, 400)
+                return
             if new_max < 1:
                 self._send_json({"ok": False, "error": "max must be >= 1"}, 400)
                 return
@@ -2201,15 +2201,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 PID_FILE       = AGENTIC_HOME / "serve.pid"
 
-# Run mode + target come from settings.json (the UI), not env vars — so you can
-# launch the server once and choose local/cloud and the project in the browser.
-# Resolved live each call so flipping mode in the panel takes effect without a
-# restart (the worker spawn re-resolves too — see _run_worker).
-def _mode() -> str:
-    return _settings.load().get("mode", "local")
-
+# Backend is per-job now (a job's model_hint → local/cloud pool); there is no
+# global "mode". is_local() is retained only for the few UI affordances that ask
+# "is local available?" — always true (local is always a usable backend), and the
+# header shows both pools' models regardless.
 def is_local() -> bool:
-    return _mode() == "local"
+    return True
 
 def local_model() -> str:
     return _settings.load().get("local_model", "qwen-coder:latest")
