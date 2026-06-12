@@ -15,8 +15,7 @@ While jobs run, your working tree is untouched — the agent works in a separate
 ## Setup (Docker — recommended)
 
 Docker is the supported way to run agentic. `docker compose up` and you land on
-the dashboard — no Python, Node, pyenv, or shell config to manage. (Native
-install is still available for contributors — see [Native install](#native-install-advanced).)
+the dashboard — no Python, Node, pyenv, or shell config to manage.
 
 ### Before you start — what a fresh machine needs
 
@@ -43,7 +42,7 @@ require.
   > Match it to the `Max local in parallel` value in the dashboard's Settings
   > (default 2) — that one only sizes agentic's own dispatch pool.
 - **A pulled model.** The default model name agentic expects is
-  `qwen-coder:latest`; either build it (see [Local model setup](#local-model-setup))
+  `qwen-coder:latest`; either build it (see [Local model setup](#local-model-setup-ollama))
   or `ollama pull <model>` and set that name in **Settings → Local model**.
 
 **For CLOUD jobs (Claude Code) — no host install:**
@@ -204,82 +203,60 @@ docker exec -it agentic bash                 # shell into the container
 
 ### Change the dashboard port
 
-Edit `HOST_PORT` in `docker/.env` (default `4080`; use `4081` to run alongside a
-native server on `4080`), then `./docker/down.sh && ./docker/up.sh -d`.
+Edit `HOST_PORT` in `docker/.env` (default `4080`), then
+`./docker/down.sh && ./docker/up.sh -d`.
 
-### Running the container and a native server at once
-
-You can, but **give them different ports AND different state dirs** — otherwise
-they fight over `:4080` and corrupt the same queue. `up.sh` refuses to start if
-its `HOST_PORT` is already taken (e.g. by a native `agentic serve`). To run both:
-
-- Native on `4080` with state `~/.agentic` (its default).
-- Container on `HOST_PORT=4081` with a separate `AGENTIC_STATE_DIR`
-  (e.g. `~/.agentic-data`, the wizard's default).
-
-They then have independent queues and dashboards. The simpler path is to run one
-at a time: `agentic serve stop` before `./docker/up.sh`, or `./docker/down.sh`
-before `agentic serve`.
-
-> Everything else — mode, model, context budget, default repo — is set in the
-> browser **Settings** panel, not on the command line.
-
----
-
-## Native install (advanced)
-
-For contributors or anyone who'd rather run on the host. Needs `jq`, `pyenv`
-(pins Python 3.11.9 for the venv), and — for cloud mode — the Claude Code CLI.
-
-```bash
-git clone <repo-url> ~/.agentic
-bash ~/.agentic/install.sh
-source ~/.zshrc
-```
-
-Then `cd your-project && agentic serve` (cloud) or `agentic serve --local`
-(Ollama). Native mode keeps app source and state together in `~/.agentic`; the
-Docker setup keeps them separate (source baked in the image, state in a mounted
-dir). All the dashboard/usage docs below apply to both.
+> Everything else — model, context budget, default repo, and your API key — is
+> set in the browser **Settings** panel, not on the command line. Each job's
+> **backend** (Local or Cloud) is chosen per job on the submit form.
 
 ---
 
 ## Usage
 
-Start the app (`./docker/up.sh` for Docker, or `agentic serve` / `agentic serve
---local` for a native install) and open
-[http://localhost:4080](http://localhost:4080). Everything below is the same in
-both — the dashboard, jobs, review, and merge workflow are identical.
+Start the app with `./docker/up.sh` and open
+[http://localhost:4080](http://localhost:4080).
 
-**Submit a job** — describe what you want and hit Submit (`Cmd+Enter`).
+**Submit a job** — describe what you want, pick its **Backend** (🏠 Local /
+☁ Cloud) and Priority, and hit Submit (`Cmd+Enter`). You can change a pending
+job's backend later from its card.
 
-**Run it** — **▶ Run Worker** for one job, **▶▶ Run All** for the queue.
+**Run it** — **▶ Run Worker** for one job, **▶▶ Run All** to drain the queue.
+Both pools run concurrently (local + cloud), capped by the slot settings; the
+header chip shows `local u/m · cloud u/m · queued`.
 
-**Review** — click a job to see what the agent did: files read, files modified, commands run, build result, GitHub-style split diff, chain position, phase summary, and estimated cost. Stats and diffs are preserved after you accept or reject the job.
+**Review** — click a job to see what the agent did: files read/modified, commands run, build result, GitHub-style split diff, chain position, phase summary, and estimated cost. Stats and diffs are preserved after you accept or reject the job.
 
-**Merge** — **Accept Chain** collects all chained jobs onto a staging branch (`agent-work/<date>`). You merge that branch into your own work when ready.
-
-```bash
-git merge agent-work/20260520-a1b2
-```
+**Merge** — **Accept** merges a job's branch into **your current branch** (the
+one you have checked out — no staging branch, no extra step). **Accept Chain**
+merges every job in a chain, in order, into the current branch. A merge conflict
+stops there for you to resolve in your IDE.
 
 ---
 
-## Cloud vs local
+## Backends (per job)
 
-| | Cloud | Local |
+Each job runs on the backend you pick when you submit it (changeable while it's
+pending). Both run from one server — no global mode switch.
+
+| | 🏠 Local | ☁ Cloud |
 |---|---|---|
-| Engine | Claude Code CLI | Ollama |
-| Quality | Higher | Good for scoped tasks |
-| Cost | Anthropic API credits | Free |
-| Speed | Fast | Moderate (first job loads model) |
-| Privacy | Code sent to Anthropic | Stays on your machine |
+| Engine | Ollama (on your host) | Claude Code (`claude` CLI, baked into the image) |
+| Quality | Good for scoped tasks | Higher |
+| Cost | Free | Anthropic API credits |
+| Speed | Moderate (first job loads model) | Fast |
+| Privacy | Stays on your machine | Code sent to Anthropic |
+| Needs | a pulled Ollama model | an `ANTHROPIC_API_KEY` in Settings |
 
-Both modes use the same queue, dashboard, worktrees, and review workflow.
+Concurrency per backend is capped in **Settings**: `Max local in parallel`
+(default 2 — match it to the host `ollama serve`'s `OLLAMA_NUM_PARALLEL`) and the
+cloud worker cap (default 4). Both pools run at the same time.
 
 ---
 
-## Local mode setup
+## Local model setup (Ollama)
+
+Needed only if you run **Local** jobs.
 
 ### 1. Install Ollama
 
@@ -315,29 +292,13 @@ EOF
 ollama create qwen-coder -f ~/Modelfile-coding
 ```
 
-### 4. Configure
+### 4. Set the model name in the dashboard
 
-Set your model in `~/.agentic/.agentic.conf`:
-
-```bash
-export AGENTIC_LOCAL_MODEL="qwen-coder"
-# AGENTIC_CONTEXT_BUDGET=24000   # default — raise if your model has a larger context window
-```
-
-### 5. Start
-
-Ollama and the agentic server are separate processes — both need to be running:
-
-```bash
-ollama serve &
-agentic serve --local
-```
-
-**Specify a model on the fly:**
-
-```bash
-agentic serve --local=qwen-coder
-```
+The container reaches your host Ollama over the network (started in
+[Before you start](#before-you-start--what-a-fresh-machine-needs)). In the
+dashboard's **Settings → Local model**, set the name you pulled or built (the
+default is `qwen-coder:latest`). That's it — submit a job with the **Local**
+backend.
 
 ---
 
@@ -353,32 +314,17 @@ Browse [ollama.com/library](https://ollama.com/library) — filter by **tools** 
 
 ---
 
-## Server commands (native install)
-
-For the native install. With Docker, use `./docker/up.sh` / `./docker/down.sh`
-(see [Command reference](#command-reference)).
-
-```bash
-agentic serve              # cloud, port 4080
-agentic serve --local      # local Ollama
-agentic serve 8080         # custom port
-agentic serve stop
-agentic serve status
-```
-
----
-
 ## Review workflow
 
 | Action | What it does |
 |---|---|
-| **Review in IDE** | Apply agent changes to your working tree (unstaged) — review in VS Code, edit in place, then commit or discard (`git checkout -- .`) |
-| **Accept** | Merge single job onto base branch |
-| **Accept Chain ↓** | Merge whole chain onto one staging branch |
+| **Review in IDE** | Apply agent changes to your working tree (unstaged) — review in VS Code, edit in place, then commit or discard (`git reset && git checkout -- .`). If the base moved and it conflicts, the button becomes **Resolve merge** and writes conflict markers to resolve. |
+| **Accept** | Merge the job's branch into your **current** branch (HEAD) |
+| **Accept Chain ↓** | Merge the whole chain, in order, into your **current** branch |
 | **Reject** | Delete branch and worktree |
-| **Abandon** | Move stuck running job to failed |
+| **Abandon** | Move a stuck running job to failed |
 
-After **Accept Chain**, you get `agent-work/<date>`. Merge it into your branch when satisfied.
+**Accept** and **Accept Chain** merge straight into the branch you have checked out — no staging branch, no extra `git merge` step. A conflict stops there for you to resolve in your IDE.
 
 ---
 
@@ -394,21 +340,24 @@ Run the full chain with **▶▶ Run All** — it executes pending jobs in depen
 
 ## Configuration
 
-`~/.agentic/.agentic.conf` (gitignored):
+Everything is set in the dashboard's **Settings** gear (persisted to
+`settings.json` in your state dir) — there are no config files to edit by hand.
+Key knobs:
 
-```bash
-# Local model
-export AGENTIC_LOCAL_MODEL="qwen-coder"
-# AGENTIC_CONTEXT_BUDGET=24000   # default — raise only if your model has a larger context window
+| Setting | What it does |
+|---|---|
+| **Local model** | the Ollama model local jobs run (default `qwen-coder:latest`) |
+| **Cloud model** | the Claude model cloud jobs run (`auto` lets the CLI pick) |
+| **Max local in parallel** | local worker pool size (default 2 — match the host `ollama serve`'s `OLLAMA_NUM_PARALLEL`) |
+| cloud worker cap | cloud worker pool size (default 4) |
+| **Default project** | repo new jobs target (Browse…, confined to the project dir) |
+| context budget / max turns / etc. | local-worker tuning, all with working defaults |
+| **Pause chains for review** | hold each chain link until you Accept its parent |
 
-# Ollama host (default: http://localhost:11434)
-export OLLAMA_HOST="http://localhost:11434"
-export OLLAMA_KEEP_ALIVE="30m"
-
-# Optional: only needed for `agentic plan` and `agentic doc-gen`
-export ANTHROPIC_API_KEY=""
-export AGENTIC_MODEL="claude-opus-4-8"
-```
+The **`ANTHROPIC_API_KEY`** (cloud) is set in the same panel and stored in
+`secrets.json` (0600) — never shown back to the browser, never committed, never
+baked into the image. Container/network settings (`OLLAMA_HOST`, port, project
+dir, `HOST_UID/GID`) live in `docker/.env`, written by the wizard.
 
 ---
 
@@ -488,7 +437,8 @@ The detail panel auto-refreshes every 5 seconds while a job is running. Stats, d
 └── serve.pid
 ```
 
-In your project: branches named `agentic/<job-id>`. Accept Chain creates `agent-work/<date>`.
+In your project: branches named `agentic/<job-id>` (one per job). Accept and
+Accept Chain merge these into your current branch; Reject deletes them.
 
 ---
 
@@ -523,6 +473,11 @@ agentic doc       # open in $EDITOR
 
 ## Other commands
 
+The dashboard covers the normal flow; these CLI commands are for scripting or
+advanced use. In Docker, run them inside the container
+(`docker compose -f docker/docker-compose.yml exec agentic agentic <cmd>`).
+Accept/Reject are also buttons in the UI.
+
 ```bash
 agentic init          # initialize project
 agentic accept <id>   # merge a single job's branch
@@ -534,60 +489,29 @@ agentic plan          # create an agile plan
 
 ## First use walkthrough
 
-After running `install.sh` and sourcing your shell, do this once before running any jobs.
+Once `./docker/up.sh` is running and the dashboard is open:
 
-### 1. Configure
+### 1. Configure in Settings (the gear)
 
-Copy the example config and fill in what you need:
+- **Default project** — Browse… to the repo agents work on (confined to the
+  project dir you set in the wizard).
+- **Local model** and/or **Cloud model** — the model each backend runs.
+- **Cloud jobs:** paste your **`ANTHROPIC_API_KEY`** (stored in `secrets.json`,
+  0600; never leaves the box).
 
-```bash
-cp ~/.agentic/.agentic.conf.example ~/.agentic/.agentic.conf
-```
+### 2. Add a CLAUDE.md to your project (recommended)
 
-Open it and edit:
+The agent reads `CLAUDE.md` at the project root before doing anything. Without it
+it guesses at conventions; with it the output is significantly better. Write one
+by hand, or have a job generate one ("Write a CLAUDE.md documenting this
+project's stack, conventions, and test setup"). Review and commit it so every
+run picks it up.
 
-```bash
-# Cloud mode — needed for agentic plan, doc-gen, and cloud worker
-export ANTHROPIC_API_KEY="sk-ant-..."
+### 3. Run your first job
 
-# Local mode — set the model you pulled with ollama pull
-# export AGENTIC_LOCAL_MODEL="qwen-coder"
-```
-
-Everything else in the file has working defaults. `AGENTIC_CONTEXT_BUDGET` only matters in local mode.
-
-### 2. Go to your project
-
-All jobs run against a specific repo. Navigate there before starting the server — the dashboard picks up `$PWD` as the default repo for new jobs.
-
-```bash
-cd ~/your-project
-```
-
-### 3. Generate a CLAUDE.md
-
-The agent reads `CLAUDE.md` at the project root before doing anything. Without it the agent guesses at conventions; with it the output is significantly better.
-
-```bash
-agentic doc-gen
-```
-
-This calls the Anthropic API to analyze your project and write a `CLAUDE.md`. Review it before running jobs — correct anything wrong about your stack, naming conventions, or test setup. Commit it to the repo so every agent run picks it up.
-
-If you don't have an `ANTHROPIC_API_KEY` yet, skip this step and create a minimal `CLAUDE.md` by hand:
-
-```bash
-agentic doc   # opens $EDITOR with an empty or existing CLAUDE.md
-```
-
-### 4. Start the server and run your first job
-
-```bash
-agentic serve          # cloud (Claude Code)
-agentic serve --local  # local (Ollama)
-```
-
-Open [http://localhost:4080](http://localhost:4080), type a request, and click **▶ Run Worker**.
+Type a request, pick its **Backend** (🏠 Local / ☁ Cloud) and Priority, Submit,
+then **▶ Run Worker**. Click the job to review the diff, and **Accept** to merge
+it into your current branch.
 
 ---
 
