@@ -776,6 +776,57 @@ def tool_read(file_path: str, offset: int = 0, limit: int = 0) -> str:
           f"to continue, or offset=<line> limit=<n> for a specific range]"
     )
 
+def _normalize_ws(s: str) -> str:
+    """Collapse all whitespace runs and strip ends — for whitespace-tolerant match."""
+    return re.sub(r"\s+", " ", s.strip())
+
+def _find_flexible_block(content_lines: list, old_lines: list):
+    """Find a UNIQUE contiguous run in content_lines whose whitespace-normalized
+    form equals old_lines' normalized form. Returns (start, end) half-open indices,
+    or None for zero or multiple matches. Leading/trailing blank lines in old_lines
+    are trimmed so newline-only differences don't block the match."""
+    norm_old = [_normalize_ws(l) for l in old_lines]
+    lead = 0
+    while lead < len(norm_old) and not norm_old[lead]:
+        lead += 1
+    trail = len(norm_old)
+    while trail > lead and not norm_old[trail - 1]:
+        trail -= 1
+    norm_old = norm_old[lead:trail]
+    if not norm_old:
+        return None
+    n = len(norm_old)
+    norm_content = [_normalize_ws(l) for l in content_lines]
+    matches = []
+    for i in range(len(norm_content) - n + 1):
+        if norm_content[i:i + n] == norm_old:
+            matches.append(i)
+            if len(matches) > 1:
+                return None  # ambiguous — refuse
+    if len(matches) == 1:
+        return (matches[0], matches[0] + n)
+    return None
+
+def _closest_region(content_lines: list, old_lines: list, ctx: int = 4) -> str:
+    """A small numbered excerpt of the region most similar to old_string's first
+    meaningful line — shown on a true miss so the model can re-target in one turn
+    instead of hunting byte-by-byte."""
+    import difflib
+    probe = next((l for l in old_lines if l.strip()), "")
+    if not probe:
+        return ""
+    pn = _normalize_ws(probe)
+    best_i, best_r = -1, 0.0
+    for i, l in enumerate(content_lines):
+        r = difflib.SequenceMatcher(None, pn, _normalize_ws(l)).ratio()
+        if r > best_r:
+            best_r, best_i = r, i
+    if best_i < 0 or best_r < 0.4:
+        return ""
+    lo = max(0, best_i - ctx)
+    hi = min(len(content_lines), best_i + ctx + 1)
+    return "\n".join(f"{j + 1}: {content_lines[j]}" for j in range(lo, hi))
+
 def tool_edit(file_path: str, old_string: str, new_string: str) -> str:
     if not _within_sandbox(file_path):
         return f"Error: '{file_path}' is outside the working directory. You can only edit files in this project."
@@ -784,13 +835,43 @@ def tool_edit(file_path: str, old_string: str, new_string: str) -> str:
         return f"Error: file not found: {file_path}"
     content = p.read_text(errors="replace")
     count = content.count(old_string)
-    if count == 0:
-        return f"Error: old_string not found in {file_path}. Use Read to see the current content."
+
+    # Fast path — exact, unique match (unchanged behavior).
+    if count == 1:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content.replace(old_string, new_string, 1))
+        return f"Edited {file_path}"
     if count > 1:
         return f"Error: old_string appears {count} times — must be unique. Add more context lines."
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(content.replace(old_string, new_string, 1))
-    return f"Edited {file_path}"
+
+    # count == 0. Before failing (which sends weak models into cat -A / xxd / python
+    # forensic loops), try a WHITESPACE-TOLERANT match: line drift and indentation
+    # differences are the usual cause, and normalizing whitespace recovers the intended
+    # region. Only apply when the normalized match is UNIQUE — never guess.
+    keepends = content.splitlines(keepends=True)
+    content_lines = [l.rstrip("\n").rstrip("\r") for l in keepends]
+    old_lines = old_string.splitlines()
+    span = _find_flexible_block(content_lines, old_lines)
+    if span:
+        s, e = span
+        at_eof = (e == len(keepends)) and bool(keepends) and not keepends[-1].endswith("\n")
+        new_block = new_string if (new_string.endswith("\n") or at_eof) else new_string + "\n"
+        rebuilt = "".join(keepends[:s]) + new_block + "".join(keepends[e:])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(rebuilt)
+        return (f"Edited {file_path} (matched lines {s + 1}-{e} ignoring whitespace "
+                f"differences — verify indentation in the next build).")
+
+    # True miss — the region isn't there (likely the code moved). Give the closest
+    # region so the model re-targets by content instead of hunting byte-by-byte.
+    hint = _closest_region(content_lines, old_lines)
+    if hint:
+        return (f"Error: old_string not found in {file_path} — the code likely moved "
+                f"(line numbers drift). Closest region right now:\n{hint}\n"
+                f"Locate your target by its symbol name, Read those exact lines, and "
+                f"copy them verbatim into old_string. Do NOT inspect bytes or rewrite the file.")
+    return (f"Error: old_string not found in {file_path}. Grep for the symbol you're "
+            f"changing, Read the current lines, and copy them exactly into old_string.")
 
 def tool_write(file_path: str, content: str) -> str:
     if not _within_sandbox(file_path):
@@ -862,10 +943,12 @@ def tool_ls(path: str = ".") -> str:
 def _detect_package_manager() -> tuple[str, str, str]:
     """Return (name, install_cmd, add_cmd) based on lock files in cwd."""
     cwd = Path.cwd()
-    if (cwd / "yarn.lock").exists():
-        return "yarn", "yarn install", "yarn add"
     if (cwd / "pnpm-lock.yaml").exists():
         return "pnpm", "pnpm install", "pnpm add"
+    if (cwd / "yarn.lock").exists():
+        return "yarn", "yarn install", "yarn add"
+    if (cwd / "bun.lockb").exists() or (cwd / "bun.lock").exists():
+        return "bun", "bun install", "bun add"
     return "npm", "npm install", "npm install"
 
 def tool_setup(packages: list | None = None) -> str:
@@ -1047,11 +1130,19 @@ def _find_build_cmd() -> str:
         scripts = {}
     pm, _, _ = _detect_package_manager()
     runner = pm if pm in ("yarn", "pnpm") else "npm run"
+    # Prefer a real script; a "typecheck" script beats a bare tsc fallback.
     build_script = next(
-        (s for s in ("build", "build:prod", "build:app", "compile") if s in scripts),
+        (s for s in ("build", "build:prod", "build:app", "compile", "typecheck", "type-check")
+         if s in scripts),
         None,
     )
-    return f"{runner} {build_script} 2>&1" if build_script else "npx tsc --noEmit 2>&1"
+    if build_script:
+        return f"{runner} {build_script} 2>&1"
+    # No script — run the PROJECT's tsc via the package manager so it resolves the
+    # installed copy (workspace-aware). Plain `npx tsc` / `./node_modules/.bin/tsc`
+    # miss it in a pnpm/yarn workspace where the binary isn't at the repo root.
+    exec_cmd = {"pnpm": "pnpm exec", "yarn": "yarn exec", "bun": "bun x"}.get(pm, "npx")
+    return f"{exec_cmd} tsc --noEmit 2>&1"
 
 
 def tool_build() -> str:
@@ -2094,10 +2185,31 @@ def repair_single_error(error: dict, messages: list, model: str,
     )
     return messages
 
+def _error_sig(e: dict) -> tuple:
+    """Line-INSENSITIVE signature for a build error: (file, code, message).
+    Line numbers are deliberately excluded. Keying on line made a pre-existing
+    error re-appear as 'new' the moment any edit shifted its line, which trapped
+    the repair loop into chasing errors the job never introduced (12M-token
+    spiral). The message text is stable across line drift and specific enough
+    (it names the symbol/module) to identify the error."""
+    return (e.get("file", ""), e.get("code", ""), (e.get("message", "") or "").strip())
+
+
+def _net_new_errors(errors: list, base_sigs: set) -> list:
+    """The errors present now that were NOT in the start-of-job baseline — the
+    only ones the job is responsible for. Compared by line-insensitive signature
+    so a pre-existing error that merely moved is never treated as new. This keeps
+    every check isolated to what the job actually changed vs. the state it started
+    from (a dirty baseline is not the job's problem)."""
+    return [e for e in errors if _error_sig(e) not in base_sigs]
+
+
 def repair_loop(request: str, messages: list, model: str,
-                initial_errors: list) -> tuple[bool, list, int, int]:
+                initial_errors: list, base_sigs: set = frozenset()) -> tuple[bool, list, int, int]:
     """
-    Surgical repair: one error at a time, Edit-only, file-locked.
+    Surgical repair: one error at a time, Edit-only, file-locked. Only ever
+    chases errors NET-NEW vs the start-of-job baseline (base_sigs) — never
+    pre-existing ones, even after edits shift their line numbers.
     Returns (build_passed, messages, total_input_tokens, total_output_tokens).
     """
     total_in = total_out = 0
@@ -2106,9 +2218,9 @@ def repair_loop(request: str, messages: list, model: str,
 
     for round_num in range(MAX_REPAIR_ROUNDS):
         if not errors:
-            # No errors left — verify the build actually passes before declaring success
-            passed_check, _, _ = run_build()
-            return passed_check, messages, total_in, total_out
+            # No net-new errors remain — the job introduced nothing vs baseline,
+            # so its work is clean even if the repo still has pre-existing errors.
+            return True, messages, total_in, total_out
 
         # Separate real file errors from synthetic bundler errors
         real_errors    = [e for e in errors if not e["file"].startswith("<")]
@@ -2147,7 +2259,11 @@ def repair_loop(request: str, messages: list, model: str,
         # Verify. The checkpoint stash holds the agent's PRIOR work, so right now
         # the worktree is (clean HEAD + this round's edits) — `git diff HEAD`
         # isolates exactly what this round changed, which the cheat check needs.
-        passed, new_errors, _ = run_build()
+        passed, all_errors, _ = run_build()
+        # Only count errors NET-NEW vs the start-of-job baseline — a dirty repo's
+        # pre-existing errors (even shifted to new lines) are never the job's to
+        # fix, so they can't keep the loop alive round after round.
+        new_errors = _net_new_errors(all_errors, base_sigs)
         new_count = len(new_errors)
         round_diff = diff_since_commit()
         error_locs = {(e["file"], int(e.get("line", 0))) for e in real_errors}
@@ -2295,6 +2411,10 @@ def run(request: str, model: str, system_prompt: str) -> int:
     # broken at base shouldn't be blamed on the agent, and a green baseline lets
     # us trust that a post-edit failure is the agent's doing.
     base_passed, base_errors, _ = run_build()
+    # Signatures of everything already broken at job start. The final gate and the
+    # repair loop judge the job ONLY against this — line-insensitively — so nothing
+    # pre-existing (a dirty tsc baseline, chain-ancestor state) is ever chased.
+    base_sigs = {_error_sig(e) for e in base_errors}
     emit({"type": "assistant", "message": {"content": [{
         "type": "text",
         "text": (f"── Baseline build: {'passing' if base_passed else f'already failing ({len(base_errors)} error(s))'} ──")
@@ -2341,33 +2461,25 @@ def run(request: str, model: str, system_prompt: str) -> int:
             "type": "text", "text": "✅ Build passed."
         }]}})
     else:
-        # Only hold the agent responsible for errors it INTRODUCED. If the repo
-        # was already failing at baseline, pre-existing errors aren't the agent's
-        # job to fix — repair only the net-new ones so a broken base doesn't trap
-        # the loop or fail an otherwise-correct change.
-        if not base_passed:
-            base_keys = {(e["file"], e.get("line", 0), e.get("code", "")) for e in base_errors}
-            new_errors = [e for e in errors if (e["file"], e.get("line", 0), e.get("code", "")) not in base_keys]
-            if not new_errors:
-                emit({"type": "assistant", "message": {"content": [{
-                    "type": "text",
-                    "text": (f"⚠️  Build still failing, but all {len(errors)} error(s) pre-existed at baseline — "
-                             f"the agent introduced none. Treating as no regression.")
-                }]}})
-                passed = True
-            else:
-                emit({"type": "assistant", "message": {"content": [{
-                    "type": "text",
-                    "text": f"❌ Agent introduced {len(new_errors)} new error(s). Entering surgical repair loop."
-                }]}})
-                passed, messages, in2, out2 = repair_loop(request, messages, model, new_errors)
-                in1 += in2; out1 += out2
+        # Only hold the job responsible for errors it INTRODUCED vs the start-of-job
+        # baseline, compared line-INSENSITIVELY (base_sigs is empty when the baseline
+        # was clean, so every error then counts as new). Pre-existing errors — a
+        # dirty tsc build, chain-ancestor state — are never the job's to fix, even
+        # after edits shift their line numbers.
+        new_errors = _net_new_errors(errors, base_sigs)
+        if not new_errors:
+            emit({"type": "assistant", "message": {"content": [{
+                "type": "text",
+                "text": (f"⚠️  Build has {len(errors)} error(s), but all pre-existed at the job's "
+                         f"baseline — none were introduced. Treating as no regression.")
+            }]}})
+            passed = True
         else:
             emit({"type": "assistant", "message": {"content": [{
                 "type": "text",
-                "text": f"❌ Build failed ({len(errors)} error(s)). Entering surgical repair loop."
+                "text": f"❌ Job introduced {len(new_errors)} new error(s). Entering surgical repair loop."
             }]}})
-            passed, messages, in2, out2 = repair_loop(request, messages, model, errors)
+            passed, messages, in2, out2 = repair_loop(request, messages, model, new_errors, base_sigs)
             in1 += in2; out1 += out2
 
     # Phase 3: Ensure commit
@@ -2429,18 +2541,28 @@ def run_ask(question: str, model: str) -> int:
             preamble = ""
 
     repo = SANDBOX_ROOT
+
+    # Prior conversation history (multi-turn planning). The block already begins
+    # with its "PRIOR CONVERSATION (most recent last):" header; insert it verbatim
+    # BETWEEN the symbol-map section and the QUESTION. Empty "" => byte-identical
+    # to today (no section, no leaked header). QUESTION stays LAST.
+    history = os.environ.get("AGENTIC_ASK_HISTORY", "")
+    history_section = f"{history}\n\n" if history else ""
+
     if preamble.strip():
         user_content = (
             f"WORKING DIRECTORY (read-only): {repo}\n"
             f"All file lookups are within this project.\n\n"
             f"PROJECT SYMBOL MAP (file → symbols):\n{preamble.strip()}\n\n"
             f"Use this to find what exists before reading files.\n\n"
+            f"{history_section}"
             f"QUESTION:\n{question}"
         )
     else:
         user_content = (
             f"WORKING DIRECTORY (read-only): {repo}\n"
             f"All file lookups are within this project.\n\n"
+            f"{history_section}"
             f"QUESTION:\n{question}"
         )
 
@@ -2532,8 +2654,24 @@ def run_ask(question: str, model: str) -> int:
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: ollama_worker.py '<request>'", file=sys.stderr)
-        print("       ollama_worker.py --ask '<question>'   (read-only planning)", file=sys.stderr)
+        print("       ollama_worker.py --ask '<question>'    (read-only planning)", file=sys.stderr)
+        print("       ollama_worker.py --prepare-deps         (install deps, then exit)", file=sys.stderr)
         sys.exit(1)
+
+    # Toolchain prepare path: install project dependencies (frozen, lockfile
+    # restored) ONCE before the agent runs, for BOTH backends. worker.sh calls
+    # this after selecting Node + the corepack package manager, so node_modules
+    # is ready and the agent never has to install/troubleshoot deps itself.
+    # Reuses ensure_dependencies() — single source of truth for the frozen
+    # install + lockfile-restore logic. Best-effort: prints status, never raises.
+    if sys.argv[1] == "--prepare-deps":
+        try:
+            status = ensure_dependencies()
+            if status:
+                print(status)
+        except Exception as exc:
+            print(f"⚠️  prepare-deps skipped ({exc})")
+        sys.exit(0)
 
     # Read-only planning path: a question that may only read. Separate from run()
     # so the job path is untouched (docs/planning-channels.md).
