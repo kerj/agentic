@@ -97,7 +97,7 @@ def _builtin_default() -> dict[str, Any]:
         },
         "post_edit": {
             "dep_trigger_file": "package.json",
-            "dep_install_cmd": "npm install --silent",
+            "dep_install_cmd": "auto",
             "type_check_trigger_file": "tsconfig.json",
             "type_check_cmd": "tsc --noEmit --skipLibCheck",
             "type_check_local_bin": "node_modules/.bin/tsc",

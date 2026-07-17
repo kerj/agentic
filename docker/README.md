@@ -163,17 +163,38 @@ and accept/remove work.
 
 ---
 
-## Node versions (fnm)
+## Node, pnpm & yarn (fnm + corepack)
 
-The image has **no baked Node** — [fnm](https://github.com/Schniz/fnm) manages it,
-so different projects can use different versions:
+The container prepares the full JS toolchain **before the agent runs**, for both
+the local and cloud backends, so a job never spends turns (and tokens) figuring
+out how to install or which tool to use.
 
-- Default is a current LTS (Node 20).
-- If a project pins a version via `.nvmrc`, `.node-version`, or
-  `engines.node`, the worker installs+activates that version before building.
-- Dependencies are installed with a **frozen lockfile** (`npm ci` /
-  `--frozen-lockfile`) before the baseline build, so the build is real and the
-  lockfile is never modified (no churn in the job's diff).
+- **Node** — no baked Node; [fnm](https://github.com/Schniz/fnm) manages it, so
+  different projects can use different versions. Default is a current LTS
+  (Node 20). If a project pins a version via `.nvmrc`, `.node-version`, or
+  `engines.node`, the worker installs + activates it before building.
+- **Package manager** — [corepack](https://nodejs.org/api/corepack.html) (built
+  into Node) provides **pnpm** and **yarn** on `PATH`, at the exact version the
+  project pins via its `package.json` `packageManager` field. npm works out of
+  the box too. So `pnpm install` / `yarn install` just work — no "command not
+  found," no version drift.
+- **Shared store/cache** — the pnpm content-addressable store, the corepack
+  binary cache, and the npm/yarn caches all live in the **state mount**
+  (`$AGENTIC_HOME/home`), so they persist across worktrees and restarts. A fresh
+  worktree (no `node_modules`, since it's gitignored) installs mostly by
+  hard-linking from the warm store instead of re-downloading the whole tree —
+  the difference between seconds and a network-bound crawl per job.
+- **Frozen install** — dependencies are installed with a frozen lockfile
+  (`npm ci` / `pnpm install --frozen-lockfile` / `yarn --frozen-lockfile`) before
+  the build, so the build is real and the lockfile is never modified (no churn in
+  the job's diff).
+- The worker's system prompt tells the agent the toolchain and dependencies are
+  already prepared, so it builds/tests directly instead of reinstalling or
+  troubleshooting the environment.
+
+Monorepos: a pnpm/yarn **workspace** install runs at the repo root (installing
+the whole workspace) — correct for cross-package deps, and fast once the shared
+store is warm.
 
 ---
 

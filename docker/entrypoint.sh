@@ -36,7 +36,34 @@ export AGENTIC_APP AGENTIC_HOME AGENTIC_PYTHON="$PY" HOME
 export npm_config_cache="$HOME/.npm"
 export XDG_CACHE_HOME="$HOME/.cache"
 export XDG_CONFIG_HOME="$HOME/.config"
+export XDG_DATA_HOME="$HOME/.local/share"
 export YARN_CACHE_FOLDER="$HOME/.cache/yarn"
+
+# pnpm + corepack live in the STATE mount so they PERSIST across worktrees and
+# container restarts. Each job runs in a fresh worktree with no node_modules
+# (gitignored, never copied), so without a shared store EVERY job re-downloads
+# the whole dependency tree — the exact cause of hours-long, token-heavy installs.
+#   • PNPM store: content-addressable; a warm store makes installs mostly
+#     hard-links from disk (no network). It defaults under XDG_DATA_HOME/pnpm,
+#     which we point at the mount above; pin store-dir explicitly too.
+#   • COREPACK_HOME: where corepack caches the project-pinned pnpm/yarn binaries,
+#     so a given pnpm@X is downloaded once, not once per job.
+export PNPM_HOME="$XDG_DATA_HOME/pnpm"   # global bin dir — fine on the bind mount
+# The pnpm STORE must live on the container's NATIVE filesystem (a Docker named
+# volume mounted at /pnpm-store), NOT the macOS bind mount. pnpm links packages
+# from the store into node_modules via reflink/clone; VirtioFS (Docker Desktop on
+# macOS) does not support that op across the mount → the install dies with
+# "ERR_PNPM Unknown system error -116" on copyfile. A named volume is native ext4
+# in the Linux VM, so it works AND persists across restarts. Overridable via env.
+export PNPM_STORE_DIR="${AGENTIC_PNPM_STORE:-/pnpm-store}"
+export npm_config_store_dir="$PNPM_STORE_DIR"
+# Store (native volume) and node_modules (worktree, on the bind mount) are on
+# DIFFERENT filesystems, so pnpm cannot hardlink/clone between them. Force plain
+# copy so it never attempts the reflink that fails on VirtioFS.
+export npm_config_package_import_method="copy"
+export COREPACK_HOME="$XDG_CACHE_HOME/corepack"
+export COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+export PATH="$PNPM_HOME:$PATH"
 
 # ── 1. PREFLIGHT REFUSALS — abort before touching anything ───────────────────
 _refuse() { echo "❌ REFUSING TO START: $1" >&2; echo "   $2" >&2; exit 1; }
@@ -81,22 +108,35 @@ mkdir -p \
   "$AGENTIC_HOME"/worktrees \
   "$AGENTIC_HOME"/diffs \
   "$AGENTIC_HOME"/logs \
-  "$HOME"/.npm "$HOME"/.cache "$HOME"/.config
+  "$HOME"/.npm "$HOME"/.cache "$HOME"/.config \
+  "$PNPM_STORE_DIR" "$COREPACK_HOME" "$YARN_CACHE_FOLDER"
 
-# ── 3. git identity, written into the container's HOME (.gitconfig) ──────────
-# The merge commits made by accept/accept-chain need a committer identity, and
-# Review-in-IDE / apply need safe.directory for the host-owned bind mount. Write
-# them into $HOME/.gitconfig. Run as the TARGET uid (via gosu) so the file is
-# owned by that uid and stays updatable — a root-written config in the mounted
-# home would be root-owned and the dropped worker couldn't touch it.
+# ── 3. git identity ──────────────────────────────────────────────────────────
+# Commits made in the container (worker job commits, the squash, accept/-chain
+# merges) need an identity, and Review-in-IDE / apply need safe.directory for the
+# host-owned bind mount.
+#
+# CRITICAL — identity comes from ENV VARS, not `git config`, and the worker is
+# told never to run `git config`. Here's why: worktrees SHARE the target repo's
+# .git/config for user.*, and that repo is bind-mounted. So a `git config
+# user.name X` inside a worktree writes into the HOST repo's .git/config — which
+# then overrides the human's global identity for THEIR OWN manual commits too
+# (the "all my commits are authored by Assistant" bug). GIT_AUTHOR_*/COMMITTER_*
+# env vars set the agent's identity for every container commit WITHOUT writing any
+# file, so nothing leaks to the host repo. safe.directory still needs the config
+# file (no env form), so we write only that — with --replace-all so it can't grow
+# unbounded across restarts.
+export GIT_AUTHOR_NAME="agentic"
+export GIT_AUTHOR_EMAIL="agentic@localhost"
+export GIT_COMMITTER_NAME="agentic"
+export GIT_COMMITTER_EMAIL="agentic@localhost"
 _git_setup() {
-  git config --global --add safe.directory '*'
-  git config --global user.name  "$(git config --global user.name  2>/dev/null || echo 'agentic')"
-  git config --global user.email "$(git config --global user.email 2>/dev/null || echo 'agentic@localhost')"
+  git config --global --replace-all safe.directory '*'
 }
 if [[ -n "${HOST_UID:-}" && -n "${HOST_GID:-}" ]] && command -v gosu >/dev/null 2>&1; then
   # Make HOME owned by the target uid first, then write the config as that uid.
-  chown "${HOST_UID}:${HOST_GID}" "$HOME" "$HOME"/.npm "$HOME"/.cache "$HOME"/.config 2>/dev/null || true
+  chown "${HOST_UID}:${HOST_GID}" "$HOME" "$HOME"/.npm "$HOME"/.cache "$HOME"/.config \
+        "$XDG_DATA_HOME" "$PNPM_HOME" "$PNPM_STORE_DIR" "$COREPACK_HOME" 2>/dev/null || true
   gosu "${HOST_UID}:${HOST_GID}" bash -c "$(declare -f _git_setup); HOME='$HOME' _git_setup" 2>/dev/null || true
 else
   _git_setup 2>/dev/null || true

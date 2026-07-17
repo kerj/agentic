@@ -73,8 +73,18 @@ services:
       #    This is the ONLY host code the container can see; the picker browses
       #    within it. Narrow by design — never the home dir.
       - "${PROJECT_DIR}:${PROJECT_DIR}"
+      # ③ PNPM STORE — a NAMED VOLUME (native ext4 in the Linux VM), NOT a bind
+      #    mount. pnpm links from the store into node_modules via reflink/clone,
+      #    which the macOS VirtioFS bind mount cannot do (ERR_PNPM system error
+      #    -116). A named volume avoids that and persists the store across runs.
+      #    Not an identity mount — nothing bakes absolute paths into it.
+      - "agentic-pnpm-store:/pnpm-store"
 
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
     restart: unless-stopped
+
+volumes:
+  # pnpm content-addressable store — see the /pnpm-store mount above.
+  agentic-pnpm-store:

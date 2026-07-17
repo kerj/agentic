@@ -36,7 +36,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # readable by any uid (the entrypoint drops to HOST_UID at runtime).
 ENV FNM_DIR=/usr/local/share/fnm
 ENV PATH=/usr/local/bin:$PATH
-ENV DEFAULT_NODE=20
+# Node 22 (current LTS). Must be >= 22.13: modern pnpm (11.x) requires it and uses
+# node:sqlite, which older Node lacks. Per-project versions still switch via fnm at
+# run time (.nvmrc / .node-version / engines.node); this is only the default.
+ENV DEFAULT_NODE=22
+# corepack must never block on an interactive "download pnpm@X? (Y/n)" prompt —
+# the worker runs unattended. Auto-approve pinned-version downloads.
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
 RUN curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir /usr/local/bin --skip-shell \
     && fnm install "${DEFAULT_NODE}" \
     && fnm default "${DEFAULT_NODE}" \
@@ -44,11 +50,31 @@ RUN curl -fsSL https://fnm.vercel.app/install | bash -s -- --install-dir /usr/lo
     # and the worker find them on PATH with NO shell eval. Per-project switches
     # still go through `fnm use`/`fnm exec` (wired in the worker).
     && DEFAULT_BIN="$(dirname "$(fnm exec --using=${DEFAULT_NODE} which node)")" \
-    && ln -sf "$DEFAULT_BIN/node" /usr/local/bin/node \
-    && ln -sf "$DEFAULT_BIN/npm"  /usr/local/bin/npm \
-    && ln -sf "$DEFAULT_BIN/npx"  /usr/local/bin/npx \
+    && ln -sf "$DEFAULT_BIN/node"     /usr/local/bin/node \
+    && ln -sf "$DEFAULT_BIN/npm"      /usr/local/bin/npm \
+    && ln -sf "$DEFAULT_BIN/npx"      /usr/local/bin/npx \
+    && ln -sf "$DEFAULT_BIN/corepack" /usr/local/bin/corepack \
+    # ── corepack: pnpm + yarn on PATH, at the version each project pins ────────
+    # corepack ships with Node and is the official way to provide pnpm/yarn at the
+    # version a project pins via its package.json `packageManager` field. Without
+    # this, `pnpm install` is "command not found" and the worker burns hours
+    # inventing workarounds. corepack itself must be on PATH first (symlinked
+    # above) — both for THIS `enable` step and for the worker's runtime
+    # `corepack prepare`. Install the shims into /usr/local/bin (node-agnostic:
+    # they just need SOME node on PATH), so pnpm/pnpx/yarn resolve for ANY uid and
+    # survive per-project fnm Node switches. The pinned pm VERSION is downloaded
+    # lazily at run time into COREPACK_HOME (a persistent state-mount dir).
+    && corepack enable --install-directory /usr/local/bin \
     && chmod -R a+rX "$FNM_DIR" \
-    && node --version && npm --version
+    && chmod a+rx /usr/local/bin/pnpm /usr/local/bin/pnpx /usr/local/bin/yarn 2>/dev/null || true \
+    # Verify the shims are INSTALLED (on PATH) without EXECUTING them: running
+    # `pnpm --version` would make corepack download the latest pnpm into the image
+    # at build time — wasteful (real downloads happen at run time into the
+    # persistent COREPACK_HOME) and it fails if that pnpm outpaces DEFAULT_NODE.
+    # The per-project pnpm/yarn VERSION is resolved lazily at run time.
+    && node --version && npm --version \
+    && command -v pnpm >/dev/null && command -v yarn >/dev/null \
+    && echo "corepack shims installed: $(command -v pnpm), $(command -v yarn)"
 
 # ── Claude Code CLI — enables CLOUD execution + CLOUD planning ───────────────
 # The cloud worker (worker.sh) and the cloud planning agent (planner.py) both
