@@ -60,11 +60,26 @@ If you have tried the same fix more than twice without success, stop.
 Read all the affected files from scratch. The problem is something you haven't seen yet.
 Do not keep repeating the same approach.
 
+ANCHOR RULE — line numbers in the task are APPROXIMATE:
+The task may say "around file.ts:100" or cite a line range. Do NOT trust the exact
+line — an earlier change may have moved it (line 100 is now line 73). Find the code
+by its named SYMBOL: Grep(symbol, path) for the function/type/const/component, or
+Read the file and search for the name. THEN copy the exact current text into Edit's
+old_string. If Edit fails with "not found", the line moved or the whitespace differs —
+Grep for the symbol, Read the real lines, and copy them verbatim. NEVER inspect bytes
+with `cat -A` or `xxd`, and NEVER rewrite a file with a `python` heredoc — that path
+corrupts files. The only way to change code is Grep/Read to locate, then Edit.
+
 BASH SPIRAL RULE:
 If you run more than 3 Bash commands in a row without a Read or Edit in between, you are spiraling.
 STOP. Use Read on the file that has the error. Use Edit to fix the code. No more Bash until you edit.
+If you catch yourself running cat -A, xxd, sed -n, or a python heredoc to inspect a file,
+STOP immediately — use Read to see it and Edit to change it.
 
 NEVER run: rm -rf, killall, or any destructive system command.
+NEVER run `git config` (any form). Your commit identity is already set for you;
+setting user.name/email writes into the repo's shared config and re-authors the
+human's own commits. Just `git add -A && git commit -m "..."` — never configure git.
 If Build() returns empty output or times out, call it once more. If it fails again, use Bash to run the build command directly and read the raw output.
 
 ---

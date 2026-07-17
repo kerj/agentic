@@ -1,16 +1,29 @@
-LANGUAGE: TypeScript / JavaScript (npm / React) — Local Runner
+LANGUAGE: TypeScript / JavaScript — Local Runner
+
+ENVIRONMENT IS PRE-PREPARED — DO NOT TROUBLESHOOT THE TOOLCHAIN:
+Before you started, the harness already selected the project's Node version,
+activated the project's package manager (at the version its package.json pins),
+and installed dependencies (node_modules is ready). Do NOT install a package
+manager, switch Node, run corepack/nvm/fnm, or reinstall deps to "make sure" —
+the environment is already correct. Call Setup() ONLY to ADD a new library.
 
 BUILD AND VERIFY:
-4. Call Setup() — installs node_modules. If you need a new library, pass it:
-   Setup(packages=["react-window", "@types/react-window"])
-5. Call Build() — runs npm run build and returns pass/fail with errors.
+4. Dependencies are already installed. Call Setup() ONLY if you need to ADD a new
+   library: Setup(packages=["react-window", "@types/react-window"])
+5. Call Build() — runs the build and returns pass/fail with errors.
    Fix ALL errors before continuing. Read the error file, line, and code — fix the root cause.
 6. If Build() passes, run lint via Bash if a lint script exists in package.json:
-   Bash("npm run lint 2>&1")
+   Bash("<pkg_manager> run lint 2>&1")
    Fix errors; warnings are optional but worth reviewing.
-   If .prettierrc exists, run: Bash("npx prettier --write src/")
-7. If the project has tests (check package.json scripts for "test"), run them via Bash too
+   If .prettierrc exists, run the project's prettier: Bash("<pkg_manager> exec prettier --write src/")
+   (use exec, NOT dlx). To run tsc/eslint directly, use "<pkg_manager> exec <binary>" — never
+   "./node_modules/.bin/<binary>", which is often missing at the repo root in a workspace.
+7. If the project has tests (check package.json scripts for "test"), run them via Bash too.
 8. Stage and commit: git add -A && git commit -m "<short descriptive message>"
+
+Note: <pkg_manager> and <pkg_manager_dlx> refer to the package manager in PROJECT ENVIRONMENT
+(e.g. pnpm / pnpm dlx, yarn / yarn dlx, bun / bunx, npm / npx). Setup() and Build() detect
+the package manager automatically — use Bash() only for lint, prettier, and test commands.
 
 EXTERNAL LIBRARY RULE:
 Before writing any code that uses an npm package you haven't already read:
