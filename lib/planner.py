@@ -606,7 +606,8 @@ def _child_env(repo: str, secret_anthropic_key: bool = True) -> dict[str, str]:
 
 def _build_agent_cmd(mode: str, model: str, request: str, repo: str,
                      max_turns: int,
-                     seed_map: str = "") -> tuple[list[str], dict[str, str]]:
+                     seed_map: str = "",
+                     history: str = "") -> tuple[list[str], dict[str, str]]:
     """Return (argv, env) for the read-only agent subprocess.
 
     cloud -> the `claude` CLI (a real tool loop) with read-only tools and
@@ -619,14 +620,27 @@ def _build_agent_cmd(mode: str, model: str, request: str, repo: str,
     """
     system_prompt = _planner_prompt()
     if mode == "cloud":
-        prompt = request
-        if seed_map:
-            prompt = (
-                f"{request}\n\n"
-                "Repository symbol map (file: symbols) — use it to jump straight "
-                "to the right files; prefer the cheapest tool that answers:\n"
-                f"{seed_map[:8000]}"
-            )
+        # Symbol map block (unchanged wording); reused in both prompt orderings.
+        map_block = (
+            "Repository symbol map (file: symbols) — use it to jump straight "
+            "to the right files; prefer the cheapest tool that answers:\n"
+            f"{seed_map[:8000]}"
+        ) if seed_map else ""
+        if history:
+            # With prior history the sections are ordered: PRIOR CONVERSATION
+            # block (already formatted upstream, inserted verbatim) → symbol map
+            # block → the current question, so the model reads context first.
+            parts = [history]
+            if map_block:
+                parts.append(map_block)
+            parts.append(f"CURRENT QUESTION:\n{request}")
+            prompt = "\n\n".join(parts)
+        else:
+            # No history → byte-identical to the pre-history prompt (question
+            # first, then symbol map).
+            prompt = request
+            if map_block:
+                prompt = f"{request}\n\n{map_block}"
         cmd = [
             "claude", "-p", prompt,
             "--dangerously-skip-permissions",
@@ -655,6 +669,13 @@ def _build_agent_cmd(mode: str, model: str, request: str, repo: str,
     env["AGENTIC_PLANNER_PROMPT"] = str(AGENTIC_APP / "agents" / "planner.txt")
     if seed_map:
         env["AGENTIC_ASK_PREAMBLE"] = seed_map[:8000]
+    # Prior conversation rides along as its own preamble section. It's already
+    # trimmed to a token budget upstream (serve._build_history_text, ~6000 tokens
+    # ≈ 24000 chars). The cap here is only a defensive backstop and MUST sit above
+    # that budget: the block is ordered most-recent-last, so a tight cap would chop
+    # the newest turns off the END — the exact context a follow-up refers to.
+    if history:
+        env["AGENTIC_ASK_HISTORY"] = history[:32000]
     return cmd, env
 
 
@@ -662,6 +683,7 @@ def run_agent(mode: str, model: str, request: str, repo: str,
               max_turns: int = PLANNING_MAX_TURNS_DEFAULT,
               timeout: int = 600,
               seed_map: str = "",
+              history: str = "",
               on_event: Optional[Any] = None,
               on_start: Optional[Any] = None) -> dict[str, Any]:
     """Dispatch a read-only agent subprocess, stream-parse its output, and
@@ -669,13 +691,16 @@ def run_agent(mode: str, model: str, request: str, repo: str,
 
     seed_map — repository symbol map routed to the right channel per backend
     (inlined into the cloud prompt; AGENTIC_ASK_PREAMBLE env for local).
+    history — prior-conversation block (already formatted/trimmed upstream),
+    inlined into the cloud prompt; AGENTIC_ASK_HISTORY env for local.
     on_event(ev_dict) — optional callback for live SSE streaming (called for
     every parsed stream event before harvesting).
 
     Returns {answer, grounding:'agent', citations, files_read, tokens,
     turns, exit_code}.
     """
-    cmd, env = _build_agent_cmd(mode, model, request, repo, max_turns, seed_map)
+    cmd, env = _build_agent_cmd(mode, model, request, repo, max_turns, seed_map,
+                                history=history)
     citations: list[dict[str, Any]] = []
     files_read: set = set()
     stats: dict[str, int] = {"input": 0, "output": 0}
@@ -762,6 +787,7 @@ def _percent_saved_hint(files_read: int, turns: int) -> str:
 
 def ask(channel: dict[str, Any], thread: dict[str, Any], question: str,
         symbol_map: Optional[str] = None, dig_deeper: bool = False,
+        history: str = "",
         on_event: Optional[Any] = None,
         on_start: Optional[Any] = None) -> dict[str, Any]:
     """Run the tiered grounding flow for one question.
@@ -780,7 +806,10 @@ def ask(channel: dict[str, Any], thread: dict[str, Any], question: str,
     if symbol_map is None:
         symbol_map, _ = cached_symbol_map(cid, repo, profile) if cid else (build_symbol_map(repo, profile), "")
 
-    bucket = "agent" if dig_deeper else classify(question)
+    # option (b) — a thread with prior turns always grounds via the agent so
+    # follow-ups keep context (the free index path can't resolve deixis like
+    # "it"/"there").
+    bucket = "agent" if (dig_deeper or history) else classify(question)
 
     if bucket == "index":
         idx = answer_index(question, symbol_map, repo)
@@ -804,7 +833,8 @@ def ask(channel: dict[str, Any], thread: dict[str, Any], question: str,
     # Seed the agent with the symbol map (routed per-backend by run_agent) so it
     # knows where things live and can jump straight to the right files.
     res = run_agent(mode, model, question, repo, max_turns=max_turns,
-                    seed_map=symbol_map or "", on_event=on_event, on_start=on_start)
+                    seed_map=symbol_map or "", history=history,
+                    on_event=on_event, on_start=on_start)
     files_read = res.get("files_read", [])
     return {
         "answer": res["answer"],
@@ -1046,10 +1076,49 @@ def _default_local_model() -> str:
         return "qwen-coder:latest"
 
 
+_BACKTICK_IDENT = re.compile(r"`([A-Za-z_$][A-Za-z0-9_$]*)`")
+
+
+def _is_strong_symbol(tok: str) -> bool:
+    """True for tokens that clearly look like a CODE IDENTIFIER, not a common word.
+    We only attach a prose-harvested symbol when it's strong, because a WRONG symbol
+    is worse than none: verify_anchor_existence snaps to the symbol's first hit (a
+    common word like `null` would match the wrong line) or DROPS the anchor entirely
+    if the symbol isn't found. Accept camelCase / PascalCase / SNAKE_CASE / $-names,
+    or a plain lowercase word only if it's reasonably long."""
+    if any(c.isupper() for c in tok) or "_" in tok or "$" in tok:
+        return True
+    return len(tok) >= 6
+
+
+def _nearest_backticked_symbol(text: str, span_start: int, span_end: int,
+                               window: int = 80) -> str:
+    """The strong backticked identifier closest to a file:line span (within
+    `window` chars), or "" — used to attach a drift-proof symbol to a prose anchor.
+    Derive requests refer to code by a backticked symbol near its location, e.g.
+    "the `handleSubmit` function at InviteUserDialog.tsx:100"."""
+    best, best_dist = "", window + 1
+    for im in _BACKTICK_IDENT.finditer(text):
+        tok = im.group(1)
+        if not _is_strong_symbol(tok):
+            continue
+        if im.end() <= span_start:
+            d = span_start - im.end()
+        elif im.start() >= span_end:
+            d = im.start() - span_end
+        else:
+            d = 0
+        if d < best_dist:
+            best_dist, best = d, tok
+    return best if best_dist <= window else ""
+
+
 def _anchors_from_prose(text: str) -> list[dict[str, Any]]:
     """Fallback: pull `path/to/file.ext:START[-END]` anchors out of request prose
-    when the model wrote them in text but not in the structured array. Matches a
-    path with a file extension followed by :line or :start-end."""
+    when the model wrote them in text but not in the structured array. Also attaches
+    a nearby backticked `symbol` when a strong one is present, so drift-resistant
+    symbol-snapping (verify_anchor_existence) still works on the prose path — a bare
+    line number alone drifts once earlier jobs in a chain edit the file."""
     out: list[dict[str, Any]] = []
     seen: set = set()
     # e.g. src/components/SearchPanel.tsx:30-48  or  lib/foo.py:42
@@ -1059,34 +1128,61 @@ def _anchors_from_prose(text: str) -> list[dict[str, Any]]:
         if key in seen:
             continue
         seen.add(key)
-        out.append({"file": f, "start": s, "end": int(e) if e else s})
+        anchor: dict[str, Any] = {"file": f, "start": s, "end": int(e) if e else s}
+        sym = _nearest_backticked_symbol(text, m.start(), m.end())
+        if sym:
+            anchor["symbol"] = sym
+        out.append(anchor)
     return out
 
 
 def bake_anchors_into_request(request: str, anchors: list[dict[str, Any]]) -> str:
-    """Inline confirmed anchors into the request text in the submit_review_job
-    file:line style (job_queue.py:submit_review_job), so the runner sees only a
-    self-contained request string — never the thread (decision 2: isolation)."""
+    """Inline confirmed anchors into the request text so the runner sees only a
+    self-contained request string — never the thread (decision 2: isolation).
+
+    SYMBOL-FIRST: when an anchor names a symbol, lead with the symbol and mark the
+    line number as APPROXIMATE. In a linear job chain, earlier jobs edit the file
+    and shift every later job's line numbers (line 100 becomes line 73), so a bare
+    file:line sends the runner to the wrong region — where its exact-match Edit
+    fails and it burns turns on byte-level forensics. The stable locator is the
+    symbol; the line is only a hint. Anchors without a symbol fall back to the
+    file:line form (still marked approximate)."""
     if not anchors:
         return request
     lines = []
+    any_symbol = False
     for a in anchors:
         f = a["file"]
         s = a.get("start")
         e = a.get("end", s)
-        if s and e and s != e:
-            loc = f"{f}:{s}-{e}"
-        elif s:
-            loc = f"{f}:{s}"
+        symbol = (a.get("symbol") or "").strip()
+        why = a.get("why")
+        if symbol:
+            any_symbol = True
+            if s and e and s != e:
+                where = f"{f}:{s}-{e}"
+            elif s:
+                where = f"{f}:{s}"
+            else:
+                where = f
+            loc = f"`{symbol}` (in {where} — approximate; find it by name, not the line number)"
         else:
-            loc = f
-        why = a.get("why") or a.get("symbol")
-        lines.append(f"- `{loc}`" + (f" — {why}" if why else ""))
-    return (
-        f"{request.strip()}\n\n"
-        "Context to read first (verified against the codebase):\n"
-        + "\n".join(lines)
+            if s and e and s != e:
+                loc = f"`{f}:{s}-{e}`"
+            elif s:
+                loc = f"`{f}:{s}`"
+            else:
+                loc = f"`{f}`"
+        lines.append(f"- {loc}" + (f" — {why}" if why else ""))
+    header = (
+        "Context to read first — line numbers are APPROXIMATE and may have shifted "
+        "(earlier changes move them); locate each by its named symbol, then Read "
+        "around it before editing:"
+        if any_symbol else
+        "Context to read first (line numbers are approximate — Read around them to "
+        "confirm the exact current text before editing):"
     )
+    return f"{request.strip()}\n\n{header}\n" + "\n".join(lines)
 
 
 def derive(channel: dict[str, Any], thread: dict[str, Any], transcript: str,
