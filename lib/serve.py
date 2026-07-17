@@ -1979,6 +1979,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._stream_thread_buffer(tid, send)
             return
 
+        # Capture prior conversation BEFORE appending the current question, so the
+        # current turn does NOT duplicate into the multi-turn history block.
+        history_text, dropped = self._build_history_text(cid, tid)
+
         # Record the user's question immediately (before the answer lands) so the
         # transcript reflects intent even if the run is interrupted.
         try:
@@ -2004,6 +2008,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # acquire/release keeps the live count accurate.
             _configure_pool_from_settings()
             _got_slot = _plan_acquire(_ask_backend)
+            # Surface that older turns were dropped to fit the history budget.
+            if dropped > 0:
+                _ask_emit(tid, {"type": "context_trimmed", "dropped": dropped})
             try:
                 smap, _ = _planner.cached_symbol_map(cid, channel["repo"], channel.get("profile"))
             except Exception:
@@ -2012,6 +2019,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 res = _planner.ask(
                     channel_dict, thread_dict, q,
                     symbol_map=smap, dig_deeper=dig,
+                    history=history_text,
                     on_event=lambda ev: _ask_emit(tid, ev),
                     on_start=lambda p: _register_ask_proc(tid, p),
                 )
@@ -2069,7 +2077,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "default_mode": _settings.get("planning_default_mode"),
         }
         thread_dict = dict(thread)
-        thread_dict.setdefault("planning_max_turns", _settings.get("planning_max_turns"))
+        # Derivation gets its OWN (higher) turn budget: covering a multi-concern
+        # plan means opening/anchoring many files, so the single-question cap
+        # would run out mid-derivation and drop the later concerns. A per-thread
+        # explicit value still wins.
+        if not thread_dict.get("planning_max_turns"):
+            thread_dict["planning_max_turns"] = _settings.get("derive_max_turns")
 
         send = self._sse_open()
         _derive_backend = _planning_backend(channel_dict, thread_dict)
@@ -2125,20 +2138,89 @@ class Handler(http.server.BaseHTTPRequestHandler):
         threading.Thread(target=_run, daemon=True).start()
         self._stream_thread_buffer(tid, send)
 
+    def _submitted_line(self, e: dict) -> str:
+        """One-line summary of a 'submitted' transcript entry: what jobs were
+        queued (seq, title, request). Shared by the chat-history and derivation
+        context builders so continued conversation / re-derivation knows what
+        has already been queued from this thread."""
+        jobs = e.get("jobs", []) or []
+        if not jobs:
+            return ""
+        parts = []
+        for idx, j in enumerate(jobs):
+            seq = j.get("seq")
+            num = (seq + 1) if isinstance(seq, int) and not isinstance(seq, bool) else idx + 1
+            title = j.get("title") or j.get("name") or j.get("job_id") or "job"
+            req = (j.get("request") or "").strip()
+            parts.append(f"({num}) {title}" + (f" — {req}" if req else ""))
+        return f"Queued {len(jobs)} job(s) as a chain: " + "; ".join(parts)
+
     def _transcript_text(self, cid: str, tid: str) -> str:
-        """Flatten the thread transcript to plain text for the derivation agent."""
+        """Flatten the thread transcript to plain text for the derivation agent.
+        Includes already-queued jobs so a second derivation doesn't re-propose
+        work that's already in the queue."""
         lines = []
         for e in _channels.transcript_read(cid, tid):
             role = e.get("role", "")
             if role in ("user", "assistant"):
                 lines.append(f"{role.upper()}: {e.get('text', '')}")
+            elif role == "submitted":
+                s = self._submitted_line(e)
+                if s:
+                    lines.append(f"ALREADY QUEUED: {s}")
         return "\n\n".join(lines)
+
+    def _build_history_text(self, cid: str, tid: str, budget_tokens: int = 6000):
+        """Build the PRIOR CONVERSATION block for a planning follow-up.
+
+        Returns (history_text, dropped). Empty ("", 0) when there are no prior
+        turns. Includes 'submitted' turns (jobs queued from this thread) so a
+        follow-up knows what's already been queued and can build on it. Trims
+        oldest turns to fit budget_tokens (estimated as len(block)//4), but never
+        drops below the most recent 2 turns."""
+        turns = []  # list of (label, text)
+        for e in _channels.transcript_read(cid, tid):
+            role = e.get("role", "")
+            if role in ("user", "assistant"):
+                text = e.get("text", "")
+                if text:
+                    turns.append(("User" if role == "user" else "Assistant", text))
+            elif role == "submitted":
+                s = self._submitted_line(e)
+                if s:
+                    turns.append(("Jobs queued", s))
+        if not turns:
+            return "", 0
+
+        header = "PRIOR CONVERSATION (most recent last):"
+
+        def _render(ts):
+            lines = [header]
+            for label, text in ts:
+                lines.append(f"{label}: {text}")
+            return "\n".join(lines)
+
+        dropped = 0
+        block = _render(turns)
+        # Estimate tokens as len(block)//4; drop oldest turns while over budget,
+        # keeping at least the most recent 2 turns (one exchange).
+        while len(block) // 4 > budget_tokens and len(turns) > 2:
+            turns.pop(0)
+            dropped += 1
+            block = _render(turns)
+        return block, dropped
 
     def _channel_submit(self, cid: str, tid: str) -> None:
         """POST /api/channel/<cid>/<tid>/submit {proposal_id, included_seqs} —
-        walk jobs in seq order calling submit_job(after=<resolved parent>). The
-        depends_on index → real job_id remap is the ONLY new queue logic. Only
-        job['request'] carries forward (job-isolation rule)."""
+        walk jobs in seq order and queue them as ONE STRICTLY LINEAR CHAIN: each
+        job's parent is the previously-queued job, so job N branches off job N-1's
+        result and builds on it. We deliberately do NOT honor the model's
+        depends_on as the parent, because a fan-out (several jobs sharing one
+        parent) makes each sibling branch off the SAME base independently — their
+        changes diverge and collide when the chain is accepted. Linearizing by seq
+        still respects every declared dependency (depends_on always points to an
+        earlier seq — no forward refs — so seq order is a valid topological order).
+        Only job['request'] carries forward (job-isolation rule)."""
         body = self._read_body()
         pid = str(body.get("proposal_id", "")).strip()
         if not pid:
@@ -2161,8 +2243,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             include_set = None  # all
 
         jobs = sorted(prop.get("jobs", []), key=lambda j: j.get("seq", 0))
-        # seq (0-based proposal index) → real job_id, for the depends_on remap.
-        seq_to_job: dict[int, str] = {}
+        # Linear chain: each queued job's parent is the previous one we queued
+        # (in seq order), regardless of the model's depends_on graph. This
+        # guarantees a single sequential chain — no two siblings share a parent,
+        # so no divergent branches and no accept-time merge races.
+        prev_job_id: str | None = None
         results = []
         try:
             for j in jobs:
@@ -2172,15 +2257,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 request = str(j.get("request", "")).strip()
                 if not request:
                     continue
-                dep = j.get("depends_on")
-                after = None
-                if isinstance(dep, int) and not isinstance(dep, bool):
-                    after = seq_to_job.get(dep)  # parent already queued earlier
+                after = prev_job_id  # chain onto the previously-queued job
                 # ONLY the request string crosses into the job — no thread,
                 # transcript, channel, or proposal reference is ever written.
                 job_id, job_name = submit_job(request, repo, priority, model_hint, after)
-                seq_to_job[seq] = job_id
-                results.append({"seq": seq, "job_id": job_id, "name": job_name})
+                prev_job_id = job_id
+                # Keep title + request on the thread-side record so the chat can
+                # show what was queued and continued conversation has the context.
+                # (This is thread→job context; the job itself still carries ONLY
+                # its request string — the isolation rule above is unchanged.)
+                results.append({"seq": seq, "job_id": job_id, "name": job_name,
+                                "title": j.get("title", ""), "request": request})
         except (ValueError, RuntimeError) as exc:
             self._send_json({"ok": False, "error": str(exc)}, 400)
             return

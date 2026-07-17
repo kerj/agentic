@@ -94,6 +94,15 @@ SCHEMA: dict[str, dict[str, Any]] = {
                 "question (the only cap on a planning thread). Lower than jobs' "
                 "Max turns because grounding a question should be cheap.",
     },
+    "derive_max_turns": {
+        "default": 20, "env": "AGENTIC_DERIVE_MAX_TURNS", "type": "int",
+        "min": 1, "max": 60, "step": 1,
+        "group": "planning", "control": "slider", "label": "Derivation max turns",
+        "help": "Hard cap on read-agent turns when deriving jobs from a conversation. "
+                "Higher than a single planning question's cap because a multi-concern "
+                "plan must open/anchor many files to cover every item — too low and it "
+                "runs out mid-derivation and drops the later concerns.",
+    },
     "planning_default_mode": {
         "default": "local", "env": "AGENTIC_PLANNING_DEFAULT_MODE", "type": "str",
         "options": ["local", "cloud"],
